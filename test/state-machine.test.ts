@@ -796,6 +796,12 @@ test("replacement critic rejection preserves the FIFO obligation and inserts not
 				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "reject" }], summary: "rejected" })),
+			// Basic-vocabulary fallback round: also rejected, queue still preserved.
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: { type: "word", text: "morning", phonetic: "", meaning: "早晨", example: "Good morning.", example_cn: "早上好。" },
+			})),
+			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "reject" }], summary: "rejected" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3 });
@@ -808,7 +814,7 @@ test("replacement critic rejection preserves the FIFO obligation and inserts not
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
 		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
 		check.close();
-		assert.equal(registration.state.callCount, 2);
+		assert.equal(registration.state.callCount, 4);
 		assert.equal(count, 1);
 		assert.deepEqual(queue, ["word"]);
 		assert.equal(active.active_item_id, null);
@@ -1815,11 +1821,13 @@ test("deterministic budget gate rejects an out-of-budget generated lesson with z
 	try {
 		// Cold-start DB -> B1 budget [12,18]. Each generated lesson has a 20-word
 		// cloze sentence (too long): the deterministic critic gate rejects it
-		// before any LLM critic call.
+		// before any LLM critic call. The 4th response is the basic-vocabulary
+		// fallback batch, also out of budget and rejected the same way.
 		registration.setResponses([
 			fauxAssistantMessage(longLessonResponse("too-long-1")),
 			fauxAssistantMessage(longLessonResponse("too-long-2")),
 			fauxAssistantMessage(longLessonResponse("too-long-3")),
+			fauxAssistantMessage(longLessonResponse("too-long-basic")),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
@@ -1835,9 +1843,10 @@ test("deterministic budget gate rejects an out-of-budget generated lesson with z
 		assert.equal(state.active_item_id, null, "no active card after deterministic rejection");
 		assert.equal(state.generation_token, null, "generation lease released");
 		assert.match(status, /critic_rejected/, "deterministic gate reject recorded as critic_rejected");
-		// Only the 3 generation calls ran; the LLM critic was never consulted because
-		// the deterministic gate short-circuited every critiqueLesson.
-		assert.equal(registration.state.callCount, 3, "no LLM critic call for the deterministic gate");
+		// 4 calls: 3 generation calls for the initial+revision batches, plus 1 basic
+		// fallback generation. The LLM critic was never consulted because the
+		// deterministic gate short-circuited every critiqueLesson.
+		assert.equal(registration.state.callCount, 4, "no LLM critic call for the deterministic gate");
 	} finally {
 		registration.unregister();
 		fake.restore();
@@ -1893,6 +1902,77 @@ test("revision loop recovers a lesson after an initial critic rejection", { conc
 		assert.equal(registration.state.callCount, 4, "generate + critique + revise generate + revise critique");
 		assert.ok(count > 0, "revised lesson committed after the critic approved it");
 		assert.equal(state.active_item_id, 1, "revised lesson activated");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("basic-vocabulary fallback commits a lesson after the critic keeps rejecting", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-basic-fallback" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(lessonResponse("basic-v1")),
+			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "不自然" }], summary: "需修订" })),
+			fauxAssistantMessage(lessonResponse("basic-v2")),
+			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "仍不自然" }], summary: "仍不达标" })),
+			fauxAssistantMessage(lessonResponse("基础词汇")),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		await makeSession({ model, modelRegistry: registry, sessionId: "basic-fallback" });
+		await fake.fire();
+		await fake.flush();
+		const db = openTestDb();
+		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const state = db.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		const status = String((db.prepare("SELECT value FROM stats WHERE key='last_gen_status'").get() as any).value);
+		db.close();
+		assert.equal(registration.state.callCount, 6, "generate + critique + revise generate + revise critique + basic generate + basic critique");
+		assert.ok(count > 0, "basic fallback batch committed after approval");
+		assert.equal(state.active_item_id, 1, "basic fallback batch activated");
+		assert.match(status, /ok: 基础词汇/, "basic fallback topic recorded");
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("basic-vocabulary fallback rescues a rejected replacement", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-replacement-basic" });
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+			})),
+			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "reject" }], summary: "rejected" })),
+			fauxAssistantMessage(JSON.stringify({
+				ready: true,
+				item: { type: "word", text: "morning", phonetic: "", meaning: "早晨", example: "Good morning.", example_cn: "早上好。" },
+			})),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-basic" });
+		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
+		await fake.fire();
+		await harness.commands["anki:skip"].handler("", harness.ctx);
+		const check = openTestDb();
+		const items = check.prepare("SELECT text,introduction_kind FROM items ORDER BY id").all() as any[];
+		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		check.close();
+		assert.equal(registration.state.callCount, 4, "replacement + critic + basic replacement + basic critic");
+		assert.equal(items.length, 2, "basic fallback replacement inserted");
+		assert.deepEqual({ text: items[1].text, kind: items[1].introduction_kind }, { text: "morning", kind: "replacement" });
+		assert.deepEqual(queue, [], "FIFO obligation consumed after fallback insertion");
+		assert.equal(active.active_item_id, 2);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		registration.unregister();
 		fake.restore();

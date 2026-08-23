@@ -1407,12 +1407,36 @@ export default function piEnglishAnkiExtension(
 				return false;
 			}
 
-			const item = decision.item;
+			let item = decision.item;
 			// Independent critic on replacement content (same fail-closed semantics as lessons).
-			const replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config, adaptive);
+			let replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config, adaptive);
 			if (sessionGeneration !== generation || !db) return false;
 			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
+			// Basic-vocabulary fallback on a genuine rejection: one last easiest-word
+			// replacement (already-known words are skippable). An unavailable critic
+			// stays fail-closed.
+			if (!replacementVerdict.pass && replacementVerdict.available) {
+				try {
+					const basic = await generateReplacement(llm, ctx, effectiveResolved, conversation, replacementKnownList(db), config, skipped, adaptive, replacementRecentLog, true);
+					if (sessionGeneration !== generation || !db) return false;
+					if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+					if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
+					if (basic.ready) {
+						const basicVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [basic.item] }, db ? knownList(db) : [], config, adaptive);
+						if (sessionGeneration !== generation || !db) return false;
+						if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+						if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
+						if (basicVerdict.pass) {
+							item = basic.item;
+							replacementVerdict = basicVerdict;
+							logGenStatus("replacement_basic_fallback");
+						}
+					}
+				} catch (err) {
+					logGenStatus(`replacement_basic_fallback_error: ${(err as Error)?.message || err}`);
+				}
+			}
 			if (!replacementVerdict.pass) {
 				if (replacementVerdict.available) lastRejectedReplacementKey = rejectionKey;
 				updateWidget(ctx, FACES.idle, [
@@ -1767,6 +1791,29 @@ export default function piEnglishAnkiExtension(
 				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+			}
+			// Basic-vocabulary fallback: after the critic keeps rejecting, try one
+			// last batch of the easiest everyday words — already-known words are
+			// fine, the user can just skip them. Only on a genuine rejection; an
+			// unavailable critic stays fail-closed.
+			if (!verdict.pass && verdict.available) {
+				try {
+					const basic = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch, true);
+					if (sessionGeneration !== generation) return;
+					if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+					if (basic.ready) {
+						const basicVerdict = await critiqueLesson(llm, ctx, effectiveResolved, basic, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
+						if (sessionGeneration !== generation) return;
+						if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+						if (basicVerdict.pass) {
+							lesson = basic;
+							verdict = basicVerdict;
+							logGenStatus("basic_fallback");
+						}
+					}
+				} catch (err) {
+					logGenStatus(`basic_fallback_error: ${(err as Error)?.message || err}`);
+				}
 			}
 			if (!verdict.pass) {
 				if (verdict.available) lastRejectedConversation = conversation;

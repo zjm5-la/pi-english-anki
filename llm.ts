@@ -165,6 +165,9 @@ export async function generateLesson(
 	adaptive?: AdaptiveContext,
 	recentLog?: string,
 	batch?: LessonBatch,
+	// basicFallback: last-resort batch of the easiest everyday words after the
+	// critic keeps rejecting; already-known words are fine (the user can skip).
+	basicFallback = false,
 ): Promise<LessonDecision> {
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
@@ -172,18 +175,29 @@ export async function generateLesson(
 	const prompt = [
 		`你是「英语小宠物」的备课大脑。学习者正在备考雅思，每天需要一整天的课量：共 ${wordItems + clozeItems} 个学习项，其中 ${wordItems} 个单词或词组（以单词为主，词组不超过 ${phraseCapFor(wordItems)} 个）${clozeItems > 0 ? (clozeItems > 1 ? `，${clozeItems} 个语法填空` : "，1 个语法填空") : ""}。`,
 		"",
-		"词汇来源（两条线，缺一不可）：",
-		`- 会话线：从下面会话中提取真实、常用的英语表达，${wordItems} 个单词/词组中至少 3 个来自会话；会话可提取的有效表达不足 3 个时全部提取，剩余名额用雅思词汇补足`,
-		"- 雅思线：学习者是低水平初学者，其余学习项从雅思入门/基础段（约 4.0-5.5 分，A2-B1）的高频常用核心词汇中选取（听说读写都常见的日常与基础词汇）；严格遵循下方画像的「词汇层次」，画像词汇档低于 B2 时禁止生僻学术词、低频难词；例句用日常简单句",
-		"- 难度限制只约束雅思线的选词；会话线的词不受词汇层次限制——工作场景立即能用、马上就能理解的词（哪怕偏难）优先级高于难度预算，照常提取",
-		"",
-		"备课条件：",
-		"- 技术开发、工具使用、报错排查、代码评审都是有效话题，提取其中值得当前学习者掌握的英语",
-		"- 即使会话缺乏可提取的英语内容（纯寒暄、单字命令、环境通知），也用雅思词汇出满一批，topic 填「雅思词汇」，不要拒绝备课",
-		"- 只有会话内容完全无法解读时才输出：{\"ready\":false,\"reason\":\"简短原因\"}",
+		...(basicFallback
+			? [
+				"词汇来源（基础兜底模式）：",
+				"- 全部学习项都使用英语初学者最基础的高频日常词汇（CEFR A1-A2 必会词，如日常动作、时间、家庭、食物、天气等），越常见越好",
+				"- 不要求与会话内容相关，也不受雅思线与画像难度约束；学习者很可能已经会其中一些——这没关系，会了可以跳过",
+				"- topic 填「基础词汇」；只有会话内容完全无法解读时才输出：{\"ready\":false,\"reason\":\"简短原因\"}",
+			]
+			: [
+				"词汇来源（两条线，缺一不可）：",
+				`- 会话线：从下面会话中提取真实、常用的英语表达，${wordItems} 个单词/词组中至少 3 个来自会话；会话可提取的有效表达不足 3 个时全部提取，剩余名额用雅思词汇补足`,
+				"- 雅思线：学习者是低水平初学者，其余学习项从雅思入门/基础段（约 4.0-5.5 分，A2-B1）的高频常用核心词汇中选取（听说读写都常见的日常与基础词汇）；严格遵循下方画像的「词汇层次」，画像词汇档低于 B2 时禁止生僻学术词、低频难词；例句用日常简单句",
+				"- 难度限制只约束雅思线的选词；会话线的词不受词汇层次限制——工作场景立即能用、马上就能理解的词（哪怕偏难）优先级高于难度预算，照常提取",
+				"",
+				"备课条件：",
+				"- 技术开发、工具使用、报错排查、代码评审都是有效话题，提取其中值得当前学习者掌握的英语",
+				"- 即使会话缺乏可提取的英语内容（纯寒暄、单字命令、环境通知），也用雅思词汇出满一批，topic 填「雅思词汇」，不要拒绝备课",
+				"- 只有会话内容完全无法解读时才输出：{\"ready\":false,\"reason\":\"简短原因\"}",
+			]),
 		"",
 		"学习项要求：",
-		"- 内容要真实常用：会话来源的贴近会话语境，雅思来源的选自雅思高频词表；难度都须贴合下面的画像与预算",
+		...(basicFallback
+			? ["- 内容要真实常用：选自基础高频词表，例句短小自然"]
+			: ["- 内容要真实常用：会话来源的贴近会话语境，雅思来源的选自雅思高频词表；难度都须贴合下面的画像与预算"]),
 		"- word 和 phrase 的例句短小自然，贴近主题的实际使用场景",
 		...(clozeItems > 0
 			? ["- 教学项围绕同一主题组织（会话主题或雅思主题）：cloze 的句子可以自然复用本批次中 1-2 个刚教的单词或词组，形成一个统一的教学单元",
@@ -588,6 +602,8 @@ export async function generateReplacement(
 	skipped: ItemRow,
 	adaptive?: AdaptiveContext,
 	recentLog?: string,
+	// basicFallback: last-resort easiest-word replacement after critic rejection.
+	basicFallback = false,
 ): Promise<ReplacementDecision> {
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
@@ -598,7 +614,9 @@ export async function generateReplacement(
 	const prompt = [
 		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟，且用户正在备考雅思。`,
 		`请补充 1 张新的 ${skipped.type} 卡片，不能与已有内容重复。`,
-		"优先从下面会话中提取真实表达（会话来源的词不受词汇层次限制，工作场景立即能用、马上能理解的词照常提取）；会话没有合适内容时，从雅思入门/基础段（约 4.0-5.5 分，A2-B1）的高频常用核心词汇中选择同类型卡片，学习者是初学者，雅思来源禁止生僻学术词、低频难词，不要因为会话缺乏英语内容而拒绝。",
+		basicFallback
+			? "本次为基础兜底补卡：直接选择英语初学者最基础的高频日常词汇（CEFR A1-A2 必会词），不要求与会话相关，也不受雅思线与画像难度约束；学习者很可能已经会——没关系，会了可以跳过。"
+			: "优先从下面会话中提取真实表达（会话来源的词不受词汇层次限制，工作场景立即能用、马上能理解的词照常提取）；会话没有合适内容时，从雅思入门/基础段（约 4.0-5.5 分，A2-B1）的高频常用核心词汇中选择同类型卡片，学习者是初学者，雅思来源禁止生僻学术词、低频难词，不要因为会话缺乏英语内容而拒绝。",
 		"只有完全无法生成时才输出：{\"ready\":false,\"reason\":\"简短原因\"}。",
 		"信息充分时只输出：",
 		`{"ready":true,"item":${itemSchema}}`,
