@@ -1342,7 +1342,12 @@ export default function piEnglishAnkiExtension(
 			logGenStatus("replacement_no_source");
 			return false;
 		}
-		const conversation = buildConversation(ctx.sessionManager.getBranch());
+		// Conversation-less sessions (e.g. the standalone app's RPC session) must
+		// still drain the replacement FIFO: the generator prompt already has an
+		// IELTS-entry fallback branch for exactly this case. Only bail when neither
+		// a conversation nor a skipped item anchor exists to steer generation.
+		const conversation = buildConversation(ctx.sessionManager.getBranch())
+			|| (skipped ? `（本会话暂无英语内容：请从雅思入门/基础段高频核心词中选 ${skipped.type} 卡，向 A1-A2 超级初学者倾斜）` : "");
 		if (!conversation.trim()) {
 			updateWidget(ctx, FACES.idle, ["等会话形成明确话题后，再补充同类型卡片…", statsLine(db)]);
 			logGenStatus("replacement_empty_conversation");
