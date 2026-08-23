@@ -1346,8 +1346,14 @@ export default function piEnglishAnkiExtension(
 		// still drain the replacement FIFO: the generator prompt already has an
 		// IELTS-entry fallback branch for exactly this case. Only bail when neither
 		// a conversation nor a skipped item anchor exists to steer generation.
-		const conversation = buildConversation(ctx.sessionManager.getBranch())
+		const branchSnapshot = buildConversation(ctx.sessionManager.getBranch());
+		const conversation = branchSnapshot
 			|| (skipped ? `（本会话暂无英语内容：请从雅思入门/基础段高频核心词中选 ${skipped.type} 卡，向 A1-A2 超级初学者倾斜）` : "");
+		// Guards below must compare against the branch snapshot, not the effective
+		// conversation (which may be the conversation-less fallback line): a real
+		// branch change invalidates in-flight generation, an unchanged empty branch
+		// must not.
+		const conversationUnchanged = () => buildConversation(ctx.sessionManager.getBranch()) === branchSnapshot;
 		if (!conversation.trim()) {
 			updateWidget(ctx, FACES.idle, ["等会话形成明确话题后，再补充同类型卡片…", statsLine(db)]);
 			logGenStatus("replacement_empty_conversation");
@@ -1360,7 +1366,7 @@ export default function piEnglishAnkiExtension(
 			return false;
 		}
 		const generationToken = claimGeneration();
-		if (!generationToken) return false;
+		if (!generationToken) { logGenStatus("replacement_no_gen_token"); return false; }
 
 		// One profile+budget snapshot per generation, after the generation claim and
 		// before any LLM await; the same snapshot feeds the generator, fallback,
@@ -1402,7 +1408,7 @@ export default function piEnglishAnkiExtension(
 				}
 			}
 			if (sessionGeneration !== generation || !db) return false;
-			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+			if (!conversationUnchanged()) return false;
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
 			if (!decision.ready) {
 				lastRejectedReplacementKey = rejectionKey;
@@ -1419,7 +1425,7 @@ export default function piEnglishAnkiExtension(
 			// "批次严重不完整" and stall the FIFO forever. Per-item checks still apply.
 			let replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config, adaptive, null);
 			if (sessionGeneration !== generation || !db) return false;
-			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+			if (!conversationUnchanged()) return false;
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
 			// Basic-vocabulary fallback on a genuine rejection: one last easiest-word
 			// replacement (already-known words are skippable). An unavailable critic
@@ -1428,12 +1434,12 @@ export default function piEnglishAnkiExtension(
 				try {
 					const basic = await generateReplacement(llm, ctx, effectiveResolved, conversation, replacementKnownList(db), config, skipped, adaptive, replacementRecentLog, true);
 					if (sessionGeneration !== generation || !db) return false;
-					if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+					if (!conversationUnchanged()) return false;
 					if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
 					if (basic.ready) {
 						const basicVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [basic.item] }, db ? knownList(db) : [], config, adaptive, null);
 						if (sessionGeneration !== generation || !db) return false;
-						if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
+						if (!conversationUnchanged()) return false;
 						if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
 						if (basicVerdict.pass) {
 							item = basic.item;
@@ -1654,7 +1660,8 @@ export default function piEnglishAnkiExtension(
 		const replacementType = pendingReplacementTypes(db)[0];
 		let replacementWaiting = false;
 		if (replacementType) {
-			if (await generateReplacementAndInsert(ctx, replacementType)) return;
+			const inserted = await generateReplacementAndInsert(ctx, replacementType);
+			if (inserted) return;
 			if (sessionGeneration !== generation || !db) return;
 			const state = getRuntimeState(db);
 			const generationBusy = Boolean(
