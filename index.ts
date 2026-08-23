@@ -1409,7 +1409,10 @@ export default function piEnglishAnkiExtension(
 
 			let item = decision.item;
 			// Independent critic on replacement content (same fail-closed semantics as lessons).
-			let replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config, adaptive);
+			// composition=null: a replacement is a single card by design — judging it by the
+			// 10+1 full-batch composition rule would reject every replacement as
+			// "批次严重不完整" and stall the FIFO forever. Per-item checks still apply.
+			let replacementVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [item] }, db ? knownList(db) : [], config, adaptive, null);
 			if (sessionGeneration !== generation || !db) return false;
 			if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
@@ -1423,7 +1426,7 @@ export default function piEnglishAnkiExtension(
 					if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
 					if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
 					if (basic.ready) {
-						const basicVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [basic.item] }, db ? knownList(db) : [], config, adaptive);
+						const basicVerdict = await critiqueLesson(llm, ctx, effectiveResolved, { topic: "replacement", items: [basic.item] }, db ? knownList(db) : [], config, adaptive, null);
 						if (sessionGeneration !== generation || !db) return false;
 						if (buildConversation(ctx.sessionManager.getBranch()) !== conversation) return false;
 						if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
