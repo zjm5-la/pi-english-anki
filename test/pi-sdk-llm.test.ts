@@ -46,7 +46,7 @@ test("rejected SDK runtime creation is evicted so the next call can recover", as
 			if (factoryCalls === 1) throw new Error("transient runtime failure");
 			return fauxRuntime(ctx);
 		});
-		const request = { systemPrompt: "Reply briefly.", prompt: "test", maxTokens: 20 };
+		const request = { systemPrompt: "Reply briefly.", prompt: "test" };
 		const resolved = { provider: ctx.model.provider, model: ctx.model.id };
 		await assert.rejects(client.complete(ctx, resolved, request), /transient runtime failure/);
 		assert.equal(await client.complete(ctx, resolved, request), "recovered");
@@ -67,17 +67,21 @@ test("native host providers are copied into the isolated runtime", async () => {
 		ctx.modelRegistry.getRegisteredNativeProvider = (provider: string) => provider === ctx.model.provider ? nativeProvider : undefined;
 		ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, headers: { "x-native-auth": "local" } });
 		let copied: unknown;
+		let streamedMaxTokens: number | undefined;
 		const runtime = fauxRuntime(ctx) as any;
 		runtime.registerNativeProvider = (provider: unknown) => { copied = provider; };
-		runtime.streamSimple = async (model: any, context: any, options: any) =>
-			streamModel(model, context, { ...options, apiKey: "native-test-key" });
+		runtime.streamSimple = async (model: any, context: any, options: any) => {
+			streamedMaxTokens = model.maxTokens;
+			return streamModel(model, context, { ...options, apiKey: "native-test-key" });
+		};
 		(ModelRuntime as any).create = async () => runtime;
 		const client = new PiSdkLlmClient();
 		assert.equal(
-			await client.complete(ctx, { provider: ctx.model.provider, model: ctx.model.id }, { systemPrompt: "Reply briefly.", prompt: "test", maxTokens: 20 }),
+			await client.complete(ctx, { provider: ctx.model.provider, model: ctx.model.id }, { systemPrompt: "Reply briefly.", prompt: "test" }),
 			"native-ok",
 		);
 		assert.equal(copied, nativeProvider);
+		assert.equal(streamedMaxTokens, ctx.model.maxTokens, "the client must not narrow the model's output limit");
 		await client.dispose();
 	} finally {
 		(ModelRuntime as any).create = originalCreate;
@@ -101,7 +105,7 @@ test("the completion deadline covers auth before session creation", async () => 
 		let factoryCalls = 0;
 		const client = new PiSdkLlmClient(async () => { factoryCalls++; return fauxRuntime(ctx); }, { completeTimeoutMs: 20, abortTimeoutMs: 20 });
 		await assert.rejects(
-			client.complete(ctx, { provider: model.provider, model: model.id }, { systemPrompt: "test", prompt: "test", maxTokens: 20 }),
+			client.complete(ctx, { provider: model.provider, model: model.id }, { systemPrompt: "test", prompt: "test" }),
 			/SDK_LLM_TIMEOUT/,
 		);
 		assert.equal(factoryCalls, 0);
@@ -129,7 +133,7 @@ test("dispose during pending auth prevents runtime and session creation", async 
 		} as any;
 		let factoryCalls = 0;
 		const client = new PiSdkLlmClient(async () => { factoryCalls++; return fauxRuntime(ctx); });
-		const completion = client.complete(ctx, { provider: model.provider, model: model.id }, { systemPrompt: "test", prompt: "test", maxTokens: 20 });
+		const completion = client.complete(ctx, { provider: model.provider, model: model.id }, { systemPrompt: "test", prompt: "test" });
 		await started;
 		await client.dispose();
 		resolveAuth({ ok: true, apiKey: "test-key", headers: {} });

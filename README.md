@@ -78,7 +78,6 @@ pi install git:github.com/zjm5-la/pi-english-anki
   "thinkingLevel": "medium",
   "intervalMinutes": 10,
   "dailyNewLimit": 3,
-  "maxTokens": 262144,
   "showWidget": true,
   "verbose": false
 }
@@ -91,7 +90,6 @@ pi install git:github.com/zjm5-la/pi-english-anki
 | `thinkingLevel` | *(provider 默认)* | 推理强度：`off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` |
 | `intervalMinutes` | `10` | 无现成队列卡时的自动检查/备课间隔（分钟）；设为 `0` 可关闭；现成队列卡之间不等待 |
 | `dailyNewLimit` | `3` | 每天首次展示的计划新卡上限；`0` 为不限，Skip 补卡不占额度 |
-| `maxTokens` | `262144` | 所有备课/审查/评价 LLM 调用的输出 token 上限（实际生效值会被模型自身上限收窄） |
 | `showWidget` | `true` | 是否显示宠物 widget |
 | `verbose` | `false` | 每次教新内容时显示通知 |
 
@@ -99,6 +97,7 @@ pi install git:github.com/zjm5-la/pi-english-anki
 
 - 未手动指定时，宠物会自动挑选适合的模型备课（如 gpt-5.4-mini、deepseek-v4-flash、grok-4.3、glm-5.2），仅从已登录或已配置密钥的提供商中选择
 - 若选中的模型无法访问（密钥缺失、网络或服务端错误），自动降级到当前会话正在使用的模型重试
+- 本体不设置额外的输出 token 上限；仅保留模型/provider 自身不可绕过的能力边界
 - 模型判断信息不足时不会硬凑学习卡；本次会话内，同一份被拒绝的会话内容不会重复请求模型
 - 学习数据位于 `~/.pi/agent/kaomoji-english-tutor.db`；请先退出 Pi 再删除数据库文件，以免运行中的 SQLite 连接继续写入旧文件
 
@@ -184,7 +183,6 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 | `thinkingLevel` | *(provider default)* | Reasoning level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `intervalMinutes` | `10` | Background check/lesson interval when no stored card is ready; `0` disables it; ready queued cards have no inter-card wait |
 | `dailyNewLimit` | `3` | Planned cards first shown per day; `0` is unlimited and Skip replacements are quota-free |
-| `maxTokens` | `262144` | Output-token ceiling for every generation/critique/evaluation call (clamped by the model's own limit) |
 | `showWidget` | `true` | Show the pet widget |
 | `verbose` | `false` | Notify whenever a new item is taught |
 
@@ -192,5 +190,6 @@ Create `~/.pi/agent/kaomoji-english-tutor.json` (global) or `.pi/kaomoji-english
 
 - Without explicit config, the pet automatically picks a suitable model for lessons (e.g. gpt-5.4-mini, deepseek-v4-flash, grok-4.3, glm-5.2), only from providers with configured auth (logged in or API key present)
 - If the chosen model is unreachable (missing key, network or provider errors), it falls back to the model driving the current session and retries
+- The tutor applies no additional output-token ceiling; only the model/provider's unavoidable capability boundary remains
 - When context is insufficient, the model waits instead of fabricating cards; within the current session, unchanged rejected context is not requested again
 - Learning data lives in `~/.pi/agent/kaomoji-english-tutor.db`; exit Pi before deleting the file so a live SQLite connection cannot keep writing to an unlinked database

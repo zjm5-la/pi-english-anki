@@ -1596,7 +1596,7 @@ test("planned new-card quota blocks extra new cards at display", { concurrency: 
 test("a negative dailyNewLimit falls back to the default quota", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: -1, maxTokens: -1 });
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: -1 });
 		const harness = await makeSession({ sessionId: "invalid-config-defaults" });
 		const db = openTestDb();
 		for (const [text, meaning] of [["one", "一"], ["two", "二"], ["three", "三"], ["four", "四"]]) {

@@ -15,7 +15,6 @@ export interface PetConfig {
 	intervalMinutes: number;
 	/** Max new items (word/phrase/sentence) taught per day. */
 	dailyNewLimit: number;
-	maxTokens: number;
 	showWidget: boolean;
 	verbose: boolean;
 }
@@ -29,13 +28,9 @@ export const LESSON_MAX_PHRASES = 3;
 /** Upper bound on cards a single /anki:add may enqueue (safety clamp). */
 export const MAX_CUSTOM_PER_ADD = 20;
 
-/** Unified output-token ceiling for every generation/evaluation LLM call (256k). */
-export const MAX_OUTPUT_TOKENS = 262_144;
-
 export const DEFAULTS: PetConfig = {
 	intervalMinutes: 10,
 	dailyNewLimit: LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS,
-	maxTokens: MAX_OUTPUT_TOKENS,
 	showWidget: true,
 	verbose: false,
 };
@@ -69,9 +64,6 @@ export function loadConfig(cwd: string): PetConfig {
 	}
 	if (!Number.isFinite(config.dailyNewLimit) || config.dailyNewLimit < 0) {
 		config.dailyNewLimit = DEFAULTS.dailyNewLimit;
-	}
-	if (!Number.isFinite(config.maxTokens) || config.maxTokens <= 0) {
-		config.maxTokens = DEFAULTS.maxTokens;
 	}
 	return config;
 }

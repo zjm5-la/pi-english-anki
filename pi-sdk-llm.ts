@@ -17,7 +17,6 @@ export interface SdkModelRef {
 export interface SdkCompletionRequest {
 	systemPrompt: string;
 	prompt: string;
-	maxTokens: number;
 	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 }
 
@@ -111,12 +110,13 @@ export class PiSdkLlmClient {
 			(err as Error & { code?: string }).code = "MODEL_NOT_FOUND";
 			throw err;
 		}
-		const maxTokens = Math.max(1, Math.min(request.maxTokens, runtimeModel.maxTokens ?? request.maxTokens));
 		const headers: Record<string, string> = { ...(runtimeModel.headers ?? {}) };
 		for (const [name, value] of Object.entries(auth.headers ?? {})) {
 			if (typeof value === "string") headers[name] = value;
 		}
-		const model = { ...runtimeModel, maxTokens, headers };
+		// Preserve the model catalog's own capability metadata; the tutor imposes no
+		// additional output-token ceiling.
+		const model = { ...runtimeModel, headers };
 		const settingsManager = SettingsManager.inMemory({
 			compaction: { enabled: false },
 			retry: { enabled: true, maxRetries: 2 },

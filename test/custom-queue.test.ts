@@ -34,7 +34,7 @@ const {
 const { formatStatusLine } = await import("../render.ts");
 
 const FAKE_CTX = {} as ExtensionContext;
-const FAKE_CONFIG = { maxTokens: 900, thinkingLevel: "off" } as unknown as PetConfig;
+const FAKE_CONFIG = { thinkingLevel: "off" } as unknown as PetConfig;
 const ADAPTIVE: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 
 /** LLM mock returning canned JSON for every complete() call. */

@@ -467,12 +467,17 @@ test("budget mapping by band and vocabulary wording uses the vocab band", () => 
 // -- LLM-coupled coverage (fake transport; deterministic, no network) -----
 
 const FAKE_CTX = {} as ExtensionContext;
-const FAKE_CONFIG = { maxTokens: 900, thinkingLevel: "off" } as unknown as PetConfig;
+const FAKE_CONFIG = { thinkingLevel: "off" } as unknown as PetConfig;
 
 test("generation prompt receives the concise profile + budget block", async () => {
 	let captured = "";
+	let sawMaxTokens = false;
 	const llm = {
-		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => { captured = request.prompt; return JSON.stringify({ ready: false, reason: "test" }); },
+		complete: async (_ctx: unknown, _r: unknown, request: Record<string, unknown>) => {
+			captured = String(request.prompt);
+			sawMaxTokens = "maxTokens" in request;
+			return JSON.stringify({ ready: false, reason: "test" });
+		},
 		dispose: async () => {},
 	} as unknown as PiSdkLlmClient;
 	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
@@ -483,6 +488,7 @@ test("generation prompt receives the concise profile + budget block", async () =
 	assert.match(captured, /句法：B1/);
 	assert.match(captured, /雅思/, "IELTS vocabulary source is offered");
 	assert.match(captured, /至少 3 个来自会话/, "at least 3 items must come from the conversation");
+	assert.equal(sawMaxTokens, false, "lesson generation does not impose an output-token budget");
 	// No hardcoded "中级学习者" assumption leaks into the prompt.
 	assert.doesNotMatch(captured, /中级学习者/);
 });
@@ -668,10 +674,10 @@ test("generateReplacement retries once after BAD_JSON and then succeeds", async 
 		}),
 	];
 	let calls = 0;
-	let capturedMaxTokens = 0;
+	let sawMaxTokens = false;
 	const llm = {
-		complete: async (_ctx: unknown, _r: unknown, request: { maxTokens: number }) => {
-			capturedMaxTokens = request.maxTokens;
+		complete: async (_ctx: unknown, _r: unknown, request: Record<string, unknown>) => {
+			sawMaxTokens ||= "maxTokens" in request;
 			return responses[calls++];
 		},
 		dispose: async () => {},
@@ -682,7 +688,7 @@ test("generateReplacement retries once after BAD_JSON and then succeeds", async 
 	assert.ok(decision.ready, "retry produced a usable replacement");
 	assert.equal(decision.item.text, "deadline");
 	assert.equal(calls, 2, "one malformed output is retried once on the same model");
-	assert.equal(capturedMaxTokens, FAKE_CONFIG.maxTokens, "replacement uses the configured maxTokens budget");
+	assert.equal(sawMaxTokens, false, "replacement does not impose an output-token budget");
 });
 
 test("generateReplacement gives up after one retry when the output stays malformed", async () => {

@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, MAX_CUSTOM_PER_ADD, MAX_OUTPUT_TOKENS, type PetConfig } from "./config.ts";
+import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, MAX_CUSTOM_PER_ADD, type PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import type { ItemRow } from "./db.ts";
 import type { SentenceExerciseView } from "./render.ts";
@@ -233,7 +233,6 @@ export async function generateLesson(
 	const text = await llm.complete(ctx, resolved, {
 		systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
 		prompt,
-		maxTokens: config.maxTokens,
 		thinkingLevel: config.thinkingLevel,
 	});
 
@@ -405,7 +404,6 @@ export async function critiqueLesson(
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语教学内容审查员，只输出 JSON。",
 			prompt,
-			maxTokens: MAX_OUTPUT_TOKENS,
 			thinkingLevel: config.thinkingLevel,
 		});
 	} catch {
@@ -488,7 +486,6 @@ export async function evaluateAttempt(
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语拼写/词义评价员，只输出 JSON。",
 			prompt,
-			maxTokens: MAX_OUTPUT_TOKENS,
 		});
 	} catch {
 		return unavailable();
@@ -567,7 +564,6 @@ export async function evaluateSentenceAttempt(
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语输出评价员，只输出严格 JSON。",
 			prompt,
-			maxTokens: MAX_OUTPUT_TOKENS,
 		});
 	} catch {
 		return unavailable();
@@ -640,7 +636,6 @@ export async function generateReplacement(
 		const text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
 			prompt,
-			maxTokens: config.maxTokens,
 			thinkingLevel: config.thinkingLevel,
 		});
 		try {
@@ -719,7 +714,6 @@ export async function generateCustomCards(
 	const text = await llm.complete(ctx, resolved, {
 		systemPrompt: "你是英语学习卡生成器，只输出 JSON；信息不足时宁可等待。",
 		prompt,
-		maxTokens: config.maxTokens,
 		thinkingLevel: config.thinkingLevel,
 	});
 
