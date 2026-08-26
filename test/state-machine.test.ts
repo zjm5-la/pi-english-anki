@@ -3023,6 +3023,67 @@ test("after a forward Again, a due reverse surfaces in reverse direction", { con
 	}
 });
 
+// -- Ambiguous forward production prompts (book/reserve → 预订) -------------
+
+test("meaning-colliding forward reviews show target cues and matching audit snapshots", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "ambiguous-cue" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,example,learned_at,due_at,shown) VALUES('word','book','预订',?,?,?,1)")
+			.run("I want to book a table for two.", new Date().toISOString(), new Date(0).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,example,learned_at,due_at,shown) VALUES('word','reserve','预订',?,?,?,1)")
+			.run("I want to reserve a table for two.", new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（以 b 开头；例：I want to ____ a table for two\.）/);
+		await harness.commands["anki:answer"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /请写出「预订」的英文（以 b 开头/);
+		await harness.commands["anki:answer"].handler("book", harness.ctx);
+		let check = openTestDb();
+		let attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 1 ORDER BY id DESC LIMIT 1").get() as any;
+		check.close();
+		assert.equal(attempt.question_text, "默写单词「预订」的英文（以 b 开头；例：I want to ____ a table for two.）");
+
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（以 r 开头；例：I want to _______ a table for two\.）/);
+		await harness.commands["anki:answer"].handler("reserve", harness.ctx);
+		check = openTestDb();
+		attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 2 ORDER BY id DESC LIMIT 1").get() as any;
+		check.close();
+		assert.equal(attempt.question_text, "默写单词「预订」的英文（以 r 开头；例：I want to _______ a table for two.）");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("non-colliding forward reviews keep the bare prompt", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "unambiguous-word" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,example,learned_at,due_at,shown) VALUES('word','apple','苹果',?,?,?,1)")
+			.run("I eat an apple every day.", new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		const shown = harness.widget().join(" ");
+		assert.match(shown, /默写单词「苹果」的英文/);
+		assert.doesNotMatch(shown, /以 . 开头/);
+		await harness.commands["anki:answer"].handler("apple", harness.ctx);
+		const check = openTestDb();
+		const attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 1 ORDER BY id DESC LIMIT 1").get() as any;
+		check.close();
+		assert.equal(attempt.question_text, "默写单词「苹果」的英文");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 // -- /anki:add custom queue release (harness level) ------------------------
 
 function queueWord(text: string, meaning: string) {

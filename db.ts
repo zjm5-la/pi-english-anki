@@ -851,11 +851,13 @@ export function countTodayNew(db: DatabaseSync, now: Date): number {
 
 export function knownList(db: DatabaseSync): string[] {
 	const rows = db
-		.prepare("SELECT text FROM items WHERE shown = 1 ORDER BY id DESC LIMIT 30")
+		.prepare("SELECT text, meaning FROM items WHERE shown = 1 ORDER BY id DESC LIMIT 30")
 		.all() as {
 		text: string;
+		meaning: string;
 	}[];
-	return rows.map((r) => r.text);
+	// Include meanings so the critic can detect ambiguous production prompts.
+	return rows.map((r) => `${r.text}（${r.meaning}）`);
 }
 
 export function replacementKnownList(db: DatabaseSync): string[] {
@@ -951,6 +953,30 @@ export function removeCustomQueueRows(db: DatabaseSync, ids: number[]): void {
 	if (!ids.length) return;
 	const del = db.prepare("DELETE FROM custom_card_queue WHERE id = ?");
 	for (const id of ids) del.run(id);
+}
+
+/** Normalize a Chinese meaning for collision comparison. */
+export function normalizeMeaning(meaning: string): string {
+	return meaning.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * Approved word/phrase items whose normalized Chinese meaning matches this
+ * item. Such a forward prompt needs a target-specific cue.
+ */
+export function meaningCollisions(
+	db: DatabaseSync,
+	item: Pick<ItemRow, "id" | "type" | "meaning">,
+): { id: number; text: string; meaning: string }[] {
+	if (item.type !== "word" && item.type !== "phrase") return [];
+	const target = normalizeMeaning(item.meaning);
+	if (!target) return [];
+	const rows = db
+		.prepare(
+			`SELECT id, text, meaning FROM items WHERE type IN ('word','phrase') AND id <> ? ${SCHEDULABLE}`,
+		)
+		.all(item.id) as { id: number; text: string; meaning: string }[];
+	return rows.filter((row) => normalizeMeaning(row.meaning) === target);
 }
 
 export function customQueueCount(db: DatabaseSync): number {

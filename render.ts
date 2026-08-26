@@ -174,12 +174,54 @@ export function sentenceExercise(item: ItemRow, requestedLevel = item.progress):
 }
 
 /** Canonical recall question text — single source for card display and attempt logs. */
-export function recallQuestionText(item: ItemRow, direction: "forward" | "reverse"): string {
+export function recallQuestionText(
+	item: ItemRow,
+	direction: "forward" | "reverse",
+	cue?: ForwardCue,
+): string {
 	if (item.type === "cloze") return `语法填空：${item.text}`;
 	const label = TYPE_LABELS[item.type] ?? item.type;
-	return direction === "reverse"
-		? `写出${label}「${item.text}」的中文释义`
-		: `默写${label}「${item.meaning}」的英文`;
+	if (direction === "reverse") return `写出${label}「${item.text}」的中文释义`;
+	const base = `默写${label}「${item.meaning}」的英文`;
+	return cue ? base + forwardCueSuffix(cue) : base;
+}
+
+/** Disambiguation for colliding Chinese → English prompts. */
+export interface ForwardCue {
+	initial: string;
+	context?: string;
+}
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function forwardCue(item: ItemRow): ForwardCue | undefined {
+	const initial = item.text.match(/[A-Za-z]/)?.[0]?.toLowerCase();
+	if (!initial) return undefined;
+	let context: string | undefined;
+	const target = item.text.trim();
+	const example = item.example?.trim();
+	if (target && example) {
+		const lead = /^[A-Za-z0-9]/.test(target) ? "\\b" : "";
+		const tail = /[A-Za-z0-9]$/.test(target) ? "\\b" : "";
+		const masked = example.replace(
+			new RegExp(`${lead}${escapeRegExp(target)}${tail}`, "gi"),
+			(match) => "_".repeat(match.length),
+		);
+		if (masked !== example) context = masked;
+	}
+	return { initial, context };
+}
+
+export function forwardCueSuffix(cue: ForwardCue): string {
+	return cue.context
+		? `（以 ${cue.initial} 开头；例：${cue.context}）`
+		: `（以 ${cue.initial} 开头）`;
+}
+
+export function questionHasForwardCue(questionText: string | null | undefined): boolean {
+	return /（以 [A-Za-z] 开头/.test(questionText ?? "");
 }
 
 /** Canonical sentence-level question text for attempt logs. */
@@ -190,7 +232,7 @@ export function sentenceQuestionText(exercise: SentenceExerciseView): string {
 }
 
 /** Render a teach/review card as widget lines (front = question, back = answer). */
-export function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false, direction: "forward" | "reverse" = "forward"): string[] {
+export function renderCard(item: ItemRow, isReview: boolean, face: string, showAnswer = false, direction: "forward" | "reverse" = "forward", cue?: ForwardCue): string[] {
 	const label = TYPE_LABELS[item.type] ?? item.type;
 	const lines: string[] = [];
 
@@ -247,7 +289,7 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 			lines.push(`${face} 复习：${item.text}${item.phonetic ? " " + item.phonetic : ""} — ${item.meaning}`);
 			lines.push(`  第 ${item.reviews + 1} 次复习`);
 		} else {
-			lines.push(`${face} 复习时间到：✍️ ${recallQuestionText(item, direction)}`);
+			lines.push(`${face} 复习时间到：✍️ ${recallQuestionText(item, direction, cue)}`);
 		}
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);

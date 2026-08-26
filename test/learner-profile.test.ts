@@ -805,7 +805,7 @@ test("critic prompt includes the minimal-meaning blocker rule", async () => {
 	assert.match(captured, /最小释义/);
 });
 
-test("answer-evaluation rubric is direction-aware: reverse accepts synonyms, forward stays strict", async () => {
+test("answer-evaluation rubric accepts synonyms for an underdetermined bare forward prompt", async () => {
 	const captured: string[] = [];
 	const llm = {
 		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => { captured.push(request.prompt); return JSON.stringify({ verdict: "correct", feedback: "" }); },
@@ -820,8 +820,9 @@ test("answer-evaluation rubric is direction-aware: reverse accepts synonyms, for
 	assert.match(captured[0], /生效，起作用/);
 	assert.match(captured[0], /不同义项/);
 	assert.doesNotMatch(captured[0], /完全一致/);
-	assert.match(captured[1], /完全一致/);
-	assert.doesNotMatch(captured[1], /语体差异/);
+	assert.match(captured[1], /任何一个自然且完全符合该中文提示/);
+	assert.match(captured[1], /本题目标是「filled」/);
+	assert.doesNotMatch(captured[1], /题面线索已唯一指向/);
 });
 
 // -- Generation decision ring log (备课决策日志) ----------------------------

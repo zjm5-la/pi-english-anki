@@ -8,12 +8,12 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, meaningCollisions, openDb, peekCustomQueue, pendingReplacementTypes, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
-import { FACES, TYPE_LABELS, formatStatusLine, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type SentenceExerciseView } from "./render.ts";
+import { FACES, TYPE_LABELS, formatStatusLine, forwardCue, forwardCueSuffix, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type ForwardCue, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
 import { dbFilePath, isSyncEnabled, peekRemoteNewer, pullIfNewer, pushSnapshot } from "./sync.ts";
 import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, smoothBudget, type AdaptiveContext } from "./learner-profile.ts";
@@ -408,7 +408,7 @@ export default function piEnglishAnkiExtension(
 			}
 			const correction = sentenceCorrectionLines(item, state);
 			const face = correction ? FACES.error : isReview ? FACES.review : FACES.teach;
-			const lines = correction ?? renderCard(item, isReview, face, pendingFlipped, pendingDirection);
+			const lines = correction ?? renderCard(item, isReview, face, pendingFlipped, pendingDirection, activeForwardCue(item, pendingDirection));
 			lines.push(statsLine(db));
 			updateWidget(ctx, face, lines);
 			recordRendered(state);
@@ -639,7 +639,7 @@ export default function piEnglishAnkiExtension(
 		pendingAssistance = state.active_assistance_level;
 		recordRendered(state);
 		const face = isReview ? FACES.review : FACES.teach;
-		const lines = renderCard(item, isReview, face, false, pendingDirection);
+		const lines = renderCard(item, isReview, face, false, pendingDirection, activeForwardCue(item, pendingDirection));
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		if (config.verbose) {
@@ -653,6 +653,12 @@ export default function piEnglishAnkiExtension(
 		if (pendingItemId == null && db && getRuntimeState(db).active_item_id != null) {
 			renderGlobalCard(ctx);
 		}
+	}
+
+	/** Add a target cue only when another word/phrase has the same meaning. */
+	function activeForwardCue(item: ItemRow, direction: RecallDirection): ForwardCue | undefined {
+		if (!db || direction !== "forward" || (item.type !== "word" && item.type !== "phrase")) return undefined;
+		return meaningCollisions(db, item).length > 0 ? forwardCue(item) : undefined;
 	}
 
 	/** Toggle the pending card between its question and answer sides. */
@@ -683,7 +689,7 @@ export default function piEnglishAnkiExtension(
 			}
 		}
 		const face = pendingIsReview ? FACES.review : FACES.teach;
-		const lines = renderCard(item, pendingIsReview, face, pendingFlipped, pendingDirection);
+		const lines = renderCard(item, pendingIsReview, face, pendingFlipped, pendingDirection, activeForwardCue(item, pendingDirection));
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		return true;
@@ -811,11 +817,12 @@ export default function piEnglishAnkiExtension(
 		}
 		const text = rawText.trim();
 		if (!text) {
+			const cue = activeForwardCue(item, pendingDirection);
 			const promptText = item.type === "cloze"
 				? `✍️ 请补全：${item.text}`
 				: pendingDirection === "reverse"
 					? `✍️ 请写出「${item.text}」的中文释义`
-					: `✍️ 请写出「${item.meaning}」的英文`;
+					: `✍️ 请写出「${item.meaning}」的英文${cue ? forwardCueSuffix(cue) : ""}`;
 			updateWidget(ctx, FACES.review, [
 				`${FACES.review} ${promptText}`,
 				"用 /anki:answer <你的答案>，或 /anki:hint 看提示，或 /anki:flip 看答案",
@@ -834,7 +841,7 @@ export default function piEnglishAnkiExtension(
 			answerText: text,
 			assistanceLevel: pendingAssistance,
 			startedAt: new Date().toISOString(),
-			questionText: recallQuestionText(item, state.active_direction),
+			questionText: recallQuestionText(item, state.active_direction, activeForwardCue(item, state.active_direction)),
 		};
 		const norm = (s: string) => item.type === "cloze"
 			? s.toLowerCase().replace(/[’]/g, "'").replace(/[^a-z0-9']+/g, " ").trim().replace(/\s+/g, " ")
@@ -849,7 +856,7 @@ export default function piEnglishAnkiExtension(
 			startAnswerThinking(ctx, attemptBase.sessionGeneration);
 			let result: AnswerEvaluation;
 			try {
-				result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction);
+				result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction, attemptBase.questionText);
 			} finally {
 				stopAnswerThinking();
 			}
@@ -1120,7 +1127,7 @@ export default function piEnglishAnkiExtension(
 						expectedVersion, expectedVersion, expectedDirection, assistanceLevel,
 						effective === Rating.Again ? "again" : "hard",
 						now.toISOString(), now.toISOString(), now.toISOString(),
-						recallQuestionText(item, expectedDirection),
+						recallQuestionText(item, expectedDirection, activeForwardCue(item, expectedDirection)),
 					);
 				}
 				if (isRecall) {
