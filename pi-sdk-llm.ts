@@ -99,7 +99,11 @@ export class PiSdkLlmClient {
 		}
 
 		const runtime = await this.waitFor(this.runtimeFor(ctx, resolved.provider), deadline);
-		if (auth.apiKey && this.runtimeApiKeys.get(resolved.provider) !== auth.apiKey) {
+		// OAuth access tokens are not API-key credentials. The isolated runtime
+		// already loads Pi's auth store (including refresh/account metadata).
+		// Overriding it with an api_key masks OAuth and breaks OAuth-only providers.
+		const usesOAuth = ctx.modelRegistry.isUsingOAuth?.(hostModel) ?? false;
+		if (!usesOAuth && auth.apiKey && this.runtimeApiKeys.get(resolved.provider) !== auth.apiKey) {
 			await this.waitFor(runtime.setRuntimeApiKey(resolved.provider, auth.apiKey), deadline);
 			this.runtimeApiKeys.set(resolved.provider, auth.apiKey);
 		}

@@ -2,10 +2,21 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, MAX_CUSTOM_PER_ADD, type PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import { normalizeMeaning, type ItemRow } from "./db.ts";
-import { questionHasForwardCue, type SentenceExerciseView } from "./render.ts";
+import { questionHasForwardCue, questionHasReverseContext, type SentenceExerciseView } from "./render.ts";
 import { coldStartProfile, deriveBudget, formatAdaptiveBlock, normalizeErrorTag, type AdaptiveContext } from "./learner-profile.ts";
 
 // -- LLM lesson generation ------------------------------------------------
+
+/** Shared by all generation paths and the critic, including basic fallbacks. */
+const FORWARD_PROMPT_QUALITY = [
+	"- word/phrase 会用 meaning 作为中文到英文的题面：必须在作答前就给足线索，不得等判分反馈才解释目标词，也不得假设学习者能猜到隐藏的 text。",
+	"- 每张 word/phrase 的 meaning 都必须明确标注当前所考义项的中文词性，不能仅在 example、隐藏字段或判分反馈里说明。单词标注名词、动词、形容词、副词、介词、代词、连词、数词、冠词或感叹词等；词组标注动词短语、名词短语等适用类别。不得因中文看起来简单而省略，也不得把同一个英文的多个词性一起罗列让学生猜本题考哪个。",
+	"- 例如 communicate 应写「交流（动词，指与他人交换信息或想法）」，communication 应写「交流（名词，指交换信息或想法的过程）」；提示「交流」无法区分动词与名词。词性须与 text 在例句中的当前用法一致，不能只标笼统的「单词」或「词组」。词性只解决词类歧义，同词性的近义词仍须补必要的义项或搭配线索。",
+	"- 消歧不限于批内或已学词的释义完全重复：即使其它近义词未入库、中文写法不同，也要检查常见合理答案。必要的词性、可数/不可数、义项范围或自然搭配属于题面线索，允许简短写在 meaning 的括号中，不属于应删去的用途/效果说明。",
+	"- 例如 information 不可只提示「信息/消息」：可写「信息（不可数名词，泛指事实或资料）」；message 可写「消息（可数名词，指发送或收到的一条留言）」。这说明词义范围，不能虚构近义词之间并不存在的区别。",
+	"- 为有近义词的目标选择能体现词义的自然例句/搭配，example 必须原样包含 text，example_cn 准确翻译；把目标挖空后仍应提供有用语境，不能只用 I like ... 等空泛句。",
+	"- 自检以实际默认题面为准：学生只看到 meaning，不能假设例句挖空或首字母已经显示，例句仅作辅助。隐藏 text 和 example 后，学生能否仅从 meaning 判断所考词？若仍有多个同样自然且满足线索的常见答案，必须将必要限定写进 meaning；仍无法消歧就换学习项，用户指定必须保留的词则返回无法生成的原因，不能靠不自然英文或直接泄露目标英文来强行唯一。",
+].join("\n");
 
 export interface GeneratedItem {
 	type: "word" | "phrase" | "sentence" | "cloze";
@@ -131,14 +142,27 @@ interface ResolvedModel {
 
 /** Max critic-driven revision rounds before a lesson is discarded. */
 export const MAX_LESSON_REVISIONS = 2;
+/** Regeneration attempts when the generated batch still duplicates existing cards. */
+export const MAX_DUPLICATE_RETRIES = 1;
 
 /** Same-model retries for transient replacement output-shape errors (BAD_JSON etc.). */
 export const REPLACEMENT_SHAPE_RETRIES = 1;
+
+/** Same-prompt retries when the model returns an unparseable or wrongly-shaped
+ * lesson decision. Format errors never lower content difficulty: the identical
+ * full-quality prompt is re-sent with the parse error attached. */
+export const LESSON_FORMAT_RETRIES = 2;
 
 /** Transient model-output shape errors worth an immediate blind retry. */
 function isTransientShapeError(err: unknown): boolean {
 	const code = String((err as Error & { code?: string })?.code || (err as Error)?.message || "");
 	return code === "BAD_JSON" || code === "INVALID_READY" || code === "EMPTY_REPLACEMENT";
+}
+
+/** Format-only failures of the lesson decision (retryable at full quality). */
+function isLessonFormatError(err: unknown): boolean {
+	const code = String((err as Error)?.message || "");
+	return ["BAD_JSON", "INVALID_READY", "INVALID_LESSON_SHAPE", "INVALID_LESSON_ITEM"].includes(code);
 }
 
 /** Explicit batch composition override (partial batches fill the day's remaining quota). */
@@ -211,9 +235,10 @@ export async function generateLesson(
 			: ["- 教学项围绕同一主题组织（会话主题或雅思主题），形成一个统一的教学单元",
 				`- 每个学习项必须互不重复；${wordItems} 个单词/词组项彼此独立，各自配一个小巧自然的例句`]),
 		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
+		FORWARD_PROMPT_QUALITY,
 		"- 若某个常用英文词/词组与本项 text 会对应同一个中文释义（如 book 与 reserve 都表示「预订」），meaning 必须补上可区分的义项或场景，不得与其它学习项或已学内容的中文释义完全相同",
 		'- 只输出 JSON，不要任何其他文字：',
-		`{"ready":true,"topic":"主题名","items":[${Array.from({ length: wordItems }, () => '{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"}').join(",")}${Array.from({ length: clozeItems }, () => ',{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}').join("")}]}`,
+		`{"ready":true,"topic":"主题名","items":[${Array.from({ length: wordItems }, () => '{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义（当前义项的中文词性，必要的消歧线索）","example":"英文例句","example_cn":"例句中文翻译"}').join(",")}${Array.from({ length: clozeItems }, () => ',{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}').join("")}]}`,
 		...(clozeItems > 0 ? ["- cloze 必须带 chunks（2-6 个意群，按顺序拼接后覆盖代入答案后的完整句子）"] : []),
 		"- 不要与已学内容重复（已学清单含释义；中文释义与已学词完全相同的也算重复），也要避开相同句型：" + (known.length ? known.join("、") : "（暂无已学内容）"),
 		...(feedback && feedback.length
@@ -232,53 +257,65 @@ export async function generateLesson(
 		"</conversation>",
 	].join("\n");
 
-	const text = await llm.complete(ctx, resolved, {
-		systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
-		prompt,
-		thinkingLevel: config.thinkingLevel,
-	});
+	// Format errors (bad JSON / wrong shape) retry the SAME full-quality prompt
+	// with the parse error attached; content difficulty and budget never change.
+	const parseDecision = (text: string): LessonDecision => {
+		const json = extractJsonObjectText(text);
+		if (!json) throw new Error("BAD_JSON");
+		let parsed: Record<string, unknown>;
+		try {
+			parsed = JSON.parse(json);
+		} catch {
+			throw new Error("BAD_JSON");
+		}
+		if (parsed.ready === false) {
+			return {
+				ready: false,
+				reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+			};
+		}
+		if (parsed.ready !== true) throw new Error("INVALID_READY");
+		if (!Array.isArray(parsed.items) || parsed.items.length !== wordItems + clozeItems) throw new Error("INVALID_LESSON_SHAPE");
+		const parsedItems = parsed.items.map((item) => parseGeneratedItem(item));
+		if (parsedItems.some((item) => item == null)) throw new Error("INVALID_LESSON_ITEM");
+		const items = parsedItems as GeneratedItem[];
+		// The word/phrase slots are homogeneous now: at least one word, phrases capped
+		// (never above the batch size), sentence cards are legacy review-only.
+		const wordCount = items.filter((item) => item.type === "word").length;
+		const phraseCount = items.filter((item) => item.type === "phrase").length;
+		const clozeCount = items.filter((item) => item.type === "cloze").length;
+		if (wordCount + phraseCount !== wordItems || phraseCount > phraseCapFor(wordItems) || wordCount < 1) throw new Error("INVALID_LESSON_SHAPE");
+		if (clozeCount !== clozeItems) throw new Error("INVALID_LESSON_SHAPE");
+		// Grammar clozes are the dedicated slots now; sentences are legacy review-only.
+		if (items.some((item) => item.type === "sentence")) throw new Error("INVALID_LESSON_SHAPE");
+		if (items.filter((item) => item.type === "cloze").some((item) => !validClozeItem(item))) throw new Error("INVALID_LESSON_ITEM");
+		// Reject in-batch duplicates early; the fingerprint unique index would
+		// otherwise sink the whole commit at insertion time.
+		const batchTexts = new Set(items.map((item) => item.text.trim().toLowerCase()));
+		if (batchTexts.size !== items.length) throw new Error("INVALID_LESSON_ITEM");
+		return { ready: true, topic: String(parsed.topic ?? ""), items };
+	};
 
-	const json = extractJsonObjectText(text);
-	if (!json) throw new Error("BAD_JSON");
-
-	let parsed: Record<string, unknown>;
-	try {
-		parsed = JSON.parse(json);
-	} catch {
-		throw new Error("BAD_JSON");
+	let lastFormatError: unknown;
+	for (let attempt = 0; attempt <= LESSON_FORMAT_RETRIES; attempt++) {
+		const retryNote = attempt === 0 ? ""
+			: `\n\n⚠ 上一次输出无法解析（${String((lastFormatError as Error)?.message ?? "")}）。请重新输出完整批次：只输出一个合法 JSON 对象（以 {"ready":true 开头且完整闭合），不要任何解释、markdown 代码围栏或多余文字，字符串正确转义。内容要求与难度预算保持不变。`;
+		const text = await llm.complete(ctx, resolved, {
+			systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
+			prompt: prompt + retryNote,
+			thinkingLevel: config.thinkingLevel,
+		});
+		try {
+			return parseDecision(text);
+		} catch (err) {
+			if (!isLessonFormatError(err)) throw err;
+			lastFormatError = err;
+		}
 	}
-
-	if (parsed.ready === false) {
-		return {
-			ready: false,
-			reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
-		};
-	}
-	if (parsed.ready !== true) throw new Error("INVALID_READY");
-
-	if (!Array.isArray(parsed.items) || parsed.items.length !== wordItems + clozeItems) throw new Error("INVALID_LESSON_SHAPE");
-	const parsedItems = parsed.items.map((item) => parseGeneratedItem(item));
-	if (parsedItems.some((item) => item == null)) throw new Error("INVALID_LESSON_ITEM");
-	const items = parsedItems as GeneratedItem[];
-	// The word/phrase slots are homogeneous now: at least one word, phrases capped
-	// (never above the batch size), sentence cards are legacy review-only.
-	const wordCount = items.filter((item) => item.type === "word").length;
-	const phraseCount = items.filter((item) => item.type === "phrase").length;
-	const clozeCount = items.filter((item) => item.type === "cloze").length;
-	if (wordCount + phraseCount !== wordItems || phraseCount > phraseCapFor(wordItems) || wordCount < 1) throw new Error("INVALID_LESSON_SHAPE");
-	if (clozeCount !== clozeItems) throw new Error("INVALID_LESSON_SHAPE");
-	// Grammar clozes are the dedicated slots now; sentences are legacy review-only.
-	if (items.some((item) => item.type === "sentence")) throw new Error("INVALID_LESSON_SHAPE");
-	if (items.filter((item) => item.type === "cloze").some((item) => !validClozeItem(item))) throw new Error("INVALID_LESSON_ITEM");
-	// Reject in-batch duplicates early; the fingerprint unique index would
-	// otherwise sink the whole commit at insertion time.
-	const batchTexts = new Set(items.map((item) => item.text.trim().toLowerCase()));
-	if (batchTexts.size !== items.length) throw new Error("INVALID_LESSON_ITEM");
-
-	return { ready: true, topic: String(parsed.topic ?? ""), items };
+	throw lastFormatError;
 }
 
-interface CritiqueIssue {
+export interface CritiqueIssue {
 	severity: "blocker" | "minor";
 	category: string;
 	description: string;
@@ -371,6 +408,15 @@ export async function critiqueLesson(
 	const seenMeanings = new Map<string, string>();
 	for (const item of lesson.items) {
 		if (item.type !== "word" && item.type !== "phrase") continue;
+		// Require a visible Chinese part-of-speech label independently of the model.
+		// Keep the general parser compatible with existing stored cards.
+		if (!/[（(【]\s*(?:不可数|可数|不及物|及物)?(?:名词|动词|形容词|副词|介词|代词|连词|数词|冠词|感叹词|助动词|情态动词)(?:短语|过去分词|现在分词)?(?=[，,；;）)】\s])/.test(item.meaning)) {
+			budgetBlockers.push({
+				severity: "blocker",
+				category: "sense",
+				description: `「${item.text}」的中文题面缺少明确词性，请在 meaning 的括号中标注当前义项的名词、动词、形容词或动词短语等中文词性，并保留必要消歧线索；不能仅在例句或判分反馈中解释`,
+			});
+		}
 		const key = normalizeMeaning(item.meaning);
 		const firstText = seenMeanings.get(key);
 		if (firstText != null) {
@@ -388,7 +434,7 @@ export async function critiqueLesson(
 			available: true,
 			pass: false,
 			issues: budgetBlockers,
-			summary: "确定性质量检查未通过（难度预算或批次重复）",
+			summary: "确定性质量检查未通过（难度预算、批次重复或题面词性）",
 		};
 	}
 
@@ -408,8 +454,11 @@ export async function critiqueLesson(
 		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；若同一空存在其他语法正确的填法（时态/语态歧义）记 blocker；example 必须是代入答案后的完整句子；chunks 必须是 2-6 个意群且拼接覆盖完整句子；违反记 blocker",
 		"- 中文释义准确，不得机翻味",
 		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），也不得并列近义改写（「生效，起作用」应只写「生效」）；违反记 blocker",
+		"- 每张 word/phrase 的 meaning 缺少明确中文词性、词性与当前义项或例句不符，或只写「词组」等无法区分词类的标签，均记 sense blocker；不能根据隐藏 text 或例句猜出词性后放行。communicate / communication 仅提示「交流」必须拦截，并要求补动词 / 名词；名词、动词等词性线索属于必要题面，不属于冗余说明。",
 		"- word/phrase 的 example 必须原样包含所教 text（大小写不限）；违反记 blocker",
 		"- word/phrase 的中文释义与批内其它学习项或已学内容完全相同时（如 book 与 reserve 都是「预订」），必须给出可区分的义项或场景限定，否则记 blocker",
+		FORWARD_PROMPT_QUALITY,
+		"- 逐项模拟只看题面作答，主动寻找其它合理近义答案（包括未入库的词）：information 只给「信息/消息」且没有词性或义项限定，或例句无法帮助消歧，记 sense blocker。不能因本批没有 message 就放行；不能把必需的消歧限定误判为冗余。问题说明须写出具体替代答案和应补充的线索。",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
 		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；cloze 句子可以自然复用批次中 1-2 个单词或词组`,
 		"- 不得为凑结构硬造不自然句子",
@@ -470,9 +519,12 @@ export async function evaluateAttempt(
 	if (!resolved) return unavailable();
 	const isCloze = item.type === "cloze";
 	const isReverse = direction === "reverse";
+	// A reverse prompt that carries the card's example sentence pins the target
+	// sense; the bare legacy prompt cannot, so it must accept any common sense.
+	const reverseContextual = isReverse && questionHasReverseContext(questionText);
 	const target = isCloze ? item.meaning : isReverse ? item.meaning : item.text;
 	const answerLang = isReverse ? "中文" : "英文";
-	const shownQuestion = !isCloze && !isReverse ? questionText : undefined;
+	const shownQuestion = !isCloze && (!isReverse || reverseContextual) ? questionText : undefined;
 	const cuePresent = questionHasForwardCue(shownQuestion);
 	const rubric = isCloze
 		? [
@@ -481,12 +533,23 @@ export async function evaluateAttempt(
 			"- incorrect: 不同的词、空白或语言错误；语义相同但语法形式不同的答案不算对",
 		]
 		: isReverse
-		? [
-			"- correct: 中文意思与目标释义一致即可；同义表达、简写/全称、语体差异（如“已”与“已经”）都算对，措辞不必逐字相同",
-			"- 目标释义并列的多个说法若互为近义（如「生效，起作用」），答出任一近义说法即为 correct，不得因漏掉其余说法判 partial",
-			"- partial: 意思基本正确，但有明显遗漏或偏差；遗漏仅指漏掉并列的不同义项（如「银行」与「河岸」只答出其一）",
-			"- incorrect: 意思错误、空白、语言错误或无法识别",
-		]
+		? reverseContextual
+			? [
+				"- correct: 中文意思与目标释义一致即可；同义表达、简写/全称、语体差异（如“已”与“已经”）都算对，措辞不必逐字相同",
+				"- meaning 括号中的词性、可数性等出题提示不要求学生复述；【动词】等前缀标签同样无需复述；只答出符合题面语境的核心中文意思即可，不得因省略这些提示判 partial 或 incorrect（如 information 答「信息」）。真正改变词义的语义差异仍按题面判断。",
+				"- 目标释义并列的多个说法若互为近义（如「生效，起作用」），答出任一近义说法即为 correct",
+				"- 题面例句已经限定目标义项：答案必须是这个词在题面例句语境中的意思；不符合本句的其它常见义项，应判 incorrect（如 work 在「The settings work」中答「工作」）",
+				"- partial: 意思基本正确，但有明显遗漏或偏差",
+				"- incorrect: 意思错误、空白、语言错误、无法识别，或答的是题面例句之外的义项",
+			]
+			: [
+				"- 题面没有提供义项语境，无法唯一确定目标义项：任一常见且成立的中文义项都算 correct，不得因与目标释义不同而判错",
+				"- correct: 中文意思与该词任一常见义项一致即可；同义表达、简写/全称、语体差异都算对",
+				"- meaning 括号中的词性、可数性等出题提示不要求学生复述；【动词】等前缀标签同样无需复述；只答出符合题面语境的核心中文意思即可，不得因省略这些提示判 partial 或 incorrect（如 information 答「信息」）。真正改变词义的语义差异仍按题面判断。",
+				"- 目标释义并列的多个说法若互为近义（如「生效，起作用」），答出任一近义说法即为 correct",
+				"- partial: 意思基本正确，但有明显遗漏或偏差；遗漏仅指漏掉并列的不同义项（如「银行」与「河岸」只答出其一）",
+				"- incorrect: 意思错误、空白、语言错误或无法识别",
+			]
 		: cuePresent
 		? [
 			"- correct: 英文与目标完全一致，或仅大小写/标点/多余空格差异，且满足题面的首字母/语境线索",
@@ -638,7 +701,7 @@ export async function generateReplacement(
 	const isCloze = skipped.type === "cloze";
 	const itemSchema = isCloze
 		? '{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}'
-		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句翻译"}`;
+		: `{"type":"${skipped.type}","text":"${skipped.type === "word" ? "单词" : "词组"}","phonetic":"/音标/","meaning":"中文释义（当前义项的中文词性，必要的消歧线索）","example":"英文例句","example_cn":"例句翻译"}`;
 	const prompt = [
 		`用户刚把 ${skipped.type} 卡片「${skipped.text} = ${skipped.meaning}」标记为已经很熟，且用户正在备考雅思。`,
 		`请补充 1 张新的 ${skipped.type} 卡片，不能与已有内容重复。`,
@@ -651,6 +714,7 @@ export async function generateReplacement(
 		isCloze
 			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，text 只放挖空句且句尾不得附加 = 答案或 → 答案，example 是代入答案后的完整句子，chunks 是覆盖完整句子的 2-6 个意群，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
 			: "内容要真实常用：会话来源的贴近当前会话语境，雅思来源的选自雅思高频词表，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn；example 必须原样包含所教 text（大小写不限）；若某个常用英文词/词组与本项共用同一中文释义（如 book 与 reserve 都表示「预订」），meaning 必须补上可区分的义项或场景。",
+		...(isCloze ? [] : [FORWARD_PROMPT_QUALITY]),
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
 		...(recentLog
 			? ["", "最近出题与作答记录（新→旧）：", recentLog, "避免重复近期刚练过的内容；若反馈指向出题缺陷，避免同类出题。"]
@@ -723,7 +787,7 @@ export async function generateCustomCards(
 		`卡片类型限 word（单词）、phrase（词组）、cloze（语法填空）；数量按提示词理解，未写明数量时做 5 张；单次最多 ${MAX_CUSTOM_PER_ADD} 张，提示词要求更多时只做最重要的前 ${MAX_CUSTOM_PER_ADD} 张。`,
 		"提示词完全无法解读时才输出：{\"ready\":false,\"reason\":\"简短原因\"}",
 		"信息充分时只输出 JSON，不要任何其他文字：",
-		`{"ready":true,"items":[{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}]}`,
+		`{"ready":true,"items":[{"type":"word|phrase","text":"单词或词组","phonetic":"/音标/","meaning":"中文释义（当前义项的中文词性，必要的消歧线索）","example":"英文例句","example_cn":"例句中文翻译"},{"type":"cloze","text":"含一个 ___ 的英文句子（空后括号给原形提示）","phonetic":"","meaning":"正确答案","example":"代入答案后的完整句子","example_cn":"整句中文翻译（可附考点说明）","chunks":["意群1","意群2","意群3"]}]}`,
 		"内容要求：",
 		"- 内容要真实常用、贴合提示词的意图，难度贴合下面的画像与预算",
 		"- word 和 phrase 的例句短小自然，贴近提示词的实际使用场景",
@@ -731,6 +795,7 @@ export async function generateCustomCards(
 		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然；提示词只要词汇时可不用 cloze`,
 		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning；释义只给一个首选说法，不并列近义改写，确有多个义项才用「；」并列",
 		"- word/phrase 的 example 必须原样包含所教的 text（大小写不限），例句要真正用到这个词",
+		FORWARD_PROMPT_QUALITY,
 		"- 若某个常用英文词/词组与本项 text 共用同一中文释义（如 book 与 reserve 都表示「预订」），meaning 必须补上可区分的义项或场景，不得与本批其它卡或已有内容的中文释义完全相同",
 		"- 每张卡互不重复，也不得与已有内容重复：" + (known.length ? known.join("、") : "（暂无）"),
 		...(feedback && feedback.length

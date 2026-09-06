@@ -1,3 +1,4 @@
+import { CHAT_SYSTEM_PROMPT, chatEditReview, createChatDispatcher, parseChatRequest, runChat } from "./chat.ts";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -7,12 +8,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
+import { dailyLoadPlan, formatDailyLoadPlan, hasNewCardCapacity, nextAdaptiveLessonBatch, remainingNewCardSlots } from "./adaptive-load.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, meaningCollisions, openDb, peekCustomQueue, pendingReplacementTypes, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, meaningCollisions, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
-import { MAX_LESSON_REVISIONS, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
+import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
 import { FACES, TYPE_LABELS, formatStatusLine, forwardCue, forwardCueSuffix, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type ForwardCue, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
 import { dbFilePath, isSyncEnabled, peekRemoteNewer, pullIfNewer, pushSnapshot } from "./sync.ts";
@@ -58,15 +60,30 @@ export default function piEnglishAnkiExtension(
 
 	// -- State ------------------------------------------------------------
 	let config: PetConfig = { ...DEFAULTS };
-	const statsLine = (database: DatabaseSync) => formatStatusLine(database, config.dailyNewLimit);
+	const loadPlan = (database: DatabaseSync, now = new Date()) => dailyLoadPlan(database, now, config);
+	const statsLine = (database: DatabaseSync) => formatStatusLine(database, loadPlan(database));
+	const queueEta = (database: DatabaseSync, total: number) => {
+		const plan = loadPlan(database);
+		if (!plan.adaptive && plan.limit === 0) return "不限速，将尽快放出";
+		const pace = Math.max(1, plan.limit || Math.min(plan.rampTarget, config.dailyNewLimit));
+		return `按当前${plan.adaptive ? "自动" : "固定"}节奏预计 ${Math.ceil(total / pace)} 天放完`;
+	};
 	let db: DatabaseSync | null = null;
 	let resolvedModelName = "";
 	let lastError = "";
+	let pendingChat = false;
+	const dispatchChat = createChatDispatcher();
 	let pendingLLMCall = false;
 	let pendingLLMCallAt = 0;
 	let lastRejectedConversation = "";
 	let manualTeachTopic = "";
+	/** Manual /anki:teach topics waiting for the in-flight generation (in-process FIFO). */
+	const teachQueue: string[] = [];
 	let lastRejectedReplacementKey = "";
+	let replacementRetryAt = 0;
+	let replacementTimer: ReturnType<typeof setTimeout> | undefined;
+	const REPLACEMENT_RETRY_MS = 30_000;
+	let replacementRunning = false;
 	let sessionGeneration = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -111,6 +128,8 @@ export default function piEnglishAnkiExtension(
 		pendingLLMCallAt = 0;
 		lastRejectedConversation = "";
 		lastRejectedReplacementKey = "";
+		replacementRetryAt = 0;
+		replacementRunning = false;
 		resolvedModelName = "";
 	}
 
@@ -129,6 +148,20 @@ export default function piEnglishAnkiExtension(
 		pendingLLMCallAt = 0;
 		if (db) setStat(db, "last_gen_status", "hung_llm_reset");
 		return true;
+	}
+
+	/** Start the next queued manual teach once no generation is in flight. */
+	function drainTeachQueue() {
+		if (teachQueue.length === 0 || pendingLLMCall) return;
+		const ctx = latestCtx;
+		if (!ctx || isCtxStale(ctx)) return;
+		const topic = teachQueue.shift();
+		if (topic == null) return;
+		manualTeachTopic = topic;
+		ctx.ui.notify(`开始执行排队的备课：「${topic}」`, "info");
+		void generateAndInsert(ctx, new Date())
+			.catch((err) => console.error(`[pi-english-anki] queued teach failed: ${err}`))
+			.finally(() => scheduleTimer());
 	}
 
 	function stopTimer() {
@@ -180,6 +213,43 @@ export default function piEnglishAnkiExtension(
 		} catch { /* sync must never break the tick */ }
 	}
 
+	function stopReplacementTimer() {
+		if (replacementTimer) clearTimeout(replacementTimer);
+		replacementTimer = undefined;
+	}
+
+	/** Refill stored inventory independently of the currently displayed card. */
+	function scheduleReplacementWork() {
+		if (replacementTimer || replacementRunning || !db || !latestCtx || pendingReplacementTypes(db).length === 0) return;
+		const generation = sessionGeneration;
+		replacementTimer = setTimeout(() => {
+			replacementTimer = undefined;
+			const ctx = latestCtx;
+			if (generation !== sessionGeneration || !db || !ctx || isCtxStale(ctx)) return;
+			if (Date.now() < replacementRetryAt) { scheduleReplacementWork(); return; }
+			if (pendingLLMCall || answerJudging) {
+				replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
+				scheduleReplacementWork();
+				return;
+			}
+			const type = pendingReplacementTypes(db)[0];
+			if (!type) return;
+			replacementRunning = true;
+			void generateReplacementAndInsert(ctx, type).then((inserted) => {
+				if (generation === sessionGeneration) replacementRetryAt = inserted ? 0 : Date.now() + REPLACEMENT_RETRY_MS;
+			}, (err) => {
+				if (generation === sessionGeneration) replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
+				console.error(`[pi-english-anki] Background replacement failed: ${err}`);
+			}).finally(() => {
+				if (generation !== sessionGeneration) return;
+				replacementRunning = false;
+				scheduleReplacementWork();
+			});
+		}, Math.max(0, replacementRetryAt - Date.now()));
+		(replacementTimer as unknown as { kaomojiReplacement?: boolean }).kaomojiReplacement = true;
+		replacementTimer.unref?.();
+	}
+
 	function scheduleTimer(delay = intervalMs()) {
 		stopTimer();
 		if (!latestCtx || config.intervalMinutes <= 0 || db == null || activeItem(db) != null) return;
@@ -200,7 +270,10 @@ export default function piEnglishAnkiExtension(
 		const generation = sessionGeneration;
 		if (!ctx || isCtxStale(ctx) || config.intervalMinutes <= 0) return;
 		if (pendingLLMCall && !resetHungLlmCall()) {
-			scheduleTimer(Math.min(30_000, intervalMs()));
+			// Background inventory work must not delay already-stored study cards.
+			const due = claimDueItem(new Date());
+			if (due) showItem(ctx, due);
+			else scheduleTimer(Math.min(30_000, intervalMs()));
 			return;
 		}
 		try {
@@ -242,6 +315,7 @@ export default function piEnglishAnkiExtension(
 			updateWidget(ctx, FACES.idle, [statsLine(db)]);
 		}
 		startPolling();
+		scheduleReplacementWork();
 	}
 
 	// -- Coordinator lease & cross-session sync ----------------------------
@@ -382,9 +456,9 @@ export default function piEnglishAnkiExtension(
 		localVersion = state.active_version;
 	}
 
-	/** Cloze has no teach face: a legacy persisted teach state still quizzes. */
+	/** Non-sentence cards always use active recall, including persisted teach states. */
 	function effectiveIsReview(item: ItemRow, state: RuntimeState): boolean {
-		return state.active_kind === "review" || item.type === "cloze";
+		return state.active_kind === "review" || item.type !== "sentence";
 	}
 
 	/**
@@ -457,6 +531,7 @@ export default function piEnglishAnkiExtension(
 					}
 				}
 				const state = getRuntimeState(db);
+				scheduleReplacementWork();
 				const generationExpired = Boolean(
 					pendingLLMCall && (!state.generation_until || Date.now() >= new Date(state.generation_until).getTime())
 				);
@@ -553,7 +628,7 @@ export default function piEnglishAnkiExtension(
 		const replacementNew = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 AND introduction_kind = 'replacement' ${SCHEDULABLE} LIMIT 1`)
 			.get(now.toISOString());
 		if (replacementNew) return true;
-		if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) return false;
+		if (!hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now))) return false;
 		return Boolean(db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 ${SCHEDULABLE} LIMIT 1`).get(now.toISOString()));
 	}
 
@@ -583,8 +658,8 @@ export default function piEnglishAnkiExtension(
 					due = replacement;
 					isReview = false;
 				} else {
-					// Enforce the planned/custom first-display quota (0 = unlimited, for compatibility).
-					if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) {
+					// Enforce today's automatic or fixed planned/custom first-display quota.
+					if (!hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now))) {
 						db.exec("ROLLBACK");
 						return undefined;
 					}
@@ -643,7 +718,7 @@ export default function piEnglishAnkiExtension(
 		lines.push(statsLine(db));
 		updateWidget(ctx, face, lines);
 		if (config.verbose) {
-			ctx.ui.notify(`${isReview ? "复习" : "新学"}：${item.text} — ${item.meaning}`, "info");
+			ctx.ui.notify(item.reviews === 0 ? "新卡已放出，请先作答" : "复习卡已放出，请先作答", "info");
 		}
 		return true;
 	}
@@ -811,17 +886,13 @@ export default function piEnglishAnkiExtension(
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
 		if (!item) return true;
 		if (item.type === "sentence") return answerSentencePending(ctx, item, rawText, state);
-		if (!effectiveIsReview(item, state)) {
-			ctx.ui.notify("这是首次展示的新卡，请先用 /anki:flip 翻面查看释义，再选择 /anki:good 或 /anki:skip", "info");
-			return true;
-		}
 		const text = rawText.trim();
 		if (!text) {
 			const cue = activeForwardCue(item, pendingDirection);
 			const promptText = item.type === "cloze"
 				? `✍️ 请补全：${item.text}`
 				: pendingDirection === "reverse"
-					? `✍️ 请写出「${item.text}」的中文释义`
+					? `✍️ ${recallQuestionText(item, "reverse")}`
 					: `✍️ 请写出「${item.meaning}」的英文${cue ? forwardCueSuffix(cue) : ""}`;
 			updateWidget(ctx, FACES.review, [
 				`${FACES.review} ${promptText}`,
@@ -1130,9 +1201,23 @@ export default function piEnglishAnkiExtension(
 						recallQuestionText(item, expectedDirection, activeForwardCue(item, expectedDirection)),
 					);
 				}
+				const objectiveCorrect = attempt != null && attempt.verdict === "correct";
 				if (isRecall) {
 					if (usesDirection) {
-						advanceReviewDirectional(db, item.id, expectedDirection, next.state, next.due, item.reviews + 1, now);
+						const recognitionCovered = expectedDirection === "forward" &&
+							objectiveCorrect && assistanceLevel === "none" && effective === Rating.Good;
+						advanceReviewDirectional(
+							db,
+							item.id,
+							expectedDirection,
+							next.state,
+							next.due,
+							item.reviews + 1,
+							now,
+							recognitionCovered
+								? { siblingDueFloor: recognitionDueFloorAfterProduction(now, next.due) }
+								: undefined,
+						);
 					} else {
 						advanceReview(db, item.id, next.state, next.due, item.reviews + 1);
 					}
@@ -1145,7 +1230,6 @@ export default function piEnglishAnkiExtension(
 				const m = db.prepare("SELECT stage, unassisted_good, assisted_good, consecutive_again FROM mastery_state WHERE item_id = ?").get(item.id) as { stage: string; unassisted_good: number; assisted_good: number; consecutive_again: number } | undefined;
 				const prevStage = m?.stage ?? "exposure";
 				const assisted = assistanceLevel !== "none";
-				const objectiveCorrect = attempt != null && attempt.verdict === "correct";
 				const newGood = effective === Rating.Again
 					? 0
 					: Number(m?.unassisted_good ?? 0) + (objectiveCorrect && !assisted ? 1 : 0);
@@ -1306,8 +1390,6 @@ export default function piEnglishAnkiExtension(
 				next_check_at: new Date(now.getTime() + REPLACEMENT_GRACE_MS).toISOString(),
 				coordinator: myId,
 				coordinator_until: new Date(now.getTime() + leaseMs()).toISOString(),
-				generation_token: null,
-				generation_until: null,
 				last_activity: now.toISOString(),
 			});
 			applied = true;
@@ -1339,13 +1421,17 @@ export default function piEnglishAnkiExtension(
 		skippedItem?: ItemRow,
 	): Promise<boolean> {
 		if (!db) return false;
+		const updateReplacementWidget: typeof updateWidget = (...args) => {
+			if (db && activeItem(db)) renderGlobalCard(ctx);
+			else updateWidget(...args);
+		};
 		// Legacy sentence skips are fulfilled with cloze cards now.
 		const type: GeneratedItem["type"] = requestedType === "sentence" ? "cloze" : requestedType;
 		if (type !== requestedType) logGenStatus("replacement_mapped: sentence→cloze");
 		let skipped = skippedItem ?? latestMasteredItem(db, requestedType);
 		if (skipped && skipped.type === "sentence" && type === "cloze") skipped = { ...skipped, type: "cloze" };
 		if (!skipped) {
-			updateWidget(ctx, FACES.error, ["待补卡片缺少来源记录，请保留队列并稍后重试。", statsLine(db)]);
+			updateReplacementWidget(ctx, FACES.error, ["待补卡片缺少来源记录，请保留队列并稍后重试。", statsLine(db)]);
 			logGenStatus("replacement_no_source");
 			return false;
 		}
@@ -1362,13 +1448,13 @@ export default function piEnglishAnkiExtension(
 		// must not.
 		const conversationUnchanged = () => buildConversation(ctx.sessionManager.getBranch()) === branchSnapshot;
 		if (!conversation.trim()) {
-			updateWidget(ctx, FACES.idle, ["等会话形成明确话题后，再补充同类型卡片…", statsLine(db)]);
+			updateReplacementWidget(ctx, FACES.idle, ["等会话形成明确话题后，再补充同类型卡片…", statsLine(db)]);
 			logGenStatus("replacement_empty_conversation");
 			return false;
 		}
 		const rejectionKey = `${type}\n${conversation}`;
-		if (rejectionKey === lastRejectedReplacementKey) {
-			updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
+		if (rejectionKey === lastRejectedReplacementKey && Date.now() < replacementRetryAt) {
+			updateReplacementWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
 			logGenStatus("replacement_cached_rejection");
 			return false;
 		}
@@ -1387,7 +1473,7 @@ export default function piEnglishAnkiExtension(
 		const generation = sessionGeneration;
 		pendingLLMCall = true;
 		pendingLLMCallAt = Date.now();
-		updateWidget(ctx, FACES.teach, ["正在补充同类型卡片，喵…"]);
+		updateReplacementWidget(ctx, FACES.teach, ["正在补充同类型卡片，喵…"]);
 		try {
 			let effectiveResolved = resolveModel(ctx);
 			if (!effectiveResolved) throw new Error("NO_MODEL");
@@ -1419,7 +1505,8 @@ export default function piEnglishAnkiExtension(
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return false;
 			if (!decision.ready) {
 				lastRejectedReplacementKey = rejectionKey;
-				updateWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
+				replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
+				updateReplacementWidget(ctx, FACES.idle, ["还在等待足够信息，以补充同类型卡片…", statsLine(db)]);
 				logGenStatus(`replacement_not_ready: ${decision.reason || ""}`);
 				if (config.verbose && decision.reason) ctx.ui.notify(`暂不补卡：${decision.reason}`, "info");
 				return false;
@@ -1460,7 +1547,8 @@ export default function piEnglishAnkiExtension(
 			}
 			if (!replacementVerdict.pass) {
 				if (replacementVerdict.available) lastRejectedReplacementKey = rejectionKey;
-				updateWidget(ctx, FACES.idle, [
+				replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
+				updateReplacementWidget(ctx, FACES.idle, [
 					replacementVerdict.available ? "补充卡内容质量未达标，保留队列稍后再试…" : "补充卡审查暂时不可用，保留队列稍后重试…",
 					statsLine(db),
 				]);
@@ -1476,7 +1564,7 @@ export default function piEnglishAnkiExtension(
 			try {
 				const state = getRuntimeState(db);
 				const dueReview = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} LIMIT 1`).get(now.toISOString());
-				if (!ownsGeneration(state, generationToken, now) || state.active_item_id != null || pendingReplacementTypes(db)[0] !== requestedType || dueReview) {
+				if (!ownsGeneration(state, generationToken, now) || pendingReplacementTypes(db)[0] !== requestedType) {
 					db.exec("ROLLBACK");
 					logGenStatus("replacement_insert_deferred");
 					return false;
@@ -1494,21 +1582,24 @@ export default function piEnglishAnkiExtension(
 						keyWords: item.keyWords,
 						introductionKind: "replacement",
 					});
-					bumpStat(db, "total_learned", 1);
-					touchStreak(db, now);
-					if (!consumeReplacement(db, requestedType)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
-					markShown(db, id);
-					db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(now.toISOString(), id);
-					setRuntimeState(db, {
-						active_item_id: id,
-						active_kind: "teach",
-						active_direction: "forward",
-						active_version: state.active_version + 1,
-						...EMPTY_SENTENCE_CYCLE,
-						next_check_at: now.toISOString(),
-						generation_token: null,
-						generation_until: null,
+					const activate = state.active_item_id == null && !dueReview;
+					if (activate) {
+						bumpStat(db, "total_learned", 1);
+						touchStreak(db, now);
+						markShown(db, id);
+						db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(now.toISOString(), id);
+						setRuntimeState(db, {
+							active_item_id: id,
+							active_kind: "teach",
+							active_direction: "forward",
+							active_version: state.active_version + 1,
+							...EMPTY_SENTENCE_CYCLE,
+							next_check_at: now.toISOString(),
+							generation_token: null,
+							generation_until: null,
 					});
+					}
+					if (!consumeReplacement(db, requestedType)) throw new Error("REPLACEMENT_QUEUE_MISMATCH");
 					inserted = db.prepare("SELECT * FROM items WHERE id = ?").get(id) as ItemRow | undefined;
 					if (!inserted) throw new Error("REPLACEMENT_INSERT_FAILED");
 					db.exec("COMMIT");
@@ -1519,21 +1610,34 @@ export default function piEnglishAnkiExtension(
 			}
 			if (duplicate) {
 				lastRejectedReplacementKey = rejectionKey;
-				updateWidget(ctx, FACES.idle, ["模型给出了重复内容，等话题变化后再补卡…", statsLine(db)]);
+				replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
+				updateReplacementWidget(ctx, FACES.idle, ["模型给出了重复内容，等话题变化后再补卡…", statsLine(db)]);
 				logGenStatus("replacement_duplicate");
 				return false;
 			}
 			lastRejectedReplacementKey = "";
 			if (!inserted) return false;
 			logGenStatus(`replacement_ok: ${type} ${item.text}`);
-			showItem(ctx, inserted);
-			if (config.verbose) ctx.ui.notify(`已补充 ${TYPE_LABELS[type]}：${item.text}`, "info");
+			replacementRetryAt = 0;
+			// A worker may have deferred while this direct skip call was in flight.
+			// Cancel that busy retry so remaining inventory resumes immediately.
+			stopReplacementTimer();
+			if (getRuntimeState(db).active_item_id === inserted.id) showItem(ctx, inserted);
+			else if (getRuntimeState(db).active_item_id != null) renderGlobalCard(ctx);
+			else {
+				// Successful refill clears a prior failed-teach pacing delay on an empty screen.
+				resetPacing(db);
+				const due = claimDueItem(new Date(), true);
+				if (due) showItem(ctx, due);
+			}
+			if (config.verbose) ctx.ui.notify(`已补充一张${TYPE_LABELS[type]}卡`, "info");
 			return true;
 		} catch (err) {
 			if (sessionGeneration !== generation) return false;
 			const msg = (err as Error)?.message || String(err);
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
-			if (db && !isCtxStale(ctx)) updateWidget(ctx, FACES.error, [`补卡失败：${lastError}`, statsLine(db)]);
+			if (db && !isCtxStale(ctx)) updateReplacementWidget(ctx, FACES.error, [`补卡失败：${lastError}`, statsLine(db)]);
+			replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
 			logGenStatus(`replacement_error: ${lastError}`);
 			return false;
 		} finally {
@@ -1541,6 +1645,8 @@ export default function piEnglishAnkiExtension(
 			if (sessionGeneration === generation) {
 				pendingLLMCall = false;
 				pendingLLMCallAt = 0;
+				drainTeachQueue();
+				scheduleReplacementWork();
 			}
 		}
 	}
@@ -1567,13 +1673,13 @@ export default function piEnglishAnkiExtension(
 				db.exec("ROLLBACK");
 				return false;
 			}
-			if (config.dailyNewLimit > 0 && countTodayNew(db, now) >= config.dailyNewLimit) {
+			const plan = loadPlan(db, now);
+			const introduced = countTodayNew(db, now);
+			if (!hasNewCardCapacity(plan, introduced)) {
 				db.exec("ROLLBACK");
 				return false;
 			}
-			const remaining = config.dailyNewLimit > 0
-				? config.dailyNewLimit - countTodayNew(db, now)
-				: customQueueCount(db);
+			const remaining = remainingNewCardSlots(plan, introduced, customQueueCount(db));
 			const rows = peekCustomQueue(db, remaining);
 			if (rows.length === 0) {
 				db.exec("ROLLBACK");
@@ -1701,18 +1807,30 @@ export default function piEnglishAnkiExtension(
 		// ahead of fresh lesson generation (pure DB work, no LLM).
 		if (releaseCustomQueue(ctx, now)) return;
 
-		// 3. Otherwise teach new items (LLM), up to the daily limit (0 = unlimited), single-owner.
-		if (config.dailyNewLimit === 0 || countTodayNew(db, now) < config.dailyNewLimit) {
+		// 3. Otherwise teach new items (LLM), using today's automatic or fixed quota.
+		const plan = loadPlan(db, now);
+		const introduced = countTodayNew(db, now);
+		if (hasNewCardCapacity(plan, introduced)) {
 			if (pendingLLMCall && !resetHungLlmCall()) return;
-			// Partial batches fill only the day's remaining quota; the manual
-			// /anki:teach path keeps the full default batch.
-			const slots = config.dailyNewLimit > 0
-				? config.dailyNewLimit - countTodayNew(db, now)
-				: LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS;
-			await generateAndInsert(ctx, now, {
-				wordItems: Math.min(LESSON_WORD_ITEMS, slots),
-				clozeItems: slots >= LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS ? LESSON_CLOZE_ITEMS : 0,
-			});
+			// Queued manual topics take priority over a fresh automatic lesson.
+			if (teachQueue.length > 0) {
+				manualTeachTopic = teachQueue.shift() ?? "";
+				await generateAndInsert(ctx, now);
+				return;
+			}
+			let batch = nextAdaptiveLessonBatch(db, now, plan);
+			if (!plan.adaptive) {
+				const slots = remainingNewCardSlots(
+					plan,
+					introduced,
+					LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS,
+				);
+				batch = {
+					wordItems: Math.min(LESSON_WORD_ITEMS, slots),
+					clozeItems: slots >= LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS ? LESSON_CLOZE_ITEMS : 0,
+				};
+			}
+			if (batch && batch.wordItems > 0) await generateAndInsert(ctx, now, batch);
 			return;
 		}
 
@@ -1732,8 +1850,14 @@ export default function piEnglishAnkiExtension(
 
 	async function generateAndInsert(ctx: ExtensionContext, _now: Date, batch?: LessonBatch) {
 		const conversationSnapshot = buildConversation(ctx.sessionManager.getBranch());
-		const conversation = manualTeachTopic || conversationSnapshot;
+		// RPC sessions (the IELTS app) have no chat to mine for topics; fall back
+		// to the IELTS basic line so the adaptive daily plan still fills on ticks.
+		const emptyFallback = !conversationSnapshot.trim() && ctx.mode === "rpc"
+			? "雅思基础词汇（A1-A2，超级初学者）"
+			: "";
+		const conversation = manualTeachTopic || conversationSnapshot || emptyFallback;
 		const isManual = manualTeachTopic !== "";
+		const usedFallback = !isManual && emptyFallback !== "";
 		manualTeachTopic = "";
 		const conversationUnchanged = () => buildConversation(ctx.sessionManager.getBranch()) === conversationSnapshot;
 		if (!conversation.trim()) {
@@ -1742,14 +1866,23 @@ export default function piEnglishAnkiExtension(
 			deferPacing();
 			return;
 		}
-		if (!isManual && conversation === lastRejectedConversation) {
+		if (!isManual && !usedFallback && conversation === lastRejectedConversation) {
 			if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
 			logGenStatus("cached_rejection");
 			deferPacing();
 			return;
 		}
 		const generationToken = claimGeneration();
-		if (!generationToken) { logGenStatus("no_gen_token"); return; }
+		if (!generationToken) {
+			// Another process holds the lease: keep the manual request queued
+			// instead of dropping it; the next tick or lease release retries it.
+			if (isManual) {
+				teachQueue.unshift(conversation);
+				if (!isCtxStale(ctx)) ctx.ui.notify(`已排队：另一轮生成仍在进行，结束后自动开始「${conversation}」`, "info");
+			}
+			logGenStatus("no_gen_token");
+			return;
+		}
 
 		// One profile+budget snapshot per generation, after the generation claim and
 		// before any LLM await; the same snapshot feeds the initial generator,
@@ -1849,6 +1982,51 @@ export default function piEnglishAnkiExtension(
 				return;
 			}
 			if (!conversationUnchanged()) return;
+			// The known list is advisory; when the generator still returns an
+			// existing card, retry with the collisions called out, then drop any
+			// remainder so the batch is delivered instead of failing wholesale.
+			const duplicateItems = (items: GeneratedItem[]): GeneratedItem[] => {
+				if (!db) return [];
+				const seen = new Set<string>();
+				const dupes: GeneratedItem[] = [];
+				for (const it of items) {
+					const fp = contentFingerprint(it.type, it.text, it.meaning);
+					if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fp) || seen.has(fp)) dupes.push(it);
+						seen.add(fp);
+				}
+				return dupes;
+			};
+			for (let dupAttempt = 0; dupAttempt < MAX_DUPLICATE_RETRIES; dupAttempt++) {
+				const dupes = duplicateItems(lesson.items);
+				if (dupes.length === 0) break;
+				logGenStatus(`duplicate_retry: ${dupes.map((d) => d.text).join("、")}`);
+				const dupFeedback: CritiqueIssue[] = dupes.map((d) => ({
+					severity: "blocker",
+					category: "dup",
+					description: `「${d.text}」与已有学习内容重复，请更换成其它不重复的单词/词组`,
+				}));
+				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, dupFeedback, adaptive ?? undefined, recentLog, batch);
+				if (sessionGeneration !== generation) return;
+				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+				if (!revised.ready) break;
+				const revisedVerdict = await critiqueLesson(llm, ctx, effectiveResolved, revised, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
+				if (sessionGeneration !== generation) return;
+				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+				if (!revisedVerdict.pass) break;
+				lesson = revised;
+			}
+			const remainingDupes = duplicateItems(lesson.items);
+			if (remainingDupes.length > 0) {
+				const dupeKeys = new Set(remainingDupes.map((d) => `${d.type} ${d.text}`));
+				logGenStatus(`duplicate_dropped: ${[...dupeKeys].join("、")}`);
+				lesson = { ...lesson, items: lesson.items.filter((it) => !dupeKeys.has(`${it.type} ${it.text}`)) };
+				if (lesson.items.length === 0) {
+					updateWidget(ctx, FACES.idle, ["生成内容与已有卡重复，稍后再试…", statsLine(db)]);
+					logGenStatus(`duplicate_batch: ${[...dupeKeys].join("、").slice(0, 120)}`);
+					deferPacing();
+					return;
+				}
+			}
 			const insertedAt = new Date();
 			let insertedFirst: ItemRow | undefined;
 			db.exec("BEGIN IMMEDIATE");
@@ -1856,7 +2034,7 @@ export default function piEnglishAnkiExtension(
 				const state = getRuntimeState(db);
 				if (!ownsGeneration(state, generationToken, insertedAt) ||
 					state.active_item_id != null ||
-					(config.dailyNewLimit > 0 && countTodayNew(db, insertedAt) >= config.dailyNewLimit) ||
+					!hasNewCardCapacity(loadPlan(db, insertedAt), countTodayNew(db, insertedAt)) ||
 					pendingReplacementTypes(db).length > 0 ||
 					getDueItem(db, insertedAt)) {
 					db.exec("ROLLBACK");
@@ -1908,9 +2086,16 @@ export default function piEnglishAnkiExtension(
 			if (!insertedFirst) return;
 			showItem(ctx, insertedFirst);
 			if (lesson.topic && db) {
-				updateWidget(ctx, FACES.teach, [
+				updateWidget(ctx, FACES.review, [
 					`${FACES.teach} 今日主题：${lesson.topic}`,
-					...renderCard(insertedFirst, false, FACES.teach, false),
+					...renderCard(
+						insertedFirst,
+						true,
+						FACES.review,
+						false,
+						"forward",
+						activeForwardCue(insertedFirst, "forward"),
+					),
 					statsLine(db),
 				]);
 			}
@@ -1929,6 +2114,7 @@ export default function piEnglishAnkiExtension(
 			if (sessionGeneration === generation) {
 				pendingLLMCall = false;
 				pendingLLMCallAt = 0;
+				drainTeachQueue();
 			}
 		}
 	}
@@ -2046,10 +2232,7 @@ export default function piEnglishAnkiExtension(
 				throw err;
 			}
 			const total = customQueueCount(db);
-			const eta = config.dailyNewLimit > 0
-				? `按每日 ${config.dailyNewLimit} 张预计 ${Math.ceil(total / Math.max(1, config.dailyNewLimit))} 天放完`
-				: "不限速，将尽快放出";
-			ctx.ui.notify(`已做好 ${kept.length} 张卡并入队（队列共 ${total} 张，${eta}）`, "info");
+			ctx.ui.notify(`已做好 ${kept.length} 张卡并入队（队列共 ${total} 张，${queueEta(db, total)}）`, "info");
 			if (dropped.length) {
 				ctx.ui.notify(`其中 ${dropped.length} 张与已有卡片/队列重复，已丢弃：${dropped.join("、").slice(0, 200)}`, "info");
 			}
@@ -2068,6 +2251,7 @@ export default function piEnglishAnkiExtension(
 			if (sessionGeneration === generation) {
 				pendingLLMCall = false;
 				pendingLLMCallAt = 0;
+				drainTeachQueue();
 			}
 		}
 	}
@@ -2089,6 +2273,7 @@ export default function piEnglishAnkiExtension(
 			ctx.ui.notify("当前没有可跳过的卡片", "info");
 			return;
 		}
+		scheduleReplacementWork();
 		// A due review must never wait for replacement generation.
 		resetPacing(db);
 		const dueReview = claimDueItem(new Date(), true);
@@ -2105,6 +2290,9 @@ export default function piEnglishAnkiExtension(
 			// Generation failed or was waiting for info: lower the pacing window so
 			// the next tick can surface a due card instead of stalling on the grace gap.
 			resetPacing(db);
+			replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
+			stopReplacementTimer();
+			scheduleReplacementWork();
 			scheduleTimer();
 		}
 	}
@@ -2299,6 +2487,52 @@ export default function piEnglishAnkiExtension(
 		},
 	});
 
+	pi.registerCommand("anki:chat", {
+		description: "Anki 专用问答、修卡与加卡",
+		handler: async (args, ctx) => {
+			let request;
+			try { request = parseChatRequest(String(args ?? "")); }
+			catch (error) {
+				const reply = `问答请求无效：${(error as Error).message}`;
+				let rawRequest: { requestId?: unknown; itemId?: unknown } | null = null;
+				try { rawRequest = JSON.parse(String(args ?? "")); } catch { /* no correlated request id */ }
+				if (rawRequest && typeof rawRequest.requestId === "string" && /^[a-zA-Z0-9_-]{1,80}$/.test(rawRequest.requestId)) {
+					ctx.ui.notify("ANKI_CHAT_RESULT:" + JSON.stringify({ requestId: rawRequest.requestId, success: false, reply, action: "none", itemId: Number.isSafeInteger(rawRequest.itemId) && Number(rawRequest.itemId) > 0 ? rawRequest.itemId : null }), "info");
+				} else ctx.ui.notify(reply, "error");
+				return;
+			}
+			const generation = sessionGeneration;
+			const database = db;
+			const valid = () => generation === sessionGeneration && database === db && !isCtxStale(ctx);
+			dispatchChat(request, async () => {
+				if (!database || !valid()) return { requestId: request.requestId, success: false, reply: "数据库或会话不可用", action: "none", itemId: request.itemId };
+				if (pendingChat) return { requestId: request.requestId, success: false, reply: "上一条问答仍在处理中，请稍候", action: "none", itemId: request.itemId };
+				pendingChat = true;
+				try {
+					const resolved = resolveModel(ctx);
+					if (!resolved) return { requestId: request.requestId, success: false, reply: "未配置可用模型", action: "none", itemId: request.itemId };
+					return await runChat(request, {
+						db: database, valid,
+						complete: (prompt) => llm.complete(ctx, resolved, { systemPrompt: CHAT_SYSTEM_PROMPT, prompt, thinkingLevel: config.thinkingLevel }),
+						critique: async (item) => {
+							const review = chatEditReview(database, request.itemId!, item);
+							return (await critiqueLesson(llm, ctx, resolved, review.lesson, review.known, config, undefined, null)).pass;
+						},
+						refresh: () => { if (valid()) { localVersion = -1; renderGlobalCard(ctx); } },
+						add: async (prompt) => {
+							if (pendingLLMCall) return { success: false, reply: "正在备课，请稍后再加卡" };
+							const messages: string[] = [];
+							const scopedUi = new Proxy(ctx.ui, { get(target, key) { return key === "notify" ? (message: string) => messages.push(message) : Reflect.get(target, key); } });
+							const scopedCtx = new Proxy(ctx, { get(target, key) { return key === "ui" ? scopedUi : Reflect.get(target, key); } });
+							await runAddCustomCards(scopedCtx, prompt);
+							return { success: messages.some(message => /^已做好 \d+ 张卡并入队/.test(message)), reply: messages.join("\n") || "未添加卡片，请稍后重试" };
+						},
+					});
+				} finally { if (generation === sessionGeneration) { pendingChat = false; scheduleTimer(); } }
+			}, result => { if (valid()) ctx.ui.notify("ANKI_CHAT_RESULT:" + JSON.stringify(result), "info"); });
+		},
+	});
+
 	pi.registerCommand("anki:hint", {
 		description: "Show a recall hint or the current sentence level's initial-letter hint",
 		handler: async (_args, ctx) => {
@@ -2314,12 +2548,13 @@ export default function piEnglishAnkiExtension(
 				ctx.ui.notify("用法：/anki:teach <话题>（例如 /anki:teach async programming）", "info");
 				return;
 			}
-			manualTeachTopic = topic;
-			ctx.ui.notify(`将围绕「${topic}」备课`, "info");
-			if (pendingLLMCall) {
-				ctx.ui.notify("上一轮备课还在进行中，请稍候", "info");
+			if (pendingLLMCall || teachQueue.length > 0) {
+				teachQueue.push(topic);
+				ctx.ui.notify(`已排队：当前生成结束后自动开始「${topic}」（第 ${teachQueue.length} 位）`, "info");
 				return;
 			}
+			manualTeachTopic = topic;
+			ctx.ui.notify(`将围绕「${topic}」备课`, "info");
 			void generateAndInsert(ctx, new Date())
 				.catch((err) => console.error(`[pi-english-anki] teach failed: ${err}`))
 				.finally(() => scheduleTimer());
@@ -2366,10 +2601,7 @@ export default function piEnglishAnkiExtension(
 					: `${row.id}. （无法解析的队列项）`;
 			});
 			if (rows.length > 15) lines.push(`…以及 ${rows.length - 15} 张更多`);
-			const eta = config.dailyNewLimit > 0
-				? `，按每日 ${config.dailyNewLimit} 张预计 ${Math.ceil(rows.length / Math.max(1, config.dailyNewLimit))} 天放完`
-				: "，不限速，将尽快放出";
-			ctx.ui.notify(`${lines.join("\n")}\n共 ${rows.length} 张${eta}`, "info");
+			ctx.ui.notify(`${lines.join("\n")}\n共 ${rows.length} 张，${queueEta(db, rows.length)}`, "info");
 		},
 	});
 
@@ -2384,8 +2616,10 @@ export default function piEnglishAnkiExtension(
 			const rate = attempts > 0 ? Math.round((correct / attempts) * 100) : 0;
 			const stageLine = stages.length ? stages.map((s) => `${s.stage}:${s.n}`).join(" · ") : "暂无";
 			ctx.ui.notify(`掌握阶段：${stageLine}；需强化：${reinforce}；答题 ${attempts} 次，正确率 ${rate}%`, "info");
-			const profile = computeLearnerProfile(db, new Date());
+			const now = new Date();
+			const profile = computeLearnerProfile(db, now);
 			ctx.ui.notify(formatProfileStatsLine(profile, deriveBudget(profile)), "info");
+			ctx.ui.notify(formatDailyLoadPlan(loadPlan(db, now)), "info");
 			const genEvents = getGenLog(db).slice(-3);
 			if (genEvents.length) {
 				const fmt = (t: string) => {
@@ -2407,6 +2641,7 @@ export default function piEnglishAnkiExtension(
 			stopAnswerThinking();
 			stopTimer();
 			stopPolling();
+			stopReplacementTimer();
 			releaseCoordinator();
 			if (db) {
 				// Unregister myself so the live-client guard does not refuse the swap.
@@ -2452,6 +2687,8 @@ export default function piEnglishAnkiExtension(
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionGeneration++;
+		pendingChat = false;
+		stopReplacementTimer();
 		stopAnswerThinking();
 		stopTimer();
 		lastDataVersion = null;
@@ -2488,6 +2725,8 @@ export default function piEnglishAnkiExtension(
 
 	pi.on("session_shutdown", async () => {
 		sessionGeneration++;
+		pendingChat = false;
+		stopReplacementTimer();
 		stopAnswerThinking();
 		await llm.dispose();
 		stopTimer();

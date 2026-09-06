@@ -36,6 +36,16 @@ const { formatStatusLine } = await import("../render.ts");
 const FAKE_CTX = {} as ExtensionContext;
 const FAKE_CONFIG = { thinkingLevel: "off" } as unknown as PetConfig;
 const ADAPTIVE: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
+const FIXED_DAILY_PLAN = {
+	adaptive: false,
+	limit: 11,
+	paused: false,
+	wordTarget: 10,
+	clozeTarget: 1,
+	rampTarget: 11,
+	dueReviews: 0,
+	reason: "fixed test",
+};
 
 /** LLM mock returning canned JSON for every complete() call. */
 function mockLlm(response: () => string, captured: { prompt?: string } = {}): PiSdkLlmClient {
@@ -52,21 +62,21 @@ function word(text: string, meaning = `释义 ${text}`): GeneratedItem {
 	return { type: "word", text, meaning, phonetic: "/x/", example: `The ${text} runs.`, example_cn: `${text} 在跑。` };
 }
 
-function wordJson(text: string, meaning = `释义 ${text}`): unknown {
+function wordJson(text: string, meaning = `释义 ${text}`): GeneratedItem {
 	return { type: "word", text, meaning, phonetic: "/x/", example: `The ${text} runs.`, example_cn: `${text} 在跑。` };
 }
 
 // -- db: migration + FIFO queue ------------------------------------------------
 
-test("v12 migration creates custom_card_queue and registers schema version 12", () => {
+test("latest migration keeps custom_card_queue and registers schema version 14", () => {
 	const db = openDb();
 	try {
 		const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='custom_card_queue'").get() as { name: string } | undefined;
 		assert.ok(table, "custom_card_queue exists");
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as { schema_version: number };
-		assert.equal(meta.schema_version, 12);
+		assert.equal(meta.schema_version, 14);
 		const migrations = (db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[]).map((r) => r.version);
-		assert.equal(migrations[migrations.length - 1], 12);
+		assert.equal(migrations[migrations.length - 1], 14);
 	} finally {
 		db.close();
 	}
@@ -107,9 +117,28 @@ test("countTodayNew counts custom introductions alongside planned", () => {
 		const now = new Date();
 		const customId = insertItem(db, "word", "queueword", null, "排队词", null, null, now, { introductionKind: "custom" });
 		const plannedId = insertItem(db, "word", "planword", null, "计划词", null, null, now, { introductionKind: "planned" });
+		const duplicateId = insertItem(db, "word", "oldduplicate", null, "旧重复卡", null, null, now, { introductionKind: "planned" });
 		assert.equal(countTodayNew(db, now), 0, "not yet introduced");
-		db.prepare("UPDATE items SET introduced_at = ? WHERE id IN (?, ?)").run(now.toISOString(), customId, plannedId);
-		assert.equal(countTodayNew(db, now), 2, "planned + custom both counted");
+		db.prepare("UPDATE items SET introduced_at = ? WHERE id IN (?, ?, ?)").run(now.toISOString(), customId, plannedId, duplicateId);
+		db.prepare("UPDATE items SET content_fingerprint = NULL, legacy_duplicate_of = ? WHERE id = ?").run(customId, duplicateId);
+		assert.equal(countTodayNew(db, now), 2, "planned + custom count, quarantined duplicate does not");
+	} finally {
+		db.close();
+	}
+});
+
+test("insertItem rejects the same lexical surface with a different meaning", () => {
+	const db = openDb();
+	try {
+		const now = new Date();
+		insertItem(db, "word", "workload-guard", null, "工作量；学习负担", null, null, now);
+		const sensesBefore = Number((db.prepare("SELECT COUNT(*) AS n FROM lexical_senses").get() as { n: number }).n);
+		assert.throws(
+			() => insertItem(db, "word", " Workload-Guard ", null, "工作量", null, null, now),
+			/DUPLICATE_CONTENT/,
+		);
+		const sensesAfter = Number((db.prepare("SELECT COUNT(*) AS n FROM lexical_senses").get() as { n: number }).n);
+		assert.equal(sensesAfter, sensesBefore, "rejected duplicate creates no orphan lexical sense");
 	} finally {
 		db.close();
 	}
@@ -206,7 +235,7 @@ test("generateCustomCards rejects sentence items and in-batch duplicates", async
 	);
 	await assert.rejects(
 		generateCustomCards(
-			mockLlm(() => JSON.stringify({ ready: true, items: [wordJson("menu"), wordJson("Menu")] })),
+			mockLlm(() => JSON.stringify({ ready: true, items: [wordJson("menu", "菜单"), wordJson("Menu", "菜单；选项")]})),
 			FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "x", [], FAKE_CONFIG, ADAPTIVE,
 		),
 		/INVALID_CUSTOM_ITEM/,
@@ -226,8 +255,8 @@ test("generateCustomCards surfaces an LLM refusal with its reason", async () => 
 test("critiqueLesson custom composition skips the fixed-composition gate", async () => {
 	// 11 items with 5 phrases trip the default full-batch composition rule...
 	const items: GeneratedItem[] = [];
-	for (let i = 0; i < 6; i++) items.push(word(`fox${i}`));
-	for (let i = 0; i < 5; i++) items.push({ ...word(`lazy dog ${i}`), type: "phrase" });
+	for (let i = 0; i < 6; i++) items.push({ ...word(`fox${i}`), meaning: `狐狸${i}（名词）` });
+	for (let i = 0; i < 5; i++) items.push({ ...word(`lazy dog ${i}`), type: "phrase", meaning: `懒狗${i}（名词短语）` });
 	const passLlm = mockLlm(() => JSON.stringify({ pass: true, issues: [], summary: "ok" }));
 
 	const defaultVerdict = await critiqueLesson(
@@ -264,10 +293,10 @@ test("formatStatusLine appends the queue badge only when cards are queued", () =
 	const db = openDb();
 	try {
 		db.exec("DELETE FROM items; DELETE FROM custom_card_queue;");
-		assert.equal(formatStatusLine(db, 11), "", "nothing left and empty queue -> no line");
+		assert.equal(formatStatusLine(db, FIXED_DAILY_PLAN), "", "nothing left and empty queue -> no line");
 		enqueueCustomCard(db, "p", word("alpha"));
 		enqueueCustomCard(db, "p", word("beta"));
-		const line = formatStatusLine(db, 11);
+		const line = formatStatusLine(db, FIXED_DAILY_PLAN);
 		assert.match(line, /排队 2/);
 		assert.doesNotMatch(line, /今日剩余卡片/);
 	} finally {

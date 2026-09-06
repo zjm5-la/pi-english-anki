@@ -89,6 +89,48 @@ test("native host providers are copied into the isolated runtime", async () => {
 	}
 });
 
+test("OAuth remains OAuth in isolated sessions instead of becoming an API key", async () => {
+	const registration = registerFauxProvider({ provider: "kaomoji-sdk-oauth" });
+	try {
+		registration.setResponses([fauxAssistantMessage("oauth-ok")]);
+		const ctx = testContext(registration);
+		ctx.modelRegistry.isUsingOAuth = () => true;
+		let apiKeyOverrides = 0;
+		const runtime = fauxRuntime(ctx);
+		runtime.setRuntimeApiKey = async () => { apiKeyOverrides++; };
+		const client = new PiSdkLlmClient(async () => runtime);
+		try {
+			assert.equal(await client.complete(ctx, { provider: ctx.model.provider, model: ctx.model.id }, {
+				systemPrompt: "Reply briefly.", prompt: "test",
+			}), "oauth-ok");
+			assert.equal(apiKeyOverrides, 0, "an OAuth token must never replace Pi OAuth credentials");
+		} finally { await client.dispose(); }
+	} finally { registration.unregister(); }
+});
+
+test("ordinary API-key providers still inherit host runtime credentials", async () => {
+	const registration = registerFauxProvider({ provider: "kaomoji-sdk-api-key" });
+	try {
+		registration.setResponses([fauxAssistantMessage("api-key-ok")]);
+		const ctx = testContext(registration);
+		ctx.modelRegistry.isUsingOAuth = () => false;
+		let apiKeyOverrides = 0;
+		const runtime = fauxRuntime(ctx);
+		runtime.setRuntimeApiKey = async (provider: string, key: string) => {
+			assert.equal(provider, ctx.model.provider);
+			assert.equal(key, "test-key");
+			apiKeyOverrides++;
+		};
+		const client = new PiSdkLlmClient(async () => runtime);
+		try {
+			assert.equal(await client.complete(ctx, { provider: ctx.model.provider, model: ctx.model.id }, {
+				systemPrompt: "Reply briefly.", prompt: "test",
+			}), "api-key-ok");
+			assert.equal(apiKeyOverrides, 1);
+		} finally { await client.dispose(); }
+	} finally { registration.unregister(); }
+});
+
 test("the completion deadline covers auth before session creation", async () => {
 	const registration = registerFauxProvider({ provider: "kaomoji-sdk-auth-timeout" });
 	try {

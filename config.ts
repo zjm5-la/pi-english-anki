@@ -13,16 +13,20 @@ export interface PetConfig {
 	thinkingLevel?: ThinkingLevel;
 	/** Minutes between automatic lesson/review checks. Zero disables the timer. */
 	intervalMinutes: number;
-	/** Max new items (word/phrase/sentence) taught per day. */
+	/** Fixed daily limit, or the hard ceiling when adaptiveNewCards is enabled. */
 	dailyNewLimit: number;
+	/** Let recent recall quality and due-review load choose today's limit. */
+	adaptiveNewCards: boolean;
 	showWidget: boolean;
 	verbose: boolean;
 }
 
-/** Daily batch composition: word/phrase items (words-majority) + grammar clozes. */
+/** Maximum composition of one generation call; adaptive days may use two calls. */
 export const LESSON_WORD_ITEMS = 10;
 export const LESSON_CLOZE_ITEMS = 1;
-/** The daily batch is words-majority: phrases may not exceed this count. */
+export const ADAPTIVE_START_NEW_ITEMS = 17;
+export const ADAPTIVE_MAX_NEW_ITEMS = 22;
+/** Each generation call is words-majority: phrases may not exceed this count. */
 export const LESSON_MAX_PHRASES = 3;
 
 /** Upper bound on cards a single /anki:add may enqueue (safety clamp). */
@@ -30,7 +34,8 @@ export const MAX_CUSTOM_PER_ADD = 20;
 
 export const DEFAULTS: PetConfig = {
 	intervalMinutes: 10,
-	dailyNewLimit: LESSON_WORD_ITEMS + LESSON_CLOZE_ITEMS,
+	dailyNewLimit: ADAPTIVE_MAX_NEW_ITEMS,
+	adaptiveNewCards: true,
 	showWidget: true,
 	verbose: false,
 };
@@ -64,6 +69,8 @@ export function loadConfig(cwd: string): PetConfig {
 	}
 	if (!Number.isFinite(config.dailyNewLimit) || config.dailyNewLimit < 0) {
 		config.dailyNewLimit = DEFAULTS.dailyNewLimit;
+	} else {
+		config.dailyNewLimit = Math.floor(config.dailyNewLimit);
 	}
 	return config;
 }

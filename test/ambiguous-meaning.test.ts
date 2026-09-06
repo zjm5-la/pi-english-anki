@@ -8,6 +8,7 @@ import type { PiSdkLlmClient } from "../pi-sdk-llm.ts";
 import type { PetConfig } from "../config.ts";
 import {
 	knownList,
+	replacementKnownList,
 	meaningCollisions,
 	normalizeMeaning,
 	openDb,
@@ -162,7 +163,7 @@ test("forwardCue: first Latin letter + underscore-masked example for the exact t
 	assert.equal(inflected?.context, undefined, "a substring inside booking is not the exact target");
 });
 
-test("recallQuestionText appends the cue only for colliding forward word/phrase prompts", () => {
+test("recallQuestionText adds forward collision cues and reverse sense context", () => {
 	const cue = forwardCue(RESERVE);
 	assert.equal(
 		recallQuestionText(BOOK, "forward"),
@@ -175,8 +176,13 @@ test("recallQuestionText appends the cue only for colliding forward word/phrase 
 	);
 	assert.equal(
 		recallQuestionText(RESERVE, "reverse", cue),
-		"写出单词「reserve」的中文释义",
-		"reverse prompt ignores the cue",
+		"在例句「I want to reserve a table for two.」中，单词「reserve」是什么意思？",
+		"reverse prompt uses the English example to identify the intended sense",
+	);
+	assert.equal(
+		recallQuestionText(wordItem({ id: 7, text: "work", meaning: "起作用" }), "reverse"),
+		"写出单词「work」的中文释义",
+		"legacy cards without an example retain the generic fallback",
 	);
 	assert.equal(
 		recallQuestionText(CLOZE, "forward", cue),
@@ -318,7 +324,58 @@ test("cued forward prompt: the answer must satisfy the first-letter/context cue"
 	assert.doesNotMatch(prompt, /任何一个自然且完全符合该中文提示/);
 });
 
-test("reverse and cloze evaluation prompts are unchanged by question text", async () => {
+test("contextual reverse prompt grades only the sense used in the shown example", async () => {
+	const captured: string[] = [];
+	const work = wordItem({
+		id: 8,
+		text: "work",
+		meaning: "起作用",
+		example: "The new settings work after a restart.",
+	});
+	const llm = {
+		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => {
+			captured.push(request.prompt);
+			return JSON.stringify({ verdict: "incorrect", feedback: "义项不符" });
+		},
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	await evaluateAttempt(
+		llm,
+		FAKE_CTX,
+		work,
+		"工作",
+		{ provider: "p", model: "m" },
+		"reverse",
+		recallQuestionText(work, "reverse"),
+	);
+	assert.match(captured[0], /题面（按题面判分）：在例句「The new settings work after a restart\.」中/);
+	assert.match(captured[0], /题面例句已经限定目标义项/);
+	assert.match(captured[0], /不符合本句的其它常见义项，应判 incorrect/);
+});
+
+test("generic reverse fallback accepts any valid common sense because the prompt is ambiguous", async () => {
+	const captured: string[] = [];
+	const llm = {
+		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => {
+			captured.push(request.prompt);
+			return JSON.stringify({ verdict: "correct", feedback: "也是常见义项" });
+		},
+		dispose: async () => {},
+	} as unknown as PiSdkLlmClient;
+	await evaluateAttempt(
+		llm,
+		FAKE_CTX,
+		wordItem({ id: 9, text: "work", meaning: "起作用" }),
+		"工作",
+		{ provider: "p", model: "m" },
+		"reverse",
+		"写出单词「work」的中文释义",
+	);
+	assert.match(captured[0], /题面没有提供义项语境/);
+	assert.match(captured[0], /任一常见且成立的中文义项都算 correct/);
+});
+
+test("cloze evaluation remains independent of the recall question text", async () => {
 	const captured: string[] = [];
 	const llm = {
 		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => {
@@ -330,27 +387,14 @@ test("reverse and cloze evaluation prompts are unchanged by question text", asyn
 	await evaluateAttempt(
 		llm,
 		FAKE_CTX,
-		BOOK,
-		"已订好的",
-		{ provider: "p", model: "m" },
-		"reverse",
-		"写出单词「book」的中文释义",
-	);
-	await evaluateAttempt(
-		llm,
-		FAKE_CTX,
 		CLOZE,
 		"reserve",
 		{ provider: "p", model: "m" },
 		"forward",
 		"语法填空：He ___ (reserve) a table.",
 	);
-	assert.doesNotMatch(
-		captured.join("\n"),
-		/题面（按题面判分）|任何一个自然且完全符合|题面线索已唯一指向/,
-	);
-	assert.match(captured[0], /同义表达/, "reverse rubric unchanged");
-	assert.match(captured[1], /填空句/, "cloze rubric unchanged");
+	assert.doesNotMatch(captured[0], /题面（按题面判分）/);
+	assert.match(captured[0], /填空句/);
 });
 
 // -- Content prevention ----------------------------------------------------
@@ -397,14 +441,14 @@ test("critic deterministically rejects a batch with two identical normalized mea
 		{
 			type: "word",
 			text: "book",
-			meaning: "预订",
+			meaning: "预订（动词）",
 			example: "I want to book a table.",
 			example_cn: "我想订个位子。",
 		},
 		{
 			type: "word",
 			text: "bank",
-			meaning: "银行",
+			meaning: "银行（名词）",
 			example: "The bank opens at nine.",
 			example_cn: "银行九点开门。",
 		},
@@ -502,7 +546,7 @@ test("generation and critic prompts carry the example-must-contain-text and sens
 	const word: GeneratedItem = {
 		type: "word",
 		text: "reload",
-		meaning: "重新加载",
+		meaning: "重新加载（动词）",
 		example: "Reload the extension.",
 		example_cn: "重新加载扩展。",
 	};
@@ -528,4 +572,31 @@ test("generation and critic prompts carry the example-must-contain-text and sens
 		/book（预订）/,
 		"critic sees prior collisions via the known list",
 	);
+});
+
+
+test("replacement prompt includes all canonical cards beyond the most recent fifty", async () => {
+	const handle = freshDb();
+	try {
+		const oldest = insertWord(handle.db, "morning", "早晨");
+		for (let i = 0; i < 60; i++) insertWord(handle.db, `newer-${i}`, `新词${i}`);
+		const duplicate = insertWord(handle.db, "legacy-morning", "历史重复");
+		handle.db.prepare("UPDATE items SET legacy_duplicate_of=? WHERE id=?").run(oldest, duplicate);
+		const known = replacementKnownList(handle.db);
+		assert.equal(known.length, 61);
+		assert.ok(known.includes("word: morning = 早晨"), "oldest card remains in exclusion context");
+		assert.ok(known.includes("word: newer-59 = 新词59"), "unshown inventory is excluded too");
+		assert.ok(!known.some((entry) => entry.includes("legacy-morning")));
+		let prompt = "";
+		const llm = {
+			complete: async (_ctx: unknown, _resolved: unknown, request: { prompt: string }) => {
+				prompt = request.prompt;
+				return JSON.stringify({ ready: false, reason: "test" });
+			},
+		} as unknown as PiSdkLlmClient;
+		await generateReplacement(llm, FAKE_CTX, RESOLVED, "", known, FAKE_CONFIG,
+			wordItem({ id: oldest, text: "morning", meaning: "早晨" }), ADAPTIVE);
+		assert.match(prompt, /word: morning = 早晨/);
+		assert.match(prompt, /word: newer-59 = 新词59/);
+	} finally { handle.close(); }
 });

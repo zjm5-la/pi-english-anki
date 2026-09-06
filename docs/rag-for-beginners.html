@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG 从零开始：用词典给 Anki 备课</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #202722;
+      --muted: #667069;
+      --paper: #fffdf8;
+      --canvas: #f3efe6;
+      --line: #ddd7ca;
+      --green: #245f4b;
+      --green-2: #3f7a63;
+      --green-soft: #dfece4;
+      --amber: #995b1b;
+      --amber-soft: #faead6;
+      --blue: #375d86;
+      --blue-soft: #e2ebf4;
+      --red: #97413e;
+      --red-soft: #f7e2df;
+      --shadow: 0 18px 55px rgba(54, 48, 36, 0.09);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 4%, rgba(185, 214, 195, 0.5), transparent 28rem),
+        radial-gradient(circle at 94% 2%, rgba(243, 208, 164, 0.42), transparent 28rem),
+        var(--canvas);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.65;
+    }
+
+    button { font: inherit; }
+    a { color: var(--green); }
+    code {
+      padding: 0.1em 0.35em;
+      border-radius: 0.35em;
+      background: #f0ede5;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.92em;
+    }
+
+    .page { width: min(1120px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 80px; }
+    .hero, .section {
+      margin-bottom: 24px;
+      border: 1px solid rgba(205, 198, 183, 0.8);
+      border-radius: 26px;
+      background: rgba(255, 253, 248, 0.92);
+      box-shadow: var(--shadow);
+    }
+
+    .hero { padding: 38px; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      color: var(--green);
+      background: var(--green-soft);
+      font-size: 14px;
+      font-weight: 750;
+    }
+    h1 { margin: 18px 0 12px; font-size: clamp(34px, 6vw, 62px); line-height: 1.08; letter-spacing: -0.035em; }
+    h2 { margin: 0 0 10px; font-size: clamp(25px, 4vw, 36px); line-height: 1.2; }
+    h3 { margin: 0 0 8px; font-size: 20px; }
+    p { margin: 0 0 12px; }
+    .lead { max-width: 780px; color: var(--muted); font-size: 19px; }
+    .one-line {
+      margin-top: 24px;
+      padding: 20px 24px;
+      border-left: 6px solid var(--green);
+      border-radius: 14px;
+      background: var(--green-soft);
+      font-size: clamp(20px, 3vw, 28px);
+      font-weight: 780;
+    }
+
+    .section { padding: 30px; }
+    .section-head { margin-bottom: 22px; }
+    .section-head p { max-width: 790px; color: var(--muted); }
+    .step-number {
+      display: inline-grid;
+      width: 30px;
+      height: 30px;
+      margin-right: 8px;
+      place-items: center;
+      border-radius: 50%;
+      color: white;
+      background: var(--green);
+      font-size: 15px;
+    }
+
+    .compare, .rag-grid, .chunk-grid, .project-grid { display: grid; gap: 16px; }
+    .compare { grid-template-columns: repeat(2, 1fr); }
+    .rag-grid { grid-template-columns: repeat(3, 1fr); }
+    .chunk-grid { grid-template-columns: 0.9fr 1.1fr; }
+    .project-grid { grid-template-columns: repeat(7, auto); align-items: center; }
+    .card {
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--paper);
+    }
+    .card.bad { background: var(--red-soft); }
+    .card.good { background: var(--green-soft); }
+    .card.blue { background: var(--blue-soft); }
+    .card.amber { background: var(--amber-soft); }
+    .big-letter { color: var(--green); font-size: 46px; font-weight: 900; line-height: 1; }
+    .muted { color: var(--muted); }
+    .arrow { color: var(--muted); font-size: 24px; text-align: center; }
+
+    .analogy {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 16px;
+      align-items: stretch;
+    }
+    .analogy .arrow { align-self: center; }
+    .mini-list { margin: 10px 0 0; padding-left: 1.2em; }
+
+    .demo-shell {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: #faf8f2;
+    }
+    .demo-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+      background: white;
+    }
+    .scenario-tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+    .tab, .primary, .secondary {
+      min-height: 42px;
+      padding: 9px 15px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      cursor: pointer;
+      background: white;
+      color: var(--ink);
+      font-weight: 700;
+    }
+    .tab[aria-selected="true"], .primary {
+      border-color: var(--green);
+      color: white;
+      background: var(--green);
+    }
+    .primary:hover { background: #1d4f3e; }
+    .secondary:hover, .tab:hover { border-color: var(--green-2); }
+    .demo-body { padding: 20px; }
+    .query-box {
+      padding: 16px;
+      border-radius: 14px;
+      background: var(--blue-soft);
+    }
+    .stage-progress {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin: 18px 0;
+    }
+    .stage-dot {
+      padding: 9px 6px;
+      border-radius: 10px;
+      color: var(--muted);
+      background: #ebe7dc;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 750;
+    }
+    .stage-dot.active { color: white; background: var(--green); }
+    .stage-panel { min-height: 280px; }
+    .sense-list { display: grid; gap: 10px; }
+    .sense {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 110px;
+      gap: 14px;
+      align-items: center;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: white;
+    }
+    .sense.selected { border: 2px solid var(--green); background: var(--green-soft); }
+    .score { height: 9px; overflow: hidden; border-radius: 999px; background: #d8d5cc; }
+    .score > span { display: block; height: 100%; border-radius: inherit; background: var(--green-2); }
+    .score-label { margin-top: 4px; color: var(--muted); text-align: right; font-size: 12px; }
+    .evidence {
+      padding: 18px;
+      border: 1px dashed var(--blue);
+      border-radius: 14px;
+      background: var(--blue-soft);
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 14px;
+    }
+    .anki-card {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .anki-face {
+      min-height: 180px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: white;
+    }
+    .anki-face strong { display: block; margin-bottom: 12px; color: var(--green); }
+    .demo-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+
+    .chunk {
+      padding: 14px;
+      border-radius: 12px;
+      background: white;
+      border: 1px solid var(--line);
+    }
+    .chunk + .chunk { margin-top: 10px; }
+    .chunk strong { color: var(--green); }
+
+    .embedding-demo { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .meaning-map {
+      position: relative;
+      min-height: 280px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background:
+        linear-gradient(rgba(55,93,134,.08) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(55,93,134,.08) 1px, transparent 1px),
+        white;
+      background-size: 28px 28px;
+    }
+    .point {
+      position: absolute;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      border: 1px solid #b8c9dc;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .point.query { color: white; border-color: var(--green); background: var(--green); }
+
+    .flow-node {
+      min-width: 92px;
+      padding: 13px 10px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: white;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 750;
+    }
+
+    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 14px; background: white; }
+    th, td { padding: 13px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--green-soft); }
+
+    .quiz-question { margin-bottom: 18px; padding: 18px; border: 1px solid var(--line); border-radius: 16px; background: white; }
+    .quiz-question legend { padding: 0 6px; font-weight: 800; }
+    .quiz-question label { display: block; margin: 7px 0; cursor: pointer; }
+    .quiz-result { display: none; margin-top: 14px; padding: 14px; border-radius: 12px; font-weight: 750; }
+    .quiz-result.show { display: block; }
+    .quiz-result.pass { color: var(--green); background: var(--green-soft); }
+    .quiz-result.retry { color: var(--red); background: var(--red-soft); }
+
+    details { margin-top: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 14px; background: white; }
+    summary { cursor: pointer; font-weight: 800; }
+    footer { padding: 8px 4px; color: var(--muted); text-align: center; }
+
+    .hidden { display: none !important; }
+    .fade-in { animation: appear 300ms ease-out; }
+    @keyframes appear { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+
+    @media (max-width: 800px) {
+      .hero, .section { padding: 22px; border-radius: 20px; }
+      .compare, .rag-grid, .chunk-grid, .embedding-demo, .anki-card { grid-template-columns: 1fr; }
+      .analogy { grid-template-columns: 1fr; }
+      .analogy .arrow { transform: rotate(90deg); }
+      .project-grid { grid-template-columns: 1fr; }
+      .project-grid .arrow { transform: rotate(90deg); }
+      .sense { grid-template-columns: 1fr; }
+      .stage-progress { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .fade-in { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <span class="eyebrow">零基础 · 可点击演示 · 不需要数学</span>
+      <h1>RAG 到底是什么？</h1>
+      <p class="lead">我们不从“向量数据库”开始，而是从你已经拥有的 Cambridge 词典和 Anki 备课开始。读完这页，你应该能自己说清楚 R、A、G 各自做了什么。</p>
+      <div class="one-line">RAG = 先找资料，再把资料放进问题里，最后让模型根据资料回答。</div>
+    </header>
+
+    <section class="section" id="analogy">
+      <div class="section-head">
+        <h2><span class="step-number">1</span>先用“开卷考试”理解</h2>
+        <p>大语言模型像一个读过很多书、但记忆可能模糊的学生。RAG 让它在回答前临时翻资料。</p>
+      </div>
+      <div class="analogy">
+        <article class="card bad">
+          <h3>没有 RAG：闭卷回答</h3>
+          <p>你问：“<strong>condition 在这句话里是什么意思？</strong>”</p>
+          <p>模型只能依靠记忆猜。它可能答对，也可能选错义项或编造 IPA。</p>
+        </article>
+        <div class="arrow" aria-hidden="true">→</div>
+        <article class="card good">
+          <h3>有 RAG：开卷回答</h3>
+          <p>系统先从本地 Cambridge 词典找到相关义项，再把义项交给模型。</p>
+          <p>模型负责<strong>理解和讲解</strong>，词典负责提供<strong>事实证据</strong>。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="rag">
+      <div class="section-head">
+        <h2><span class="step-number">2</span>R、A、G 分别是什么？</h2>
+        <p>RAG 是三个英文单词的首字母。先记动作，不必背全称。</p>
+      </div>
+      <div class="rag-grid">
+        <article class="card">
+          <div class="big-letter">R</div>
+          <h3>Retrieve · 检索</h3>
+          <p>去资料库里找与问题最相关的几条资料。</p>
+          <p class="muted">本项目：从 Cambridge 词典找出目标单词的候选义项。</p>
+        </article>
+        <article class="card">
+          <div class="big-letter">A</div>
+          <h3>Augment · 增强</h3>
+          <p>把找到的资料附加到模型原本的问题中。</p>
+          <p class="muted">本项目：把词性、IPA、释义和例句放进备课提示词。</p>
+        </article>
+        <article class="card">
+          <div class="big-letter">G</div>
+          <h3>Generate · 生成</h3>
+          <p>模型阅读问题和证据，然后生成最终结果。</p>
+          <p class="muted">本项目：生成符合你水平的 Anki 卡片，再由 critic 检查。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="demo">
+      <div class="section-head">
+        <h2><span class="step-number">3</span>亲手跑一次 RAG</h2>
+        <p>选择一个场景，然后不断点击“下一步”。这里的数据是为了教学而简化的示意，不会读取或修改你的真实学习库。</p>
+      </div>
+      <div class="demo-shell">
+        <div class="demo-toolbar">
+          <div class="scenario-tabs" role="tablist" aria-label="选择演示单词">
+            <button class="tab" role="tab" data-scenario="condition" aria-selected="true">condition</button>
+            <button class="tab" role="tab" data-scenario="book" aria-selected="false">book</button>
+            <button class="tab" role="tab" data-scenario="polite" aria-selected="false">polite</button>
+          </div>
+          <button class="secondary" id="reset-demo" type="button">重新开始</button>
+        </div>
+        <div class="demo-body">
+          <div class="query-box" id="query-box"></div>
+          <div class="stage-progress" aria-label="RAG 演示进度">
+            <div class="stage-dot active" data-stage-dot="0">问题</div>
+            <div class="stage-dot" data-stage-dot="1">R · 检索</div>
+            <div class="stage-dot" data-stage-dot="2">A · 增强</div>
+            <div class="stage-dot" data-stage-dot="3">G · 生成</div>
+          </div>
+          <div class="stage-panel" id="stage-panel" aria-live="polite"></div>
+          <div class="demo-actions">
+            <button class="primary" id="next-stage" type="button">开始检索</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="chunks">
+      <div class="section-head">
+        <h2><span class="step-number">4</span>Chunk 是什么？</h2>
+        <p>Chunk 就是“可被单独找回的一小段资料”。切得太大，模型会看到很多无关内容；切得太小，信息又不完整。</p>
+      </div>
+      <div class="chunk-grid">
+        <article class="card bad">
+          <h3>不好的切法</h3>
+          <p>把 <strong>condition 的整个词条</strong>作为一个 chunk：状态、健康、条件、环境……全部混在一起。</p>
+          <p class="muted">检索到了单词，却没有解决“到底是哪个义项”。</p>
+        </article>
+        <article class="card good">
+          <h3>适合词典的切法：一个义项一个 chunk</h3>
+          <div class="chunk"><strong>condition · noun · 义项 1</strong><br />某时某物所处的状态</div>
+          <div class="chunk"><strong>condition · noun · 义项 2</strong><br />某事发生前必须满足的要求</div>
+          <div class="chunk"><strong>condition · noun · 义项 3</strong><br />疾病或健康问题</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="embedding">
+      <div class="section-head">
+        <h2><span class="step-number">5</span>Embedding 又是什么？</h2>
+        <p>Embedding 把一段文字的“意思”转换成一串数字。意思越接近，数字之间通常越接近。下面只是二维卡通；真实 embedding 往往有几百个维度。</p>
+      </div>
+      <div class="embedding-demo">
+        <div class="meaning-map" aria-label="语义距离示意图">
+          <span class="point query" style="left: 61%; top: 35%">查询：协议继续的条件</span>
+          <span class="point" style="left: 66%; top: 51%">必须满足的要求</span>
+          <span class="point" style="left: 10%; top: 18%">一本纸质书</span>
+          <span class="point" style="left: 16%; top: 68%">身体健康问题</span>
+          <span class="point" style="left: 56%; top: 76%">合同条款</span>
+        </div>
+        <article class="card blue">
+          <h3>它在这里做什么？</h3>
+          <p>我们已经通过单词 <code>condition</code> 找到它的几个义项。Embedding 只负责比较：</p>
+          <p><strong>当前句子的语境，和哪个义项最接近？</strong></p>
+          <p>因此我们不需要一开始就在 6 万个词条上建设复杂的全局向量数据库。</p>
+          <p class="muted">先精确找单词，再用语义选择义项：这叫混合检索。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="project">
+      <div class="section-head">
+        <h2><span class="step-number">6</span>放进你的 Anki 项目后</h2>
+        <p>整个流程会是这样。只有最后生成并通过 critic 的卡片才进入学习库。</p>
+      </div>
+      <div class="project-grid" aria-label="项目 RAG 流程">
+        <div class="flow-node">Cambridge<br />MDX</div><div class="arrow">→</div>
+        <div class="flow-node">按义项<br />建立索引</div><div class="arrow">→</div>
+        <div class="flow-node">检索<br />Top‑K</div><div class="arrow">→</div>
+        <div class="flow-node">证据 +<br />备课问题</div>
+      </div>
+      <div class="project-grid" style="margin-top: 14px" aria-label="项目生成与验证流程">
+        <div class="flow-node">LLM<br />生成卡片</div><div class="arrow">→</div>
+        <div class="flow-node">critic<br />对照证据</div><div class="arrow">→</div>
+        <div class="flow-node">通过后<br />写入 Anki</div><div class="arrow">→</div>
+        <div class="flow-node">你开始<br />学习</div>
+      </div>
+      <details>
+        <summary>Top‑K 是什么？</summary>
+        <p>Top 是“最相关”，K 是“取几条”。Top‑3 就是取相关度最高的 3 个义项。K 太小可能漏掉正确资料；K 太大又会塞进噪声。</p>
+      </details>
+      <details>
+        <summary>RAG 会训练或修改模型吗？</summary>
+        <p>不会。它只是在模型回答这一次问题之前，临时给它几条资料。模型本身的参数没有变化。</p>
+      </details>
+    </section>
+
+    <section class="section" id="compare">
+      <div class="section-head">
+        <h2>不要把这三个概念混在一起</h2>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>方式</th><th>做了什么</th><th>在本项目中的例子</th></tr></thead>
+          <tbody>
+            <tr><td><strong>RAG</strong></td><td>回答前临时检索资料</td><td>备课前检索 Cambridge 义项</td></tr>
+            <tr><td><strong>微调</strong></td><td>用训练数据改变模型参数</td><td>目前不需要，成本和复杂度都更高</td></tr>
+            <tr><td><strong>普通工具调用</strong></td><td>模型主动调用一个函数</td><td>让模型自己调用 lookup；可行，但我们会优先在代码中确定性检索</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="quiz">
+      <div class="section-head">
+        <h2>三道题，检查你是否建立了概念</h2>
+        <p>答错没关系；目的是发现哪个概念还模糊。</p>
+      </div>
+      <form id="quiz-form">
+        <fieldset class="quiz-question">
+          <legend>1. RAG 的第一步是什么？</legend>
+          <label><input type="radio" name="q1" value="a" /> 让模型立刻生成答案</label>
+          <label><input type="radio" name="q1" value="b" /> 从资料库检索相关证据</label>
+          <label><input type="radio" name="q1" value="c" /> 重新训练模型</label>
+        </fieldset>
+        <fieldset class="quiz-question">
+          <legend>2. 词典最适合如何切 chunk？</legend>
+          <label><input type="radio" name="q2" value="a" /> 整本词典一个 chunk</label>
+          <label><input type="radio" name="q2" value="b" /> 一个字母一个 chunk</label>
+          <label><input type="radio" name="q2" value="c" /> 一个义项一个 chunk</label>
+        </fieldset>
+        <fieldset class="quiz-question">
+          <legend>3. 没有检索到可靠义项时，应该怎样？</legend>
+          <label><input type="radio" name="q3" value="a" /> 让模型凭记忆补一个</label>
+          <label><input type="radio" name="q3" value="b" /> 拒绝这张卡，避免编造</label>
+          <label><input type="radio" name="q3" value="c" /> 随便使用第一个词条</label>
+        </fieldset>
+        <button class="primary" type="submit">检查答案</button>
+        <div class="quiz-result" id="quiz-result" role="status"></div>
+      </form>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>现在你只需要记住四句话</h2>
+      </div>
+      <ol>
+        <li><strong>RAG 不会训练模型</strong>，只是在回答前给模型资料。</li>
+        <li><strong>Retrieval 的目标不是找得多，而是找得准。</strong></li>
+        <li>对词典来说，<strong>一个义项一个 chunk</strong>最容易控制歧义。</li>
+        <li>生成结果必须能回到检索证据；<strong>没有证据就不生成卡片。</strong></li>
+      </ol>
+      <p class="muted">下一课可以实际观察：同一句话使用关键词检索和 embedding 检索时，Top‑K 结果有什么不同。</p>
+    </section>
+
+    <footer>为 pi-english-anki 制作 · 本页面完全离线，不读取真实词典或学习数据库</footer>
+  </main>
+
+  <script>
+    const scenarios = {
+      condition: {
+        prompt: "为句子 “The agreement will continue on one condition.” 制作 condition 学习卡。",
+        context: "协议只有在满足某项要求时才会继续。",
+        senses: [
+          { title: "状态、状况", detail: "the state that something is in", score: 31 },
+          { title: "必须满足的条件", detail: "a requirement that must be met", score: 96, selected: true },
+          { title: "疾病、健康问题", detail: "an illness or health problem", score: 18 }
+        ],
+        evidence: "[DICT-SENSE condition.n.2]\n词性：noun\nUK IPA：/kənˈdɪʃ.ən/\n含义：a requirement that must be met\n语境：agreement / continue / requirement\n约束：只能使用这个义项，不得使用‘健康状况’义项。",
+        front: "协议继续需要满足一个条件。\n目标词以 c 开头。",
+        back: "condition  /kənˈdɪʃ.ən/  noun\n这里表示‘必须满足的条件’。\n例句：We can proceed on one condition."
+      },
+      book: {
+        prompt: "为句子 “I booked a table for two.” 制作 book 学习卡。",
+        context: "说话者提前预订了两个人的桌位。",
+        senses: [
+          { title: "书籍", detail: "a written work with pages", score: 22 },
+          { title: "预订", detail: "to arrange to use something at a future time", score: 98, selected: true },
+          { title: "登记某人的违法行为", detail: "to record an offence officially", score: 14 }
+        ],
+        evidence: "[DICT-SENSE book.v.1]\n词性：verb\nUK IPA：/bʊk/\n含义：to arrange to use something at a future time\n语境：table / for two / restaurant\n约束：目标是动词‘预订’，不是名词‘书’。",
+        front: "我为两个人预订了一张桌子。\n目标词以 b 开头。",
+        back: "book  /bʊk/  verb\n这里表示‘预订’。\n例句：We booked a room for Friday."
+      },
+      polite: {
+        prompt: "为句子 “It is polite to say thank you.” 制作 polite 学习卡。",
+        context: "说谢谢是一种有礼貌的行为。",
+        senses: [
+          { title: "有礼貌的", detail: "behaving in a respectful and socially correct way", score: 99, selected: true },
+          { title: "上流社会的", detail: "belonging to socially refined company", score: 20 },
+          { title: "经过打磨的", detail: "smooth or polished", score: 8 }
+        ],
+        evidence: "[DICT-SENSE polite.adj.1]\n词性：adjective\nUK IPA：/pəˈlaɪt/\n含义：behaving in a respectful and socially correct way\n语境：say thank you / behaviour\n约束：只使用‘有礼貌的’这一现代常用义项。",
+        front: "说谢谢是一种有礼貌的行为。\n目标词以 p 开头。",
+        back: "polite  /pəˈlaɪt/  adjective\n表示‘有礼貌的’。\n例句：Please be polite to the staff."
+      }
+    };
+
+    function select(selector) {
+      const found = document.querySelector(selector);
+      if (!found) throw new Error(`Missing element: ${selector}`);
+      return found;
+    }
+
+    function node(tag, className, text) {
+      const created = document.createElement(tag);
+      if (className) created.className = className;
+      if (text !== undefined) created.textContent = text;
+      return created;
+    }
+
+    function appendLines(target, text) {
+      text.split("\n").forEach((line, index) => {
+        if (index > 0) target.append(document.createElement("br"));
+        target.append(document.createTextNode(line));
+      });
+    }
+
+    let scenarioName = "condition";
+    let stage = 0;
+    const queryBox = select("#query-box");
+    const stagePanel = select("#stage-panel");
+    const nextButton = select("#next-stage");
+    const resetButton = select("#reset-demo");
+
+    function renderQuery(data) {
+      const title = node("strong", "", "用户问题");
+      const context = node("span", "muted", `已知语境：${data.context}`);
+      queryBox.replaceChildren(
+        title,
+        document.createElement("br"),
+        document.createTextNode(data.prompt),
+        document.createElement("br"),
+        context,
+      );
+    }
+
+    function renderInitialStage() {
+      const article = node("article", "card amber fade-in");
+      const explanation = node("p");
+      explanation.append(
+        document.createTextNode("如果直接生成，它可能把 "),
+        node("code", "", scenarioName),
+        document.createTextNode(" 的其他义项写进卡片。"),
+      );
+      article.append(
+        node("h3", "", "模型现在还没有词典证据"),
+        explanation,
+        node("p", "", "点击下面的按钮，让系统先去资料库找义项。"),
+      );
+      stagePanel.replaceChildren(article);
+      nextButton.textContent = "开始检索";
+    }
+
+    function renderRetrievalStage(data) {
+      const list = node("div", "sense-list fade-in");
+      data.senses.forEach((sense, index) => {
+        const article = node("article", `sense${sense.selected ? " selected" : ""}`);
+        const copy = node("div");
+        copy.append(
+          node("strong", "", `候选义项 ${index + 1}：${sense.title}`),
+          document.createElement("br"),
+          node("span", "muted", sense.detail),
+        );
+        if (sense.selected) {
+          copy.append(document.createElement("br"), node("strong", "", "✓ 与当前语境最匹配"));
+        }
+        const scoreColumn = node("div");
+        const score = node("div", "score");
+        const fill = node("span");
+        fill.style.width = `${sense.score}%`;
+        score.append(fill);
+        scoreColumn.append(score, node("div", "score-label", `相关度 ${sense.score}%`));
+        article.append(copy, scoreColumn);
+        list.append(article);
+      });
+      stagePanel.replaceChildren(list);
+      nextButton.textContent = "把证据加入问题";
+    }
+
+    function renderAugmentationStage(data) {
+      const wrapper = node("div", "fade-in");
+      const evidence = node("div", "evidence", data.evidence);
+      const note = node("p", "muted", "这就是 Augmentation：模型的问题没有被替换，只是多了一份可信资料。");
+      note.style.marginTop = "12px";
+      wrapper.append(node("h3", "", "原问题 + 检索证据"), evidence, note);
+      stagePanel.replaceChildren(wrapper);
+      nextButton.textContent = "根据证据生成卡片";
+    }
+
+    function ankiFace(title, content) {
+      const face = node("article", "anki-face");
+      face.append(node("strong", "", title));
+      appendLines(face, content);
+      return face;
+    }
+
+    function renderGenerationStage(data) {
+      const cards = node("div", "anki-card fade-in");
+      cards.append(ankiFace("Anki 正面", data.front), ankiFace("Anki 背面", data.back));
+      const note = node("p", "muted", "生成后，critic 还会用同一个词典义项检查这张卡。");
+      note.style.marginTop = "12px";
+      stagePanel.replaceChildren(cards, note);
+      nextButton.textContent = "演示完成";
+    }
+
+    function renderDemo() {
+      const data = scenarios[scenarioName];
+      renderQuery(data);
+      document.querySelectorAll("[data-stage-dot]").forEach((dot) => {
+        dot.classList.toggle("active", Number(dot.dataset.stageDot) <= stage);
+      });
+
+      if (stage === 0) renderInitialStage();
+      else if (stage === 1) renderRetrievalStage(data);
+      else if (stage === 2) renderAugmentationStage(data);
+      else renderGenerationStage(data);
+      nextButton.disabled = stage === 3;
+    }
+
+    document.querySelectorAll(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const nextScenario = tab.dataset.scenario;
+        if (!nextScenario || !scenarios[nextScenario]) return;
+        scenarioName = nextScenario;
+        stage = 0;
+        document.querySelectorAll(".tab").forEach((item) => item.setAttribute("aria-selected", String(item === tab)));
+        renderDemo();
+      });
+    });
+
+    nextButton.addEventListener("click", () => {
+      if (stage < 3) stage += 1;
+      renderDemo();
+    });
+    resetButton.addEventListener("click", () => { stage = 0; renderDemo(); });
+
+    select("#quiz-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const data = new FormData(event.currentTarget);
+      const result = select("#quiz-result");
+      const score = Number(data.get("q1") === "b") + Number(data.get("q2") === "c") + Number(data.get("q3") === "b");
+      result.className = `quiz-result show ${score === 3 ? "pass" : "retry"}`;
+      result.textContent = score === 3
+        ? "3/3，太好了！你已经理解 RAG 的基本骨架。"
+        : `${score}/3。再看一次：先检索证据；一个义项一个 chunk；没有证据就不生成。`;
+    });
+
+    renderDemo();
+  </script>
+</body>
+</html>

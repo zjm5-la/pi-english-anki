@@ -22,13 +22,14 @@ function freshDb() {
 // These imports/exports do not exist yet — the tests below define the contract:
 // - migrateDirectionState(db): idempotent v10 migration (create + backfill)
 // - dueDirection(db, itemId, now): pick the due direction (earliest due; tie -> forward)
-// - advanceReviewDirectional(db, id, direction, state, due, reviews, now): upsert one
-//   direction, ensure the sibling row exists, mirror items.fsrs_state (forward) and
-//   items.due_at (min over directions)
+// - advanceReviewDirectional(db, id, direction, state, due, reviews, now, options):
+//   upsert one direction, ensure the sibling row exists, mirror items.fsrs_state
+//   (forward) and items.due_at (min over directions)
 const {
 	advanceReviewDirectional,
 	dueDirection,
 	migrateDirectionState,
+	recognitionDueFloorAfterProduction,
 } = await import("../db.ts");
 
 const T0 = new Date("2026-08-15T08:00:00.000Z");
@@ -129,6 +130,36 @@ test("advanceReviewDirectional keeps directions independent and mirrors items", 
 		const mirror2 = h.db.prepare("SELECT fsrs_state, due_at FROM items WHERE id = ?").get(id) as { fsrs_state: string; due_at: string };
 		assert.equal(mirror2.due_at, again.due < good.due ? again.due : good.due, "items.due_at = min over directions");
 		assert.equal(mirror2.fsrs_state, good.state);
+	} finally {
+		h.close();
+	}
+});
+
+test("unassisted production can defer recognition near the production interval", () => {
+	const h = freshDb();
+	try {
+		const id = insertRatedWord(h.db, "covered", "", T0.toISOString());
+		const productionDue = new Date(T0.getTime() + 8 * 24 * 3600 * 1000).toISOString();
+		const floor = recognitionDueFloorAfterProduction(T0, productionDue);
+		advanceReviewDirectional(
+			h.db,
+			id,
+			"forward",
+			"forward-state",
+			productionDue,
+			5,
+			T0,
+			{ siblingDueFloor: floor },
+		);
+		const rows = h.db.prepare(
+			"SELECT direction,due_at FROM direction_state WHERE item_id=? ORDER BY direction",
+		).all(id) as { direction: string; due_at: string }[];
+		assert.deepEqual(rows.map((row) => ({ ...row })), [
+			{ direction: "forward", due_at: productionDue },
+			{ direction: "reverse", due_at: new Date(Date.parse(productionDue) - 60_000).toISOString() },
+		]);
+		const item = h.db.prepare("SELECT due_at FROM items WHERE id=?").get(id) as { due_at: string };
+		assert.equal(item.due_at, rows[1].due_at, "recognition remains the next independent check");
 	} finally {
 		h.close();
 	}

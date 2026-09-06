@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import type { DailyLoadPlan } from "./adaptive-load.ts";
 import { countTodayNew, customQueueCount, getStat, SCHEDULABLE, type ItemRow } from "./db.ts";
 
 // -- Pet faces ------------------------------------------------------------
@@ -20,7 +21,7 @@ export const TYPE_LABELS: Record<string, string> = {
 	cloze: "语法填空",
 };
 
-function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: number): { total: number; reviews: number; newCards: number } {
+function countTodayRemainingCards(db: DatabaseSync, now: Date, plan: DailyLoadPlan): { total: number; reviews: number; newCards: number } {
 	const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
 	// Due reviews (shown items due today or earlier).
 	const reviews = Number((db.prepare(
@@ -33,16 +34,19 @@ function countTodayRemainingCards(db: DatabaseSync, now: Date, dailyNewLimit: nu
 	const queuedPlanned = Number((db.prepare(
 		`SELECT COUNT(*) AS n FROM items WHERE shown = 0 AND status = 'learning' AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) AND due_at < ? ${SCHEDULABLE}`,
 	).get(tomorrow) as { n: number }).n);
-	const remainingPlanned = dailyNewLimit === 0
-		? queuedPlanned
-		: Math.min(queuedPlanned, Math.max(0, dailyNewLimit - countTodayNew(db, now)));
+	let remainingPlanned = 0;
+	if (!plan.paused) {
+		remainingPlanned = plan.limit === 0
+			? queuedPlanned
+			: Math.min(queuedPlanned, Math.max(0, plan.limit - countTodayNew(db, now)));
+	}
 	const newCards = queuedReplacement + remainingPlanned;
 	return { total: reviews + newCards, reviews, newCards };
 }
 
-export function formatStatusLine(db: DatabaseSync, dailyNewLimit: number): string {
+export function formatStatusLine(db: DatabaseSync, plan: DailyLoadPlan): string {
 	const streak = Number(getStat(db, "streak_days") ?? 0);
-	const remaining = countTodayRemainingCards(db, new Date(), dailyNewLimit);
+	const remaining = countTodayRemainingCards(db, new Date(), plan);
 	const queued = customQueueCount(db);
 	if (remaining.total === 0 && queued === 0) return "";
 	const parts: string[] = [];
@@ -181,7 +185,13 @@ export function recallQuestionText(
 ): string {
 	if (item.type === "cloze") return `语法填空：${item.text}`;
 	const label = TYPE_LABELS[item.type] ?? item.type;
-	if (direction === "reverse") return `写出${label}「${item.text}」的中文释义`;
+	if (direction === "reverse") {
+		// A bare "give the Chinese meaning" prompt is ambiguous for polysemous
+		// words (work → 工作/起作用). The card's example sentence pins the sense.
+		const example = item.example?.trim();
+		if (example) return `在例句「${example}」中，${label}「${item.text}」是什么意思？`;
+		return `写出${label}「${item.text}」的中文释义`;
+	}
 	const base = `默写${label}「${item.meaning}」的英文`;
 	return cue ? base + forwardCueSuffix(cue) : base;
 }
@@ -222,6 +232,11 @@ export function forwardCueSuffix(cue: ForwardCue): string {
 
 export function questionHasForwardCue(questionText: string | null | undefined): boolean {
 	return /（以 [A-Za-z] 开头/.test(questionText ?? "");
+}
+
+/** True when a reverse prompt carries the card's example sentence as sense context. */
+export function questionHasReverseContext(questionText: string | null | undefined): boolean {
+	return /^在例句「.+」中，.+「.+」是什么意思？/.test(questionText ?? "");
 }
 
 /** Canonical sentence-level question text for attempt logs. */

@@ -99,22 +99,23 @@
 
 ### 5.1 新授
 
-首次展示仍用于理解，不要求立即闭卷产出：
+首次展示就进入主动回忆，不设置“必须先翻面才能答题”的门槛：
 
 ```text
-(=^･ω･^=) 新义项：coordinate /koʊˈɔːrdɪneɪt/
-  释义：协调多个参与者或任务，使其共同工作
-  搭配：coordinate access to shared state
-  场景：多个 Pi 会话需要安全共享学习状态
-💬 /anki:flip 查看例句 · /anki:skip 已会
+(=^･ω･^=) 新义项 · 主动回忆
+  默写单词：协调多个参与者或任务，使其共同工作
+  提示：以 c 开头
+💬 /anki:answer <答案> · /anki:hint · /anki:flip · /anki:skip
 ```
 
-翻面后展示：
+不会时可以请求提示或翻面。翻面后展示：
 
 - 简洁释义和义项边界；
 - 与已有义项或易混词的区别；
 - 一个短例句；
 - 本教学单元中的完整长句。
+
+翻面后仍允许输入答案继续练习，但该回答记录为 `revealed` 辅助，并按 Again 保守调度；翻面是辅助，不是作答许可。
 
 ### 5.2 主动回忆
 
@@ -263,6 +264,8 @@ validator 要求 target sense 存在、每题只有一个主目标、cloze 只�
 同时分别累计 `recognition`、`recall`、`use` 和 `transfer` 四个 facet 的证据，避免用一个阶段掩盖“认得但不会用”。`stage` 只表示下一次优先练习方向，不是单一总分。
 
 FSRS 决定**何时出现**；掌握阶段和 facet 证据决定**出现时练什么**。
+
+word/phrase 的中→英产出与英→中识别保留独立 FSRS 状态，但证据覆盖是非对称的：无辅助中→英正确说明更容易的英→中关联仍然可用，因此识别到期至少推迟到接近本次产出到期（提前一分钟保留一次独立检查）；英→中正确不证明能主动产出，不能推迟中→英。提示、翻面或手动自评同样不能触发这种覆盖。英→中题面携带卡片例句作为义项语境：多义词必须按例句语境作答，答其它常见义项算错；无例句的旧卡题面无法限定义项，任一常见释义均可判对，判分不得因与目标释义不同而判错。
 
 阶段变化由代码按下表执行，LLM 不返回“下一阶段”：
 
@@ -600,6 +603,8 @@ CREATE INDEX lexical_senses_surface_idx
 
 `sense_fingerprint` 对 **kind + 规范化形式 + 词性 + 规范化释义** 做确定性哈希，防止精确重复；语义近似重复由共识审查拦截。同词不同义具有不同 fingerprint，并自动生成 contrast 练习。
 
+当前 protocol 1 尚未接入词典证据和可靠的词性/义项 ID，因此先采用更保守的安全门：word/phrase 的 `content_fingerprint` 只使用 **kind + 规范化形式**，同一英文正文即使中文释义措辞不同也不得生成第二张可调度卡。真正的同形异义卡要等 CALD 义项证据接入后，以 `lexical_sense_id` 区分并配套 contrast 练习；在此之前宁可不新增，也不把“工作量”与“工作量；学习负担”误当两个生词。已知词表对生成器只是提示性约束：插入前会用同一指纹确定性复查，撞车批次自动带着「重复」反馈重生成一次，仍撞车的个别项被丢弃、其余照常交付，只有全军覆没才记 duplicate_batch 拒绝。
+
 另建 `lexical_surface_versions(kind, normalized_surface, version)`。任何该 surface 的义项插入都会在同一事务增加 version。novelty job 记录审查时的 surface version；最终插入事务只在 version 未变化时提交，否则回到 novelty 审查，避免 LLM 调用和提交之间出现语义竞态。
 
 ### 9.3 扩展 `items`
@@ -624,7 +629,7 @@ ALTER TABLE items ADD COLUMN fsrs_corrupt_at TEXT;
 
 为非空 fingerprint 建唯一索引，并建立 `UNIQUE(lexical_sense_id) WHERE lexical_sense_id IS NOT NULL AND legacy_duplicate_of IS NULL`，保证一个 lexical sense 只有一个 canonical schedulable item。新插入事务先查询/复用 canonical item；唯一冲突回退为 reinforce，不能再建卡。
 
-旧 item 在首次 due 或后台维护时懒迁移，不重置 FSRS。若旧库已经存在精确重复，选择最早 item 作为 canonical 并设置 fingerprint/sense id；其他行保留原 FSRS、令 fingerprint 和 lexical_sense_id 为 NULL、写入 `legacy_duplicate_of`。第一版不自动合并历史进度，scheduler 避免同时教学这些重复项。新内容不允许进入该兼容通道。
+旧 item 在首次 due 或后台维护时迁移，不重置 FSRS。protocol 1 若发现同类 word/phrase 的规范化正文重复，优先保留已批准、复习次数更多的 item 为 canonical；其他行保留原 FSRS 与 attempts、清空 `content_fingerprint` 并写入 `legacy_duplicate_of`。scheduler 不再教学这些重复项，它们也不再消耗每日新卡额度；新内容不允许进入该兼容通道。
 
 ### 9.4 `supporting_materials` 与 `exercises`
 
@@ -1031,7 +1036,7 @@ FEEDBACK
 
 至少手工验证：
 
-1. 新课 → 翻面 → Good；
+1. 新课首次展示 → answer → feedback；同时验证不翻面即可答题，翻面只是可选辅助；
 2. 到期填空 → answer → feedback → Good；
 3. 错误答案 → Again → 后续强化；
 4. 同词新义 → 对比练习；

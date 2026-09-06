@@ -799,7 +799,7 @@ test("critic prompt includes the minimal-meaning blocker rule", async () => {
 	} as unknown as PiSdkLlmClient;
 	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	// A word item skips the sentence-only deterministic gate and reaches the LLM call.
-	const word: GeneratedItem = { type: "word", text: "reload", meaning: "重新加载", example: "Reload the extension.", example_cn: "重新加载扩展。" };
+	const word: GeneratedItem = { type: "word", text: "reload", meaning: "重新加载（动词）", example: "Reload the extension.", example_cn: "重新加载扩展。" };
 	const verdict = await critiqueLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, { topic: "t", items: [word] }, [], FAKE_CONFIG, adaptive);
 	assert.equal(verdict.pass, true);
 	assert.match(captured, /最小释义/);

@@ -11,6 +11,8 @@
   },
   "files": [
     "index.ts",
+    "chat.ts",
+    "adaptive-load.ts",
     "config.ts",
     "conversation.ts",
     "db.ts",

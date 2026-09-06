@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { restoreCard } from "./fsrs.ts";
 import type { GeneratedItem } from "./llm.ts";
@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 12;
+const SCHEMA_TARGET_VERSION = 14;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -350,6 +350,112 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 				payload TEXT NOT NULL
 			);
 		`);
+	},
+	// v13: protocol 1 has no trustworthy POS/sense identity, so one normalized
+	// word/phrase surface may have only one schedulable card. Recompute lexical
+	// fingerprints, quarantine later/weaker duplicates, and clean the custom queue.
+	(db: DatabaseSync) => {
+		const rows = db
+			.prepare(
+				`SELECT id, type, text, meaning FROM items WHERE legacy_duplicate_of IS NULL
+				 ORDER BY CASE WHEN content_status = 'approved' THEN 0 ELSE 1 END,
+				 reviews DESC, shown DESC, id ASC`,
+			)
+			.all() as { id: number; type: string; text: string; meaning: string }[];
+		const canonicalByFingerprint = new Map<string, number>();
+		const setFingerprint = db.prepare(
+			"UPDATE items SET content_fingerprint = ? WHERE id = ?",
+		);
+		const markDuplicate = db.prepare(
+			"UPDATE items SET content_fingerprint = NULL, legacy_duplicate_of = ? WHERE id = ?",
+		);
+		const clearActiveDuplicate = db.prepare(
+			`UPDATE runtime_state SET active_item_id = NULL, active_kind = NULL,
+			 active_direction = 'forward', active_version = active_version + 1,
+			 active_review_cycle_id = NULL, active_exercise_id = NULL,
+			 active_cycle_outcome = NULL, active_retry_count = 0,
+			 active_assistance_level = 'none', next_check_at = ?
+			 WHERE active_item_id = ?`,
+		);
+		const now = new Date().toISOString();
+		for (const row of rows) {
+			const fingerprint = contentFingerprint(row.type, row.text, row.meaning);
+			const canonical = canonicalByFingerprint.get(fingerprint);
+			if (canonical == null) {
+				canonicalByFingerprint.set(fingerprint, row.id);
+				setFingerprint.run(fingerprint, row.id);
+				continue;
+			}
+			markDuplicate.run(canonical, row.id);
+			clearActiveDuplicate.run(now, row.id);
+		}
+
+		const queuedFingerprints = new Set<string>();
+		const updateQueued = db.prepare(
+			"UPDATE custom_card_queue SET fingerprint = ? WHERE id = ?",
+		);
+		const deleteQueued = db.prepare("DELETE FROM custom_card_queue WHERE id = ?");
+		const queued = db.prepare("SELECT id, payload FROM custom_card_queue ORDER BY id").all() as {
+			id: number;
+			payload: string;
+		}[];
+		for (const row of queued) {
+			let item: GeneratedItem;
+			try {
+				item = JSON.parse(row.payload) as GeneratedItem;
+			} catch {
+				continue;
+			}
+			if (!item?.type || !item.text || !item.meaning) continue;
+			const fingerprint = contentFingerprint(item.type, item.text, item.meaning);
+			if (canonicalByFingerprint.has(fingerprint) || queuedFingerprints.has(fingerprint)) {
+				deleteQueued.run(row.id);
+				continue;
+			}
+			queuedFingerprints.add(fingerprint);
+			updateQueued.run(fingerprint, row.id);
+		}
+	},
+	// v14: an unassisted correct production answer covers the easier recognition
+	// association. Repair existing schedules so recognition is checked near the
+	// production interval instead of returning the next day.
+	(db: DatabaseSync) => {
+		const rows = db.prepare(
+			`SELECT i.id, f.due_at AS production_due, r.due_at AS recognition_due,
+				(SELECT MAX(COALESCE(a.rated_at, a.completed_at, a.started_at))
+				 FROM attempts a
+				 WHERE a.item_id = i.id AND a.direction = 'forward'
+				   AND a.status = 'evaluated' AND a.verdict = 'correct'
+				   AND a.assistance_level = 'none' AND a.answer_text IS NOT NULL) AS last_production
+			 FROM items i
+			 JOIN direction_state f ON f.item_id = i.id AND f.direction = 'forward'
+			 JOIN direction_state r ON r.item_id = i.id AND r.direction = 'reverse'
+			 WHERE i.type IN ('word','phrase') AND i.legacy_duplicate_of IS NULL
+			   AND i.content_status = 'approved'
+			   AND (i.fsrs_status = 'ok' OR i.fsrs_status IS NULL)
+			   AND f.due_at > r.due_at`,
+		).all() as {
+			id: number;
+			production_due: string;
+			recognition_due: string;
+			last_production: string | null;
+		}[];
+		const updateRecognition = db.prepare(
+			"UPDATE direction_state SET due_at = ?, updated_at = ? WHERE item_id = ? AND direction = 'reverse'",
+		);
+		const updateItemDue = db.prepare(
+			"UPDATE items SET due_at = (SELECT MIN(due_at) FROM direction_state WHERE item_id = ?) WHERE id = ?",
+		);
+		const migratedAt = new Date().toISOString();
+		for (const row of rows) {
+			if (!row.last_production) continue;
+			const reviewedAt = new Date(row.last_production);
+			if (!Number.isFinite(reviewedAt.getTime())) continue;
+			const floor = recognitionDueFloorAfterProduction(reviewedAt, row.production_due);
+			if (row.recognition_due >= floor) continue;
+			updateRecognition.run(floor, migratedAt, row.id);
+			updateItemDue.run(row.id, row.id);
+		}
 	},
 ];
 
@@ -640,16 +746,21 @@ export function computeMasteryStage(
 	return MASTERY_STAGES[idx];
 }
 
-/** Deterministic content fingerprint for exact dedup: type + normalized text + normalized meaning. */
+/**
+ * Deterministic content fingerprint. Until dictionary-grounded POS/sense IDs
+ * exist, a normalized word/phrase surface is unique regardless of wording in
+ * its Chinese meaning. Sentence/cloze identity still includes the answer.
+ */
 export function contentFingerprint(
 	type: string,
 	text: string,
 	meaning: string,
 ): string {
 	const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
-	return createHash("sha256")
-		.update(`${type}\u0000${norm(text)}\u0000${norm(meaning)}`, "utf8")
-		.digest("hex");
+	const identity = type === "word" || type === "phrase"
+		? `${type}\u0000${norm(text)}`
+		: `${type}\u0000${norm(text)}\u0000${norm(meaning)}`;
+	return createHash("sha256").update(identity, "utf8").digest("hex");
 }
 
 /** Sense fingerprint: kind + normalized surface + part of speech + normalized meaning. */
@@ -669,7 +780,7 @@ function senseFingerprint(
 }
 
 /** Find or create a lexical_sense for a word/phrase item; sentences have no sense. */
-function ensureLexicalSense(
+export function ensureLexicalSense(
 	db: DatabaseSync,
 	type: string,
 	text: string,
@@ -722,6 +833,10 @@ export function insertItem(
 		introductionKind?: "planned" | "replacement" | "custom";
 	},
 ): number {
+	const fingerprint = contentFingerprint(type, text, meaning);
+	if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fingerprint)) {
+		throw new Error("DUPLICATE_CONTENT");
+	}
 	const senseId = ensureLexicalSense(db, type, text, meaning, now);
 	const ts = now.toISOString();
 	const introductionKind = extra?.introductionKind ?? "planned";
@@ -742,7 +857,7 @@ export function insertItem(
 			extra?.levels_cn ? JSON.stringify(extra.levels_cn) : null,
 			extra?.chunks ? JSON.stringify(extra.chunks) : null,
 			extra?.keyWords ? JSON.stringify(extra.keyWords) : null,
-			contentFingerprint(type, text, meaning),
+			fingerprint,
 			senseId,
 			introductionKind,
 		);
@@ -805,6 +920,23 @@ export function directionFsrsState(db: DatabaseSync, itemId: number, direction: 
  * prime a same-day production answer (and vice versa).
  */
 export const DIRECTION_MIN_SEPARATION_MS = 24 * 3600 * 1000;
+const RECOGNITION_LEAD_MS = 60 * 1000;
+
+/**
+ * Productive recall subsumes recognition, but keep recognition one minute
+ * earlier so it still receives an occasional independent check.
+ */
+export function recognitionDueFloorAfterProduction(
+	reviewedAt: Date,
+	productionDue: string,
+): string {
+	const minimum = reviewedAt.getTime() + DIRECTION_MIN_SEPARATION_MS;
+	const productionDueMs = Date.parse(productionDue);
+	const nearProduction = Number.isFinite(productionDueMs)
+		? productionDueMs - RECOGNITION_LEAD_MS
+		: minimum;
+	return new Date(Math.max(minimum, nearProduction)).toISOString();
+}
 
 export function advanceReviewDirectional(
 	db: DatabaseSync,
@@ -814,10 +946,16 @@ export function advanceReviewDirectional(
 	dueAt: string,
 	reviews: number,
 	now: Date,
+	options?: { siblingDueFloor?: string },
 ) {
 	const ts = now.toISOString();
 	const sibling = direction === "forward" ? "reverse" : "forward";
-	const siblingMinDue = new Date(now.getTime() + DIRECTION_MIN_SEPARATION_MS).toISOString();
+	const defaultSiblingFloor = now.getTime() + DIRECTION_MIN_SEPARATION_MS;
+	const requestedSiblingFloor = Date.parse(options?.siblingDueFloor ?? "");
+	const siblingMinDue = new Date(Math.max(
+		defaultSiblingFloor,
+		Number.isFinite(requestedSiblingFloor) ? requestedSiblingFloor : defaultSiblingFloor,
+	)).toISOString();
 	db.prepare(
 		"INSERT OR IGNORE INTO direction_state (item_id, direction, fsrs_state, due_at, updated_at) VALUES (?, ?, '', ?, ?)",
 	).run(id, sibling, siblingMinDue, ts);
@@ -843,7 +981,7 @@ export function advanceReviewDirectional(
 export function countTodayNew(db: DatabaseSync, now: Date): number {
 	const row = db
 		.prepare(
-			"SELECT COUNT(*) AS n FROM items WHERE introduction_kind IN ('planned', 'custom') AND introduced_at >= ?",
+			"SELECT COUNT(*) AS n FROM items WHERE introduction_kind IN ('planned', 'custom') AND introduced_at >= ? AND legacy_duplicate_of IS NULL",
 		)
 		.get(localDayStartISO(now)) as { n: number };
 	return Number(row.n);
@@ -851,7 +989,7 @@ export function countTodayNew(db: DatabaseSync, now: Date): number {
 
 export function knownList(db: DatabaseSync): string[] {
 	const rows = db
-		.prepare("SELECT text, meaning FROM items WHERE shown = 1 ORDER BY id DESC LIMIT 30")
+		.prepare("SELECT text, meaning FROM items WHERE shown = 1 AND legacy_duplicate_of IS NULL ORDER BY id DESC LIMIT 30")
 		.all() as {
 		text: string;
 		meaning: string;
@@ -860,9 +998,11 @@ export function knownList(db: DatabaseSync): string[] {
 	return rows.map((r) => `${r.text}（${r.meaning}）`);
 }
 
+// Replacement uniqueness spans the entire deck, including unshown inventory.
+// Truncating this context lets the generator repeatedly rediscover older cards.
 export function replacementKnownList(db: DatabaseSync): string[] {
 	const rows = db
-		.prepare("SELECT type, text, meaning FROM items ORDER BY id DESC LIMIT 50")
+		.prepare("SELECT type, text, meaning FROM items WHERE legacy_duplicate_of IS NULL ORDER BY id DESC")
 		.all() as Array<{
 		type: string;
 		text: string;
@@ -920,6 +1060,16 @@ export interface CustomQueueRow {
 	payload: string;
 }
 
+function customQueueRow(row: Record<string, SQLOutputValue>): CustomQueueRow {
+	return {
+		id: Number(row.id),
+		created_at: String(row.created_at),
+		prompt: String(row.prompt),
+		fingerprint: String(row.fingerprint),
+		payload: String(row.payload),
+	};
+}
+
 /** Stage a finished custom card; FIFO order follows insertion (rowid) order. */
 export function enqueueCustomCard(
 	db: DatabaseSync,
@@ -940,13 +1090,15 @@ export function enqueueCustomCard(
 export function peekCustomQueue(db: DatabaseSync, limit: number): CustomQueueRow[] {
 	return db
 		.prepare("SELECT * FROM custom_card_queue ORDER BY id ASC LIMIT ?")
-		.all(limit) as CustomQueueRow[];
+		.all(limit)
+		.map(customQueueRow);
 }
 
 export function listCustomQueue(db: DatabaseSync): CustomQueueRow[] {
 	return db
 		.prepare("SELECT * FROM custom_card_queue ORDER BY id ASC")
-		.all() as CustomQueueRow[];
+		.all()
+		.map(customQueueRow);
 }
 
 export function removeCustomQueueRows(db: DatabaseSync, ids: number[]): void {
