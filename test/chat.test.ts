@@ -6,6 +6,7 @@ import test from "node:test";
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "anki-chat-test-"));
 const { openDb, insertItem } = await import("../db.ts");
 const { runChat, parseChatRequest, allowedChatAction, createChatDispatcher } = await import("../chat.ts");
+const { critiqueLesson } = await import("../llm.ts");
 const db = openDb();
 let seq = 0;
 function fixture() {
@@ -14,6 +15,22 @@ function fixture() {
  const deps = { db, valid: () => true, complete: async () => JSON.stringify({ reply: "建议更明确", action: { kind: "edit", fields: { meaning: "交流（动词，指与他人交换信息或想法）" } } }), critique: async () => true, add: async () => ({ success: false, reply: "未通过审查" }), refresh: () => {} };
  return { id, request, deps };
 }
+test("repair cannot save a generic goal paraphrase even when the model critic would pass", async () => {
+ const id = insertItem(db, "word", "goal", null, "目标（可数名词，以 g 开头，共 4 个字母）", "My goal is to study English every day.", "我的目标是每天学习英语。", new Date());
+ const before = db.prepare("SELECT * FROM items WHERE id=?").get(id);
+ let criticCalls = 0;
+ const llm = { complete: async () => { criticCalls++; return JSON.stringify({ pass: true, issues: [], summary: "approved" }); } } as any;
+ const result = await runChat({ requestId: "goal-repair-regression", message: "请修改这张卡的提示", itemId: id, history: [] }, {
+  db, valid: () => true,
+  complete: async () => JSON.stringify({ reply: "建议改写", action: { kind: "edit", fields: { meaning: "目标（可数名词，指希望达到的结果）" } } }),
+  critique: async item => (await critiqueLesson(llm, {} as any, { provider: "test", model: "test", fromSession: false }, { topic: "修卡", items: [item] }, [], {} as any, undefined, null)).pass,
+  add: async () => ({ success: false, reply: "unused" }), refresh: () => {},
+ });
+ assert.equal(result.success, false);
+ assert.match(result.reply, /未通过内容审查/);
+ assert.equal(criticCalls, 0);
+ assert.deepEqual(db.prepare("SELECT * FROM items WHERE id=?").get(id), before, "content and scheduling remain untouched after rejected repair");
+});
 test("request contract rejects oversized or malformed inputs", () => {
  const { request } = fixture();
  assert.equal(parseChatRequest(JSON.stringify(request)).requestId, request.requestId);

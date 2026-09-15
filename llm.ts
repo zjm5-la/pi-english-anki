@@ -2,13 +2,13 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, MAX_CUSTOM_PER_ADD, type PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import { normalizeMeaning, type ItemRow } from "./db.ts";
-import { meaningHasForwardSenseClue, meaningHasVisiblePos, questionHasForwardCue, questionHasReverseContext, type SentenceExerciseView } from "./render.ts";
+import { forwardCue, meaningHasForwardSenseClue, meaningHasVisiblePos, questionHasForwardCue, questionHasReverseContext, type SentenceExerciseView } from "./render.ts";
 import { coldStartProfile, deriveBudget, formatAdaptiveBlock, normalizeErrorTag, type AdaptiveContext } from "./learner-profile.ts";
 
 // -- LLM lesson generation ------------------------------------------------
 
 /** Shared by all generation paths and the critic, including basic fallbacks. */
-const FORWARD_PROMPT_QUALITY = [
+export const FORWARD_PROMPT_QUALITY = [
 	"- word/phrase 会用 meaning 作为中文到英文的题面：必须在作答前就给足线索，不得等判分反馈才解释目标词，也不得假设学习者能猜到隐藏的 text。",
 	"- 每张 word/phrase 的 meaning 都必须明确标注当前所考义项的中文词性，不能仅在 example、隐藏字段或判分反馈里说明。单词标注名词、动词、形容词、副词、介词、代词、连词、数词、冠词或感叹词等；词组标注动词短语、名词短语等适用类别。不得因中文看起来简单而省略，也不得把同一个英文的多个词性一起罗列让学生猜本题考哪个。",
 	"- 例如 communicate 应写「交流（动词，指与他人交换信息或想法）」，communication 应写「交流（名词，指交换信息或想法的过程）」；提示「交流」无法区分动词与名词。词性须与 text 在例句中的当前用法一致，不能只标笼统的「单词」或「词组」。词性只解决词类歧义，同词性的近义词仍须补必要的义项或搭配线索。",
@@ -16,7 +16,10 @@ const FORWARD_PROMPT_QUALITY = [
 	"- 例如 information 不可只提示「信息/消息」：可写「信息（不可数名词，泛指事实或资料）」；message 可写「消息（可数名词，指发送或收到的一条留言）」。这说明词义范围，不能虚构近义词之间并不存在的区别。",
 	"- 例如 performance 不可只提示「表演」：show、act 同样自然。应写「一场具体的演出（可数名词，常与 give 搭配，强调演出本身或当场表现）」；只标「表演（名词）」也不够，必须补语境或搭配。",
 	"- 为有近义词的目标选择能体现词义的自然例句/搭配，example 必须原样包含 text，example_cn 准确翻译；把目标挖空后仍应提供有用语境，不能只用 I like ... 等空泛句。",
-	"- 自检以实际默认题面为准：学生只看到 meaning，不能假设例句挖空或首字母已经显示，例句仅作辅助。隐藏 text 和 example 后，学生能否仅从 meaning 判断所考词？若仍有多个同样自然且满足线索的常见答案，必须将必要限定写进 meaning；仍无法消歧就换学习项，用户指定必须保留的词则返回无法生成的原因，不能靠不自然英文或直接泄露目标英文来强行唯一。",
+	"- 逐张做同词性替换检验：先列出至少一个自然的常见候选（确无候选须说明），再把每个候选代入 meaning 的实际场景和遮住目标词的 example；候选不必已入库、也不必共享完全相同的中文释义。解释为什么替换不成立，不能只宣称「上下文明确」。",
+	"- 括号里有说明不等于完成消歧：把「目标」改写成「希望达到/达成的结果」「想要实现的事情」，或写「强调结果、常与 set 搭配」，仍然同时容纳 goal / target / aim。释义复述、目标词的英文释义和空泛例句都不是区分同义词的证据；真实场景/搭配的必要部分必须前置到 meaning，而不是只存在于 example 或反馈。",
+	"- goal / target / aim 的泛指目标义项不能靠虚构「goal 只能长期、target 只能具体、aim 只能主观」来强行区分；必须实际替换检验。若仍可互换，换词或换练习；需保留目标时，在 meaning 明确写本次学习目标的正确首字母和字母数（goal：以 g 开头，共 4 个字母；target：以 t 开头，共 6 个字母；aim：以 a 开头，共 3 个字母），并配真实场景与可遮目标的例句。这是指定拼写练习目标，不是证明这些词语义互斥。",
+	"- 自检以实际默认题面为准：学生只看到 meaning，不能假设例句挖空或首字母已经显示，例句仅作辅助。隐藏 text 和 example 后，学生能否仅从 meaning 判断所考词？若仍有多个同样自然且满足线索的常见答案，必须将必要限定写进 meaning；仍可互换时加入真实正确的首字母/词长学习目标提示，或换学习项。用户指定必须保留的词不能靠不自然英文或直接泄露完整目标英文来强行唯一，也不能在后台假设非 App 客户端显示额外提示。",
 ].join("\n");
 
 export interface GeneratedItem {
@@ -34,6 +37,29 @@ export interface GeneratedItem {
 	chunks?: string[];
 	/** Sentence only: likely-new words inside the sentence, with meanings. */
 	keyWords?: { text: string; phonetic?: string; meaning: string }[];
+}
+
+/** A narrow regression guard for a known interchangeable sense family.
+ * This catches a reproducible counterexample; it does not prove arbitrary
+ * vocabulary prompts semantically unique. All other cases still need review. */
+function knownForwardAlternatives(item: GeneratedItem): string[] {
+	const target = item.text.trim().toLowerCase();
+	const singular = target.replace(/s$/, "");
+	if (!["goal", "target", "aim"].includes(singular)) return [];
+	const core = item.meaning.replace(/【[^】]*】/g, "").split(/[（(]/)[0];
+	if (/球门|进球|靶子|靶心|靶标/.test(core)) return [];
+	if (!/目标|目的|志向|意图|愿望|(?:希望|想要|期望|预期).*(?:达到|达成|实现|取得|结果)/.test(item.meaning)) return [];
+	return ["goal", "target", "aim"].filter(word => word !== singular).map(word => target.endsWith("s") ? `${word}s` : word);
+}
+
+function hasMatchingSpellingTarget(item: GeneratedItem): boolean {
+	const target = item.text.trim().toLowerCase();
+	const initials = [...item.meaning.matchAll(/(?:以\s*([a-z])\s*开头|首字母\s*(?:为|是|[:：])?\s*([a-z]))/gi)];
+	const lengths = [...item.meaning.matchAll(/(\d+)\s*(?:个)?\s*(?:英文)?字母/g)];
+	const negated = /(?:不|非).{0,4}(?:以\s*[a-z]\s*开头|首字母|\d+\s*(?:个)?\s*(?:英文)?字母)/i.test(item.meaning);
+	return !negated && initials.length > 0 && lengths.length > 0
+		&& initials.every(match => (match[1] || match[2]).toLowerCase() === target[0])
+		&& lengths.every(match => Number(match[1]) === target.replace(/[^a-z]/g, "").length);
 }
 
 function stringArray(value: unknown): string[] | undefined {
@@ -429,6 +455,14 @@ export async function critiqueLesson(
 				description: `「${item.text}」的中文题面只有词性、缺少能排除近义词的语境或搭配，请写成「义项（词性，语境或搭配）」；不能只写「表演」或「表演（名词）」，也不能把语境留到例句或判分反馈`,
 			});
 		}
+		const alternatives = knownForwardAlternatives(item);
+		if (alternatives.length && (!hasMatchingSpellingTarget(item) || !forwardCue(item as ItemRow)?.context)) {
+			budgetBlockers.push({
+				severity: "blocker",
+				category: "sense",
+				description: `「${item.text}」的泛指目标题面仍可回答 ${alternatives.join(" / ")}；「希望达到/达成的结果」「想要实现的事情」只是释义复述，不能当消歧证据。请换学习项，或在 meaning 明确写与目标匹配的首字母和字母数，并补真实场景及能遮住目标的例句；不得编造这些词不能互换的区别`,
+			});
+		}
 		const key = normalizeMeaning(item.meaning);
 		const firstText = seenMeanings.get(key);
 		if (firstText != null) {
@@ -446,13 +480,20 @@ export async function critiqueLesson(
 			available: true,
 			pass: false,
 			issues: budgetBlockers,
-			summary: "确定性质量检查未通过（难度预算、批次重复或题面词性）",
+			summary: "确定性质量检查未通过（难度预算、批次重复或题面消歧）",
 		};
 	}
 
 	// Pass the complete bounded lesson structure (not just an outline) so the critic
 	// can judge examples, levels, chunks, and keywords.
 	const lessonJson = JSON.stringify(lesson);
+	const forwardAudit = lesson.items.filter(item => item.type === "word" || item.type === "phrase").map(item => ({
+		target: item.text,
+		visibleMeaning: item.meaning,
+		maskedExample: forwardCue(item as ItemRow)?.context ?? null,
+		knownAlternatives: knownForwardAlternatives(item),
+		explicitSpellingTarget: hasMatchingSpellingTarget(item),
+	}));
 
 	const prompt = [
 		"你是「英语小宠物」的内容审查员。审查下面备课是否适合当前学习者水平，只输出 JSON。",
@@ -474,11 +515,14 @@ export async function critiqueLesson(
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
 		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；cloze 句子可以自然复用批次中 1-2 个单词或词组`,
 		"- 不得为凑结构硬造不自然句子",
+		"- 对 forward_audit 每一项执行同词性替换检验：列出常见候选，逐个代入 visibleMeaning 和 maskedExample。knownAlternatives 仅给已知反例，空列表绝不表示没有近义词；必须独立寻找候选。不能因为词性齐全、括号更长或另一候选未入库就 pass。若例句仍可替换，要求真实前置语境并明确首字母/词长学习目标，或换词/练习；不得伪造语义互斥。",
+		"- maskedExample 为 null 表示未能安全遮住实际目标，不能声称已有挖空语境。例句和中文翻译须真实相符且提供实际场景；即使 explicitSpellingTarget 为 true，也必须继续审查事实、搭配自然性及题面是否说明真实场景，这个布尔值不是语义唯一证明。",
 		"- 只有明确问题才标 blocker；小瑕疵标 minor",
 		"",
 		formatAdaptiveBlock(ctxAdaptive.profile, budget),
 		"",
 		`<lesson>${lessonJson}</lesson>`,
+		`<forward_audit>${JSON.stringify(forwardAudit)}</forward_audit>`,
 	].join("\n");
 
 	let text: string;

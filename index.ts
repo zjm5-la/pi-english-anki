@@ -10,12 +10,12 @@ import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { dailyLoadPlan, formatDailyLoadPlan, hasNewCardCapacity, nextAdaptiveLessonBatch, remainingNewCardSlots } from "./adaptive-load.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, meaningCollisions, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
-import { FACES, TYPE_LABELS, formatStatusLine, forwardCue, forwardCueSuffix, meaningHasForwardSenseClue, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type ForwardCue, type SentenceExerciseView } from "./render.ts";
+import { FACES, TYPE_LABELS, formatStatusLine, forwardCue, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type ForwardCue, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
 import { dbFilePath, isSyncEnabled, peekRemoteNewer, pullIfNewer, pushSnapshot } from "./sync.ts";
 import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, smoothBudget, type AdaptiveContext } from "./learner-profile.ts";
@@ -892,11 +892,10 @@ export default function piEnglishAnkiExtension(
 		}
 	}
 
-	/** Add a target cue when another word shares the meaning, or the meaning itself cannot uniquely identify the English. */
+	/** Show the same pre-answer context in CLI/RPC and the desktop; a parenthetical definition is not proof of uniqueness. */
 	function activeForwardCue(item: ItemRow, direction: RecallDirection): ForwardCue | undefined {
 		if (!db || direction !== "forward" || (item.type !== "word" && item.type !== "phrase")) return undefined;
-		if (meaningCollisions(db, item).length > 0 || !meaningHasForwardSenseClue(item.meaning)) return forwardCue(item);
-		return undefined;
+		return forwardCue(item);
 	}
 
 	/** Toggle the pending card between its question and answer sides. */
@@ -1058,7 +1057,7 @@ export default function piEnglishAnkiExtension(
 				? `✍️ 请补全：${item.text}`
 				: pendingDirection === "reverse"
 					? `✍️ ${recallQuestionText(item, "reverse")}`
-					: `✍️ 请写出「${item.meaning}」的英文${cue ? forwardCueSuffix(cue) : ""}`;
+					: `✍️ ${recallQuestionText(item, "forward", cue)}`;
 			updateWidget(ctx, FACES.review, [
 				`${FACES.review} ${promptText}`,
 				"用 /anki:answer <你的答案>，或 /anki:hint 看提示，或 /anki:flip 看答案",

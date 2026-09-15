@@ -162,7 +162,7 @@ test("forwardCue: first Latin letter + underscore-masked example for the exact t
 			example: "I am booking a room.",
 		}),
 	);
-	assert.equal(inflected?.context, undefined, "a substring inside booking is not the exact target");
+	assert.equal(inflected?.context, "I am _______ a room.", "inflected targets are fully masked");
 });
 
 test("meaningHasForwardSenseClue requires POS plus a same-paren collocation or sense limit", () => {
@@ -187,7 +187,7 @@ test("recallQuestionText adds forward collision cues and reverse sense context",
 	);
 	assert.equal(
 		recallQuestionText(RESERVE, "forward", cue),
-		"默写单词「预订」的英文（以 r 开头；例：I want to _______ a table for two.）",
+		"默写单词「预订」的英文（以 r 开头；7 个字母；例：I want to _______ a table for two.）",
 	);
 	assert.equal(
 		recallQuestionText(RESERVE, "reverse", cue),
@@ -614,4 +614,35 @@ test("replacement prompt includes all canonical cards beyond the most recent fif
 		assert.match(prompt, /word: morning = 早晨/);
 		assert.match(prompt, /word: newer-59 = 新词59/);
 	} finally { handle.close(); }
+});
+
+
+test("forward target context masks repeated forms and bilingual answer fragments", () => {
+	const item = wordItem({ id: 282, text: "goal", meaning: "目标（可数名词，指希望达到的结果）", example: "My goal is clear. These goals matter.", example_cn: "我的 goal 很清楚，这些 goals 很重要。" });
+	const cue = forwardCue(item)!;
+	assert.equal(cue.shape, "4 个字母");
+	assert.equal(cue.context, "My ____ is clear. These _____ matter.");
+	assert.equal(cue.chineseContext, "我的 ____ 很清楚，这些 _____ 很重要。");
+	assert.doesNotMatch(recallQuestionText(item, "forward", cue), /goal/i);
+	const unsafe = forwardCue({ ...item, example: "Goalkeeper is my goal." });
+	assert.equal(unsafe?.context, undefined, "unknown target fragments never escape masking");
+	const oneLetter = wordItem({ id: 1, text: "a", meaning: "一个（冠词，泛指任意一个）", example: "I need a pen." });
+	const question = recallQuestionText(oneLetter, "forward", forwardCue(oneLetter));
+	assert.doesNotMatch(question, /以 a 开头/);
+	assert.match(question, /1 个字母/);
+	assert.equal(questionHasForwardCue(question), true);
+});
+
+
+test("inflected targets mask their base forms and unsafe qualifiers retain the Chinese core", () => {
+	for (const [text, example, expected] of [
+		["goals", "One goal and two goals.", "One ____ and two _____."],
+		["booked", "I booked it; I book rooms often.", "I ______ it; I ____ rooms often."],
+	]) {
+		assert.equal(forwardCue(wordItem({ id: 1, text, meaning: "测试", example }))?.context, expected);
+	}
+	const work = wordItem({ id: 2, text: "work", meaning: "工作（名词，指 workplace 里的任务）" });
+	const question = recallQuestionText(work, "forward", forwardCue(work));
+	assert.match(question, /工作（名词）/);
+	assert.doesNotMatch(question, /workplace|根据语境回忆目标词/);
 });

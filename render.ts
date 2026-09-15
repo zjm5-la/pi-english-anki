@@ -192,9 +192,38 @@ export function recallQuestionText(
 		if (example) return `在例句「${example}」中，${label}「${item.text}」是什么意思？`;
 		return `写出${label}「${item.text}」的中文释义`;
 	}
-	const base = `默写${label}「${item.meaning}」的英文`;
+	const lexical = lexicalMeaning(item.meaning);
+	const safeCore = maskTarget(lexical.meaning, item.text) ?? "根据语境回忆目标词";
+	const safeDetails = [lexical.partOfSpeech, maskTarget(lexical.clarification, item.text)].filter(Boolean).join("，");
+	const meaning = cue ? maskTarget(item.meaning, item.text) ?? `${safeCore}${safeDetails ? `（${safeDetails}）` : ""}` : item.meaning;
+	const base = `默写${label}「${meaning}」的英文`;
 	return cue ? base + forwardCueSuffix(cue) : base;
 }
+
+/** Extract only explicit grammatical labels; semantic parentheses stay intact. */
+export function lexicalMeaning(raw: string): {
+	meaning: string;
+	partOfSpeech: string;
+	clarification: string;
+} {
+	const pos = "不可数名词|可数名词|复数名词|单数名词|专有名词|集合名词|普通名词|及物动词|不及物动词|情态动词|助动词|动词过去分词|动词现在分词|动词短语|名词短语|形容词|副词|介词短语|介词|连词|代词|数词|冠词|感叹词|名词|动词";
+	let meaning = raw.trim().replace(/([）)])[。．]+$/u, "$1");
+	let partOfSpeech = "";
+	let clarification = "";
+	const prefix = new RegExp(`^【(${pos})】\\s*`).exec(meaning);
+	if (prefix) {
+		partOfSpeech = prefix[1];
+		meaning = meaning.slice(prefix[0].length).trim();
+	}
+	const suffix = new RegExp(`^(.+?)[（(](${pos})(?:[，,；;]\\s*(.+))?[）)]$`).exec(meaning);
+	if (suffix) {
+		meaning = suffix[1].trim();
+		partOfSpeech = suffix[2];
+		clarification = suffix[3]?.trim() ?? "";
+	}
+	return { meaning, partOfSpeech, clarification };
+}
+
 
 /** Visible Chinese POS used by the critic and by the forward-cue gate. */
 const CHINESE_POS =
@@ -215,42 +244,95 @@ export function meaningHasForwardSenseClue(meaning: string): boolean {
 	return new RegExp(`【\\s*${CHINESE_POS}\\s*】[^（(]{0,40}[（(][^）)]+[）)]`).test(meaning);
 }
 
-/** Disambiguation for colliding or underdetermined Chinese → English prompts. */
+/** Same conservative context as the desktop: grammatical labels alone do not
+ * establish that a Chinese cue has exactly one English answer. */
 export interface ForwardCue {
 	initial: string;
+	shape?: string;
+	letterCount?: number;
 	context?: string;
+	chineseContext?: string;
 }
 
-function escapeRegExp(text: string): string {
-	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const IRREGULAR_FORMS = [
+	["be", "am", "is", "are", "was", "were", "been", "being"], ["go", "goes", "went", "gone", "going"],
+	["have", "has", "had", "having"], ["do", "does", "did", "done", "doing"], ["take", "took", "taken", "taking"],
+	["make", "made", "making"], ["give", "gave", "given", "giving"], ["get", "got", "gotten", "getting"],
+	["see", "saw", "seen", "seeing"], ["write", "wrote", "written", "writing"], ["read", "reading"],
+	["speak", "spoke", "spoken", "speaking"], ["come", "came", "coming"], ["run", "ran", "running"],
+	["buy", "bought", "buying"], ["bring", "brought", "bringing"], ["think", "thought", "thinking"],
+	["teach", "taught", "teaching"], ["learn", "learned", "learnt", "learning"], ["eat", "ate", "eaten", "eating"],
+	["find", "found", "finding"], ["leave", "left", "leaving"], ["feel", "felt", "feeling"],
+	["child", "children"], ["person", "people"], ["man", "men"], ["woman", "women"],
+	["foot", "feet"], ["tooth", "teeth"], ["mouse", "mice"],
+];
+
+function wordForms(word: string): string[] {
+	const lower = word.toLowerCase();
+	const bases = new Set([lower]);
+	if (lower.length > 3) {
+		if (/ies$/.test(lower)) bases.add(`${lower.slice(0, -3)}y`);
+		if (/s$/.test(lower) && !/ss$/.test(lower)) bases.add(lower.slice(0, -1));
+		if (/es$/.test(lower)) bases.add(lower.slice(0, -2));
+		for (const ending of ["ed", "ing"]) if (lower.endsWith(ending)) {
+			const stem = lower.slice(0, -ending.length);
+			if (stem.length < 2) continue;
+			bases.add(stem); bases.add(`${stem}e`);
+			if (/(.)\1$/.test(stem)) bases.add(stem.slice(0, -1));
+			if (ending === "ed" && stem.endsWith("i")) bases.add(`${stem.slice(0, -1)}y`);
+		}
+	}
+	for (const family of IRREGULAR_FORMS) if (family.includes(lower)) for (const form of family) bases.add(form);
+	const forms = new Set<string>();
+	for (const base of bases) {
+		for (const form of [base, `${base}s`, `${base}es`, `${base}ed`, `${base}ing`, `${base}ings`]) forms.add(form);
+		if (base.endsWith("e")) { forms.add(`${base}d`); forms.add(`${base.slice(0, -1)}ing`); }
+		if (/[bcdfghjklmnpqrstvwxyz]y$/.test(base)) { forms.add(`${base.slice(0, -1)}ies`); forms.add(`${base.slice(0, -1)}ied`); }
+		if (/[aeiou][bcdfghjklmnpqrstvz]$/.test(base)) { forms.add(`${base}${base.at(-1)}ed`); forms.add(`${base}${base.at(-1)}ing`); }
+	}
+	return [...forms].sort((a, b) => b.length - a.length);
+}
+
+/** Mask every occurrence, including common inflections and possessives. The
+ * English example must contain a recognized target; unfamiliar spellings or
+ * residual target fragments make us withhold the example instead of leaking it. */
+function maskTarget(raw: string | null, target: string, requireMatch = false): string | null {
+	if (!requireMatch && raw?.trim() && !/[A-Za-z]/.test(raw)) return raw.trim();
+	const normalized = target.trim();
+	if (!raw?.trim() || !/^[A-Za-z]+(?:['’\-][A-Za-z]+)*(?:\s+[A-Za-z]+(?:['’\-][A-Za-z]+)*)*$/.test(normalized)) return null;
+	const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const pattern = normalized.split(/\s+/).map(word => `(?:${wordForms(word).map(escape).join("|")})(?:['’]s|['’])?`).join("\\s+");
+	const matcher = new RegExp(`(?<![A-Za-z])${pattern}(?![A-Za-z])`, "giu");
+	let matched = false;
+	const masked = raw.replace(matcher, match => { matched = true; return "_".repeat(match.length); });
+	if (requireMatch && !matched) return null;
+	const residual = normalized.split(/\s+/).map(escape).join("\\s+");
+	if (new RegExp(residual, "iu").test(masked)) return null;
+	return masked.trim();
 }
 
 export function forwardCue(item: ItemRow): ForwardCue | undefined {
 	const initial = item.text.match(/[A-Za-z]/)?.[0]?.toLowerCase();
 	if (!initial) return undefined;
-	let context: string | undefined;
-	const target = item.text.trim();
-	const example = item.example?.trim();
-	if (target && example) {
-		const lead = /^[A-Za-z0-9]/.test(target) ? "\\b" : "";
-		const tail = /[A-Za-z0-9]$/.test(target) ? "\\b" : "";
-		const masked = example.replace(
-			new RegExp(`${lead}${escapeRegExp(target)}${tail}`, "gi"),
-			(match) => "_".repeat(match.length),
-		);
-		if (masked !== example) context = masked;
-	}
-	return { initial, context };
+	const words = item.text.trim().split(/\s+/);
+	const lengths = words.map(word => (word.match(/[A-Za-z]/g) ?? []).length);
+	const letterCount = lengths.reduce((sum, length) => sum + length, 0);
+	const shape = words.length === 1 ? `${letterCount} 个字母` : `${words.length} 个词（${lengths.join(" + ")} 个字母）`;
+	return { initial, shape, letterCount,
+		context: maskTarget(item.example, item.text, true) ?? undefined,
+		chineseContext: maskTarget(item.example_cn, item.text) ?? undefined };
 }
 
 export function forwardCueSuffix(cue: ForwardCue): string {
-	return cue.context
-		? `（以 ${cue.initial} 开头；例：${cue.context}）`
-		: `（以 ${cue.initial} 开头）`;
+	return `（${[
+		cue.letterCount === 1 ? "" : `以 ${cue.initial} 开头`, cue.shape,
+		cue.context ? `例：${cue.context}` : "",
+		cue.chineseContext ? `语境：${cue.chineseContext}` : "",
+	].filter(Boolean).join("；")}）`;
 }
 
 export function questionHasForwardCue(questionText: string | null | undefined): boolean {
-	return /（以 [A-Za-z] 开头/.test(questionText ?? "");
+	return /（(?:以 [A-Za-z] 开头|1 个字母)/.test(questionText ?? "");
 }
 
 /** True when a reverse prompt carries the card's example sentence as sense context. */
