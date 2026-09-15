@@ -38,6 +38,101 @@ function completionTimeoutError(): Error {
 	return new Error("SDK_LLM_TIMEOUT");
 }
 
+type SdkStream = Awaited<ReturnType<AgentSession["agent"]["streamFunction"]>>;
+type SdkAssistantMessage = Awaited<ReturnType<SdkStream["result"]>>;
+
+const HTML_ERROR_DOCUMENT = /<(?:!doctype\s+html|html|head|body)(?:\s|>)/i;
+const TERMINAL_PROVIDER_LIMIT_CODE = /\b(?:GoUsageLimitError|FreeUsageLimitError|insufficient_quota|usage_limit_reached|usage_not_included)\b/i;
+const TERMINAL_PROVIDER_LIMIT = /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|usage_limit_reached|usage_not_included|usage limit/i;
+
+/** Keep HTTP identity before the SDK reduces provider failures to plain text.
+ * Only failure messages are inspected: successful HTML output is untouched. */
+function providerFailure(message: string, status?: number): { message: string; code?: string } {
+	const httpStatus = status != null && Number.isInteger(status) && status >= 400 && status <= 599 ? status : undefined;
+	const html = HTML_ERROR_DOCUMENT.test(message);
+	// Quota failures need their own persisted code: callers display error.code
+	// instead of the full message, and HTTP 429 alone would imply throttling.
+	// Error pages often contain navigation links mentioning billing or usage
+	// limits. Only explicit provider limit codes are conclusive within HTML.
+	if ((html ? TERMINAL_PROVIDER_LIMIT_CODE : TERMINAL_PROVIDER_LIMIT).test(message)) {
+		// AgentSession classifies text rather than error.code. Its explicit
+		// terminal marker must win even if a reset time contains 500 or 429.
+		return { code: "SDK_LLM_INSUFFICIENT_QUOTA", message: "quota exceeded（模型服务额度不足）" + (html ? "" : `：${message}`) };
+	}
+	if (!httpStatus && !html) return { message };
+	const code = httpStatus ? `SDK_LLM_HTTP_${httpStatus}` : "SDK_LLM_INVALID_RESPONSE";
+	const prefix = httpStatus ? `HTTP ${httpStatus}: ` : "";
+	if (httpStatus === 408) return { code, message: prefix + "request timeout（模型服务请求超时）。" };
+	// The session's retry matcher scans strings. A terminal HTTP response must
+	// not become retryable because its body happens to mention 500 or timeout.
+	if (httpStatus && httpStatus < 500 && httpStatus !== 429) {
+		return { code, message: prefix + (httpStatus === 401 || httpStatus === 403
+			? "模型服务身份验证或访问权限未通过。"
+			: "模型服务拒绝了请求，请检查模型与请求设置。") };
+	}
+	if (html) {
+		const summary = httpStatus === 401 || httpStatus === 403
+			? "模型服务身份验证或访问权限未通过。"
+			: httpStatus === 429 ? "模型服务请求过于频繁。"
+				: "模型服务返回异常网页，未收到有效回答。";
+		return { code, message: prefix + summary };
+	}
+	return { code, message: prefix + message };
+}
+
+function sdkFailure(message: string, code?: string): Error {
+	const error = new Error(message);
+	if (code) (error as Error & { code?: string }).code = code;
+	return error;
+}
+
+/** Adapt one isolated session, never the shared runtime or global fetch.
+ * The existing AgentSession retry policy sees sanitized terminal events and
+ * remains the only retry owner. HTTP status is fresh for every stream attempt. */
+function normalizeSessionFailures(session: AgentSession): () => string | undefined {
+	const streamFunction = session.agent.streamFunction;
+	let terminalCode: string | undefined;
+	session.agent.streamFunction = async (model, context, options) => {
+		let status: number | undefined;
+		terminalCode = undefined;
+		const normalize = (message: SdkAssistantMessage): SdkAssistantMessage => {
+			if (message.stopReason !== "error") return message;
+			const failure = providerFailure(message.errorMessage || "provider error", status);
+			terminalCode = failure.code;
+			return { ...message, errorMessage: failure.message };
+		};
+		let stream: SdkStream;
+		try {
+			stream = await streamFunction(model, context, {
+				...options,
+				onResponse: async (response, responseModel) => {
+					status = response.status;
+					await options?.onResponse?.(response, responseModel);
+				},
+			});
+		} catch (error) {
+			const failure = providerFailure((error as Error)?.message || String(error), status);
+			terminalCode = failure.code;
+			throw sdkFailure(failure.message, failure.code);
+		}
+		// Preserve the SDK's stream implementation and its private fields. Both
+		// consumption APIs must return the same normalized terminal message.
+		return new Proxy(stream, {
+			get(target, property) {
+				if (property === Symbol.asyncIterator) return async function* () {
+					for await (const event of target) {
+						yield event.type === "error" ? { ...event, error: normalize(event.error) } : event;
+					}
+				};
+				if (property === "result") return async () => normalize(await target.result());
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+	};
+	return () => terminalCode;
+}
+
 async function abortWithinDeadline(session: AgentSession, timeoutMs: number): Promise<void> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -166,11 +261,12 @@ export class PiSdkLlmClient {
 			session.dispose();
 			throw clientClosedError();
 		}
+		const terminalErrorCode = normalizeSessionFailures(session);
 		this.activeSessions.add(session);
 		try {
 			await this.waitFor(session.prompt(request.prompt, { expandPromptTemplates: false }), deadline);
 			const error = session.agent.state.errorMessage;
-			if (error) throw new Error(error);
+			if (error) throw sdkFailure(error, terminalErrorCode());
 			let last: { content?: Array<{ type?: string; text?: string }>; stopReason?: string; errorMessage?: string } | undefined;
 			for (let index = session.messages.length - 1; index >= 0; index--) {
 				const message = session.messages[index];
@@ -180,7 +276,7 @@ export class PiSdkLlmClient {
 				}
 			}
 			if (!last) throw new Error("EMPTY_RESPONSE");
-			if (last.stopReason === "error") throw new Error(last.errorMessage || "provider error");
+			if (last.stopReason === "error") throw sdkFailure(last.errorMessage || "provider error", terminalErrorCode());
 			const textParts: string[] = [];
 			for (const part of last.content ?? []) {
 				if (part.type === "text" && typeof part.text === "string") textParts.push(part.text);

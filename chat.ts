@@ -2,13 +2,14 @@ import type { DatabaseSync } from "node:sqlite";
 import { contentFingerprint, ensureLexicalSense, type ItemRow } from "./db.ts";
 import type { GeneratedItem } from "./llm.ts";
 
-export interface ChatRequest { requestId: string; message: string; itemId: number | null; history: { role: "user" | "assistant"; content: string }[] }
+export interface ChatRequest { requestId: string; message: string; itemId: number | null; history: { role: "user" | "assistant"; content: string }[]; readOnly?: boolean }
 export interface ChatResult { requestId: string; success: boolean; reply: string; action: "none" | "edited" | "added"; itemId: number | null }
 export function parseChatRequest(raw: string): ChatRequest {
  if (raw.length > 500000) throw new Error("问答请求过长");
  const r = JSON.parse(raw);
  if (!r || typeof r.requestId !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(r.requestId) || typeof r.message !== "string" || !r.message.trim() || r.message.length > 4000 || !(r.itemId === null || Number.isSafeInteger(r.itemId) && r.itemId > 0) || !Array.isArray(r.history) || r.history.length > 12 || r.history.some((m: any) => !m || !["user", "assistant"].includes(m.role) || typeof m.content !== "string" || m.content.length > 6000) || r.history.reduce((n: number, m: any) => n + m.content.length, r.message.length) > 60000) throw new Error("问答参数无效或超过长度限制");
- return { requestId: r.requestId, message: r.message.trim(), itemId: r.itemId, history: r.history.map((m: any) => ({ role: m.role, content: m.content })) };
+ if (r.readOnly !== undefined && typeof r.readOnly !== "boolean") throw new Error("只读讲解参数无效");
+ return { requestId: r.requestId, message: r.message.trim(), itemId: r.itemId, history: r.history.map((m: any) => ({ role: m.role, content: m.content })), ...(r.readOnly !== undefined ? { readOnly: r.readOnly } : {}) };
 }
 export function allowedChatAction(message: string): "none" | "edit" | "add" {
  // Leading discussion/negation is not authorization. Quoted replacement text and
@@ -71,14 +72,15 @@ export async function runChat(request: ChatRequest, deps: ChatDependencies): Pro
   const card = request.itemId === null ? null : deps.db.prepare("SELECT * FROM items WHERE id=?").get(request.itemId) as unknown as ItemRow | undefined;
   if (request.itemId !== null && !card) throw new Error("找不到这张卡片");
   const attempt = card ? deps.db.prepare("SELECT answer_text, verdict, feedback_json, assistance_level FROM attempts WHERE item_id=? ORDER BY started_at DESC LIMIT 1").get(card.id) : null;
-  const allowedAction = allowedChatAction(request.message);
+  const allowedAction = request.readOnly ? "none" : allowedChatAction(request.message);
   if (card && allowedAction !== "add" && deps.db.prepare("SELECT 1 FROM attempts WHERE item_id=? AND status='evaluating'").get(card.id)) throw new Error("此卡正在判题，请稍后再提问或修改");
-  if (card && allowedAction !== "add") { markChatAssistance(deps.db, card.id); deps.refresh(); }
+  if (card && allowedAction !== "add" && !request.readOnly) { markChatAssistance(deps.db, card.id); deps.refresh(); }
   const raw = await deps.complete(JSON.stringify({ message: request.message, history: request.history, card: card ? { id: card.id, type: card.type, text: card.text, meaning: card.meaning, phonetic: card.phonetic, example: card.example, example_cn: card.example_cn } : null, attempt, allowedAction }));
   if (!deps.valid()) throw new Error("会话已失效，请重新发送");
   const decision = JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
   if (typeof decision.reply !== "string" || !decision.reply.trim() || decision.reply.length > 12000 || !["none", "edit", "add"].includes(decision.action?.kind)) throw new Error("助教回复格式无效，请重试");
   if (decision.action.kind === "none") return { ...base, success: true, reply: decision.reply };
+  if (request.readOnly) throw new Error("此入口只提供词义讲解，未修改卡片或学习记录");
   if (decision.action.kind !== allowedAction) throw new Error("请在最新消息中明确提出修卡或加卡要求");
   if (allowedAction === "add") {
    const result = await deps.add(request.message);

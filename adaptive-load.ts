@@ -129,11 +129,11 @@ export function deriveAdaptiveDailyLoad(
 	};
 }
 
-function adaptiveStartKey(db: DatabaseSync, now: Date): string {
+function adaptiveStartKey(db: DatabaseSync, now: Date, persist = true): string {
 	const stored = getStat(db, START_STAT);
 	if (stored && /^\d{4}-\d{2}-\d{2}$/.test(stored)) return stored;
 	const today = localDateKey(now);
-	setStat(db, START_STAT, today);
+	if (persist) setStat(db, START_STAT, today);
 	return today;
 }
 
@@ -162,7 +162,7 @@ function persistDailyLoadPlan(db: DatabaseSync, now: Date, plan: DailyLoadPlan):
 }
 
 /** Current effective quota. Configured dailyNewLimit is the adaptive ceiling. */
-export function dailyLoadPlan(db: DatabaseSync, now: Date, config: PetConfig): DailyLoadPlan {
+export function dailyLoadPlan(db: DatabaseSync, now: Date, config: PetConfig, persist = true): DailyLoadPlan {
 	if (!config.adaptiveNewCards || config.dailyNewLimit === 0) {
 		const targets = targetsFor(config.dailyNewLimit);
 		const fixed = {
@@ -174,11 +174,11 @@ export function dailyLoadPlan(db: DatabaseSync, now: Date, config: PetConfig): D
 			dueReviews: 0,
 			reason: config.dailyNewLimit === 0 ? "固定为不限量" : "固定额度",
 		};
-		return persistDailyLoadPlan(db, now, fixed);
+		return persist ? persistDailyLoadPlan(db, now, fixed) : fixed;
 	}
 
 	const profile = computeLearnerProfile(db, now);
-	const start = adaptiveStartKey(db, now);
+	const start = adaptiveStartKey(db, now, persist);
 	const adaptive = deriveAdaptiveDailyLoad({
 		dayIndex: localDayIndex(start, now),
 		dueReviews: countDueReviewsToday(db, now),
@@ -186,7 +186,7 @@ export function dailyLoadPlan(db: DatabaseSync, now: Date, config: PetConfig): D
 		recallRate: profile.recallForward.rate,
 		assistanceRate: profile.assistance.rate,
 	}, config.dailyNewLimit);
-	return persistDailyLoadPlan(db, now, adaptive);
+	return persist ? persistDailyLoadPlan(db, now, adaptive) : adaptive;
 }
 
 export function hasNewCardCapacity(plan: DailyLoadPlan, introducedToday: number): boolean {

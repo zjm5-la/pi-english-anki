@@ -19,6 +19,46 @@ test("request contract rejects oversized or malformed inputs", () => {
  assert.equal(parseChatRequest(JSON.stringify(request)).requestId, request.requestId);
  for (const change of [{ message: "x".repeat(4001) }, { history: Array(13).fill({ role: "user", content: "a" }) }, { requestId: "bad/id" }, { itemId: -1 }, { history: [{ role: "system", content: "hi" }] }]) assert.throws(() => parseChatRequest(JSON.stringify({ ...request, ...change })));
 });
+test("read-only flag is explicit, boolean, and preserved by the command parser", () => {
+ const { request } = fixture();
+ assert.equal(parseChatRequest(JSON.stringify(request)).readOnly, undefined);
+ assert.equal(parseChatRequest(JSON.stringify({ ...request, readOnly: true })).readOnly, true);
+ for (const readOnly of ["true", 1, null, {}]) assert.throws(() => parseChatRequest(JSON.stringify({ ...request, readOnly })));
+});
+test("post-answer explanation keeps original word context and performs zero database writes", async () => {
+ const { id, request, deps } = fixture();
+ const next = fixture().id;
+ for (const currentId of [next, id]) {
+  db.prepare("UPDATE runtime_state SET active_item_id=?,active_assistance_level='none' WHERE id=1").run(currentId);
+  const before = db.prepare("SELECT total_changes() AS n").get()!.n;
+  const runtime = db.prepare("SELECT * FROM runtime_state WHERE id=1").get();
+  deps.refresh = () => { throw new Error("read-only explanation must not refresh mutable session state"); };
+  deps.complete = async prompt => {
+   const payload = JSON.parse(prompt);
+   assert.equal(payload.card.id, id);
+   assert.equal(payload.allowedAction, "none");
+   return JSON.stringify({ reply: "这是刚才那个词的解释。", action: { kind: "none" } });
+  };
+  const result = await runChat({ ...request, message: "请解释刚答完的词", readOnly: true }, deps);
+  assert.equal(result.success, true); assert.equal(result.itemId, id);
+  assert.deepEqual(db.prepare("SELECT * FROM runtime_state WHERE id=1").get(), runtime);
+  assert.equal(db.prepare("SELECT total_changes() AS n").get()!.n, before);
+ }
+});
+test("read-only entry rejects edit and add decisions even with imperative text", async () => {
+ const { request, deps } = fixture();
+ let writesRequested = 0;
+ deps.add = async () => { writesRequested++; return { success: true, reply: "added" }; };
+ deps.critique = async () => { writesRequested++; return true; };
+ for (const kind of ["edit", "add"]) {
+  const before = db.prepare("SELECT total_changes() AS n").get()!.n;
+  deps.complete = async () => JSON.stringify({ reply: "修改好了", action: { kind, fields: { meaning: "借出（动词）" } } });
+  const result = await runChat({ ...request, message: kind === "edit" ? "请修改这张卡" : "请添加一张卡", readOnly: true }, deps);
+  assert.equal(result.success, false); assert.equal(result.action, "none"); assert.match(result.reply, /只提供词义讲解/);
+  assert.equal(db.prepare("SELECT total_changes() AS n").get()!.n, before);
+ }
+ assert.equal(writesRequested, 0);
+});
 test("latest message alone gates actions; negation and questions do not authorize", () => {
  assert.equal(allowedChatAction("请修卡，补上词性"), "edit");
  assert.equal(allowedChatAction("请加 5 张卡"), "add");

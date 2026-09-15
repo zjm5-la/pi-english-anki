@@ -775,7 +775,7 @@ test("generateLesson prompt carries the recent attempt log and the minimal-meani
 	await generateLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "a real conversation with english", [], FAKE_CONFIG, undefined, adaptive, recentLog);
 	assert.match(captured, /最近出题与作答记录/);
 	assert.match(captured, /写出单词「reload」的中文释义/);
-	assert.match(captured, /最小中文释义/);
+	assert.match(captured, /能排除常见近义词的最小语境或搭配/);
 });
 
 test("generateReplacement prompt carries the recent attempt log and the minimal-meaning rule", async () => {
@@ -788,7 +788,7 @@ test("generateReplacement prompt carries the recent attempt log and the minimal-
 	const skipped = { type: "word", text: "reload", meaning: "重新加载" } as unknown as import("../db.ts").ItemRow;
 	await generateReplacement(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "conversation", [], FAKE_CONFIG, skipped, adaptive, "- [英→中回忆] 题:x | 答:y | 判:对");
 	assert.match(captured, /最近出题与作答记录/);
-	assert.match(captured, /最小中文释义/);
+	assert.match(captured, /能排除常见近义词的最小语境或搭配/);
 });
 
 test("critic prompt includes the minimal-meaning blocker rule", async () => {
@@ -799,10 +799,10 @@ test("critic prompt includes the minimal-meaning blocker rule", async () => {
 	} as unknown as PiSdkLlmClient;
 	const adaptive: AdaptiveContext = { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	// A word item skips the sentence-only deterministic gate and reaches the LLM call.
-	const word: GeneratedItem = { type: "word", text: "reload", meaning: "重新加载（动词）", example: "Reload the extension.", example_cn: "重新加载扩展。" };
+	const word: GeneratedItem = { type: "word", text: "reload", meaning: "重新加载（动词，把最新内容再载入一次）", example: "Reload the extension.", example_cn: "重新加载扩展。" };
 	const verdict = await critiqueLesson(llm, FAKE_CTX, { provider: "p", model: "m", fromSession: false }, { topic: "t", items: [word] }, [], FAKE_CONFIG, adaptive);
 	assert.equal(verdict.pass, true);
-	assert.match(captured, /最小释义/);
+	assert.match(captured, /能排除常见近义词/);
 });
 
 test("answer-evaluation rubric accepts synonyms for an underdetermined bare forward prompt", async () => {

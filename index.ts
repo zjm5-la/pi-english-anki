@@ -15,10 +15,16 @@ import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, 
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
-import { FACES, TYPE_LABELS, formatStatusLine, forwardCue, forwardCueSuffix, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type ForwardCue, type SentenceExerciseView } from "./render.ts";
+import { FACES, TYPE_LABELS, formatStatusLine, forwardCue, forwardCueSuffix, meaningHasForwardSenseClue, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type ForwardCue, type SentenceExerciseView } from "./render.ts";
 import { ensureSentenceCycle, ensureSentenceExercise, insertEvaluatedAttempt } from "./sentence-cycle.ts";
 import { dbFilePath, isSyncEnabled, peekRemoteNewer, pullIfNewer, pushSnapshot } from "./sync.ts";
 import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfileStatsLine, recentAttemptLog, smoothBudget, type AdaptiveContext } from "./learner-profile.ts";
+
+import { interruptOrphanedTeachRequests, parseTeachRequest, readTeachReceipt, writeTeachReceipt, type TeachPhase, type TeachRequest } from "./teach-request.ts";
+
+import { autoRefillPlan, autoRefillStrategy, writeAutoRefillStatus, type AutoRefillStrategy } from "./auto-refill.ts";
+import { buildNextCardForecast, writeNextCardForecast } from "./next-card-forecast.ts";
+import { beginStudyUndo, finishStudyUndo, beginUndoContinuation, finishUndoContinuation, withUndoContinuation, continueStudyUndoAction, initializeStudyUndo, invalidateStudyUndo, refreshStudyUndo, readStudyUndo, bindUndoReplacement, wasStudyUndone, undoStudyAction } from "./study-undo.ts";
 
 export { contentFingerprint };
 
@@ -40,8 +46,6 @@ const GENERATION_LEASE_MS = 5 * 60_000;
 const SYNC_POLL_MS = 1000;
 /** Grace window a session has to own an in-flight replacement generation. */
 const REPLACEMENT_GRACE_MS = 8000;
-/** Keep corrective feedback readable before automatically surfacing the next card. */
-const AGAIN_FEEDBACK_GRACE_MS = 15_000;
 const ANSWER_THINKING_INTERVAL_MS = 120;
 const ANSWER_THINKING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -76,16 +80,24 @@ export default function piEnglishAnkiExtension(
 	let pendingLLMCall = false;
 	let pendingLLMCallAt = 0;
 	let lastRejectedConversation = "";
-	let manualTeachTopic = "";
+	let manualTeachRequest: TeachRequest | undefined;
 	/** Manual /anki:teach topics waiting for the in-flight generation (in-process FIFO). */
-	const teachQueue: string[] = [];
+	const teachQueue: TeachRequest[] = [];
+	const pendingTeachRequests = new Map<string, TeachRequest>();
+	let manualWork: { request: TeachRequest; token: string; startedAt: number } | undefined;
+	const MANUAL_TEACH_DEADLINE_MS = 25 * 60_000;
 	let lastRejectedReplacementKey = "";
 	let replacementRetryAt = 0;
 	let replacementTimer: ReturnType<typeof setTimeout> | undefined;
 	const REPLACEMENT_RETRY_MS = 30_000;
 	let replacementRunning = false;
+	let autoRefillTimer: ReturnType<typeof setTimeout> | undefined;
+	let autoRefillRunning = false;
+	let autoRefillRetryAt = 0;
 	let sessionGeneration = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let workCheckAt: string | null = null;
+	let replacementCheckAt: string | null = null;
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
 	let answerThinkingTimer: ReturnType<typeof setInterval> | undefined;
 	/** Raw lines of the latest real widget render; the judging animation overlays these. */
@@ -100,6 +112,7 @@ export default function piEnglishAnkiExtension(
 	/** My `sessionId::instanceToken` coordinator identity. */
 	let myId = "";
 	let lastCoordinatorRenewal = 0;
+	let lastClientHeartbeat = 0;
 	/** Last active_version we rendered locally (to detect cross-session card changes). */
 	let localVersion = -1;
 	/** Cached `PRAGMA data_version` to avoid redundant SQLite reads. */
@@ -122,6 +135,57 @@ export default function piEnglishAnkiExtension(
 		}
 	}
 
+	/** The owner alone publishes real timer promises; expired owners publish no countdown. */
+	function publishForecast(allowTimers = true) {
+		if (!db || !myId || db.isTransaction) return;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const now = new Date();
+			const state = getRuntimeState(db);
+			const liveOwner = Boolean(state.coordinator && state.coordinator_until && Date.parse(state.coordinator_until) > now.getTime());
+			if (liveOwner && state.coordinator !== myId) { db.exec("ROLLBACK"); return; }
+			const ownTimers = allowTimers && liveOwner && state.coordinator === myId;
+			// After an owner expires, followers may only remove stale promises.
+			// Their differing local settings must not compete to describe the deck.
+			writeNextCardForecast(db, !liveOwner ? {
+				version: 1, status: state.active_item_id == null ? "waiting_check" : "current_card",
+				activeItemId: state.active_item_id, hasReadyAfterCurrent: false, source: null,
+				availableAt: null, scheduledAt: null, checkAt: null, updatedAt: now.toISOString(),
+			} : buildNextCardForecast(db, config, {
+				workCheckAt: ownTimers ? workCheckAt : null,
+				replacementCheckAt: ownTimers ? replacementCheckAt : null,
+				localGenerationBusy: ownTimers && pendingLLMCall,
+			}, now));
+			db.exec("COMMIT");
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[pi-english-anki] Forecast update failed: ${err}`);
+		}
+	}
+
+	function teachProgress(request: TeachRequest | undefined, phase: TeachPhase, errorCode?: string, itemIds?: number[]) {
+		if (!db || !request?.requestId) return;
+		writeTeachReceipt(db, { requestId: request.requestId, topic: request.topic, phase,
+			itemsAdded: itemIds?.length ?? 0, ...(itemIds ? { itemIds } : {}), ...(errorCode ? { errorCode } : {}),
+			updatedAt: new Date().toISOString(), ownerId: myId });
+		if (phase === "succeeded" || phase === "failed") pendingTeachRequests.delete(request.requestId);
+	}
+
+	function ownsTeachRequest(request: TeachRequest): boolean {
+		if (!request.requestId) return true;
+		if (!db) return false;
+		const receipt = readTeachReceipt(db, request.requestId);
+		return receipt?.ownerId === myId && receipt.phase !== "succeeded" && receipt.phase !== "failed";
+	}
+
+	function interruptManualRequests() {
+		for (const request of pendingTeachRequests.values()) teachProgress(request, "failed", "REQUEST_INTERRUPTED");
+		pendingTeachRequests.clear();
+		teachQueue.length = 0;
+		manualTeachRequest = undefined;
+		manualWork = undefined;
+	}
+
 	function resetState() {
 		lastError = "";
 		pendingLLMCall = false;
@@ -130,6 +194,8 @@ export default function piEnglishAnkiExtension(
 		lastRejectedReplacementKey = "";
 		replacementRetryAt = 0;
 		replacementRunning = false;
+		autoRefillRunning = false;
+		autoRefillRetryAt = 0;
 		resolvedModelName = "";
 	}
 
@@ -143,6 +209,9 @@ export default function piEnglishAnkiExtension(
 
 	/** Clear a locally stuck call after the global generation lease has had time to expire. */
 	function resetHungLlmCall(): boolean {
+		// A manual pipeline includes generation, review, and revisions. Its own
+		// deadline/lease renewal applies; the automatic 180s reset must not race it.
+		if (manualWork) return false;
 		if (!pendingLLMCall || Date.now() - pendingLLMCallAt < 180_000) return false;
 		pendingLLMCall = false;
 		pendingLLMCallAt = 0;
@@ -152,21 +221,29 @@ export default function piEnglishAnkiExtension(
 
 	/** Start the next queued manual teach once no generation is in flight. */
 	function drainTeachQueue() {
-		if (teachQueue.length === 0 || pendingLLMCall) return;
+		if (teachQueue.length === 0 || pendingLLMCall || !db) return;
 		const ctx = latestCtx;
 		if (!ctx || isCtxStale(ctx)) return;
-		const topic = teachQueue.shift();
-		if (topic == null) return;
-		manualTeachTopic = topic;
-		ctx.ui.notify(`开始执行排队的备课：「${topic}」`, "info");
+		const state = getRuntimeState(db);
+		if (state.generation_token && state.generation_until && Date.now() < Date.parse(state.generation_until)) return;
+		const request = teachQueue.shift();
+		if (!request) return;
+		if (!ownsTeachRequest(request)) {
+			if (request.requestId) pendingTeachRequests.delete(request.requestId);
+			drainTeachQueue();
+			return;
+		}
+		manualTeachRequest = request;
+		if (!request.requestId) ctx.ui.notify(`开始执行排队的备课：「${request.topic}」`, "info");
 		void generateAndInsert(ctx, new Date())
-			.catch((err) => console.error(`[pi-english-anki] queued teach failed: ${err}`))
+			.catch((err) => { teachProgress(request, "failed", "TEACH_GENERATION_FAILED"); console.error(`[pi-english-anki] queued teach failed: ${err}`); })
 			.finally(() => scheduleTimer());
 	}
 
 	function stopTimer() {
 		if (timer) clearTimeout(timer);
 		timer = undefined;
+		workCheckAt = null;
 	}
 
 	function stopAnswerThinking() {
@@ -216,14 +293,19 @@ export default function piEnglishAnkiExtension(
 	function stopReplacementTimer() {
 		if (replacementTimer) clearTimeout(replacementTimer);
 		replacementTimer = undefined;
+		replacementCheckAt = null;
 	}
 
 	/** Refill stored inventory independently of the currently displayed card. */
 	function scheduleReplacementWork() {
 		if (replacementTimer || replacementRunning || !db || !latestCtx || pendingReplacementTypes(db).length === 0) return;
 		const generation = sessionGeneration;
+		const delay = Math.max(0, replacementRetryAt - Date.now());
+		replacementCheckAt = new Date(Date.now() + delay).toISOString();
 		replacementTimer = setTimeout(() => {
 			replacementTimer = undefined;
+			replacementCheckAt = null;
+			publishForecast();
 			const ctx = latestCtx;
 			if (generation !== sessionGeneration || !db || !ctx || isCtxStale(ctx)) return;
 			if (Date.now() < replacementRetryAt) { scheduleReplacementWork(); return; }
@@ -245,24 +327,79 @@ export default function piEnglishAnkiExtension(
 				replacementRunning = false;
 				scheduleReplacementWork();
 			});
-		}, Math.max(0, replacementRetryAt - Date.now()));
+		}, delay);
 		(replacementTimer as unknown as { kaomojiReplacement?: boolean }).kaomojiReplacement = true;
 		replacementTimer.unref?.();
+		publishForecast();
+	}
+
+	function stopAutoRefillTimer() {
+		if (autoRefillTimer) clearTimeout(autoRefillTimer);
+		autoRefillTimer = undefined;
+	}
+
+	/** Desktop study prepares today’s remaining cards; ordinary RPC keeps a small reserve. */
+	function scheduleAutoRefillWork() {
+		if (!db || latestCtx?.mode !== "rpc" || !ensureCoordinator(new Date())) return;
+		const strategy = autoRefillStrategy(latestCtx.mode);
+		const plan = autoRefillPlan(db, config, new Date(), strategy);
+		const state = getRuntimeState(db);
+		if (autoRefillRunning) {
+			writeAutoRefillStatus(db, { ...plan.status, phase: "generating", reason: "后台准备新卡，可继续复习" });
+			return;
+		}
+		if (!plan.shouldRefill) { stopAutoRefillTimer(); writeAutoRefillStatus(db, plan.status); return; }
+		if (autoRefillRetryAt > Date.now()) {
+			writeAutoRefillStatus(db, { ...plan.status, phase: "retry_wait", retryAt: new Date(autoRefillRetryAt).toISOString(), reason: "补卡暂未成功，稍后自动重试" });
+			return;
+		}
+		const busy = pendingLLMCall || answerJudging || teachQueue.length > 0 || pendingReplacementTypes(db).length > 0 ||
+			Boolean(state.generation_token && Date.parse(state.generation_until ?? "") > Date.now());
+		writeAutoRefillStatus(db, { ...plan.status, reason: busy ? "等待当前任务结束后自动补卡" : plan.status.reason });
+		if (busy || autoRefillTimer) return;
+		const generation = sessionGeneration;
+		autoRefillTimer = setTimeout(() => {
+			autoRefillTimer = undefined;
+			const ctx = latestCtx;
+			if (generation !== sessionGeneration || !db || !ctx || isCtxStale(ctx)) return;
+			const fresh = autoRefillPlan(db, config, new Date(), strategy);
+			const runtime = getRuntimeState(db);
+			if (!fresh.shouldRefill || pendingLLMCall || answerJudging || teachQueue.length > 0 || pendingReplacementTypes(db).length > 0 ||
+				Boolean(runtime.generation_token && Date.parse(runtime.generation_until ?? "") > Date.now())) return;
+			autoRefillRunning = true;
+			writeAutoRefillStatus(db, { ...fresh.status, phase: "generating", reason: "后台准备新卡，可继续复习" });
+			void generateAndInsert(ctx, new Date(), fresh.batch, true, strategy).then((added) => {
+				if (generation === sessionGeneration) autoRefillRetryAt = added ? 0 : Date.now() + 30_000;
+			}, (err) => {
+				if (generation === sessionGeneration) autoRefillRetryAt = Date.now() + 30_000;
+				console.error(`[pi-english-anki] Background inventory failed: ${err}`);
+			}).finally(() => {
+				if (generation !== sessionGeneration) return;
+				autoRefillRunning = false;
+				scheduleAutoRefillWork();
+			});
+		}, 0);
+		(autoRefillTimer as unknown as { kaomojiAutoRefill?: boolean }).kaomojiAutoRefill = true;
+		autoRefillTimer.unref?.();
 	}
 
 	function scheduleTimer(delay = intervalMs()) {
 		stopTimer();
-		if (!latestCtx || config.intervalMinutes <= 0 || db == null || activeItem(db) != null) return;
+		if (!latestCtx || config.intervalMinutes <= 0 || db == null || activeItem(db) != null) { publishForecast(); return; }
 		const state = getRuntimeState(db);
 		const pacingDelay = state.next_check_at
 			? new Date(state.next_check_at).getTime() - Date.now()
 			: 0;
 		const effectiveDelay = pacingDelay > 0 ? pacingDelay : delay;
+		workCheckAt = new Date(Date.now() + Math.max(0, effectiveDelay)).toISOString();
 		timer = setTimeout(() => {
 			timer = undefined;
+			workCheckAt = null;
+			publishForecast();
 			void runTimerTick().then(syncAfterTick, syncAfterTick);
 		}, Math.max(0, effectiveDelay));
 		timer.unref?.();
+		publishForecast();
 	}
 
 	async function runTimerTick() {
@@ -290,6 +427,7 @@ export default function piEnglishAnkiExtension(
 	/** Close the session-scoped SQLite connection before reload/switch/exit. */
 	function closeDb() {
 		stopPolling();
+		stopAutoRefillTimer();
 		const current = db;
 		db = null;
 		if (!current) return;
@@ -304,6 +442,7 @@ export default function piEnglishAnkiExtension(
 	function attachDb(ctx: ExtensionContext) {
 		resolveModel(ctx);
 		if (!db) return;
+		initializeStudyUndo(db);
 		ensureCoordinator(new Date(), true);
 		setStat(db, "pet_alive", new Date().toISOString());
 		setStat(db, "pet_config_model", `${config.provider}/${config.model}`);
@@ -316,6 +455,7 @@ export default function piEnglishAnkiExtension(
 		}
 		startPolling();
 		scheduleReplacementWork();
+		scheduleAutoRefillWork();
 	}
 
 	// -- Coordinator lease & cross-session sync ----------------------------
@@ -372,14 +512,15 @@ export default function piEnglishAnkiExtension(
 	/** Release only this runtime's ownership; never disturb a newer session. */
 	function releaseCoordinator() {
 		if (!db || !myId) return;
+		publishForecast(false);
 		db.prepare(
 			"UPDATE runtime_state SET coordinator = NULL, coordinator_until = NULL, generation_token = NULL, generation_until = NULL WHERE id = 1 AND coordinator = ?",
 		).run(myId);
 	}
 
 	/** Claim one generation token without holding a transaction across the LLM call. */
-	function claimGeneration(now = new Date()): string | null {
-		if (!ensureCoordinator(now)) return null;
+	function claimGeneration(now = new Date(), manual = false): string | null {
+		if (!db || !myId || (!manual && !ensureCoordinator(now))) return null;
 		const token = randomUUID();
 		try {
 			db!.exec("BEGIN IMMEDIATE");
@@ -388,15 +529,17 @@ export default function piEnglishAnkiExtension(
 				state.generation_token && state.generation_until &&
 				now.getTime() < new Date(state.generation_until).getTime()
 			);
-			if (!iAmCoordinator(state, now) || generationBusy) {
+			if ((!manual && !iAmCoordinator(state, now)) || generationBusy) {
 				db!.exec("ROLLBACK");
 				return null;
 			}
 			setRuntimeState(db!, {
+				...(manual ? { coordinator: myId, coordinator_until: new Date(now.getTime() + leaseMs()).toISOString(), last_activity: now.toISOString() } : {}),
 				generation_token: token,
 				generation_until: new Date(now.getTime() + GENERATION_LEASE_MS).toISOString(),
 			});
 			db!.exec("COMMIT");
+			if (manual) lastCoordinatorRenewal = now.getTime();
 			return token;
 		} catch (err) {
 			try { db!.exec("ROLLBACK"); } catch { /* no transaction */ }
@@ -469,7 +612,7 @@ export default function piEnglishAnkiExtension(
 		if (!db) return false;
 		let state = getRuntimeState(db);
 		const item = activeItem(db);
-		if (item?.type === "sentence") state = ensureSentenceCycle(db, item, state);
+		if (item?.type === "sentence") state = withUndoContinuation(db, () => ensureSentenceCycle(db!, item!, state));
 		const changed = state.active_version !== localVersion;
 		if (item && state.active_kind) {
 			const isReview = effectiveIsReview(item, state);
@@ -530,14 +673,31 @@ export default function piEnglishAnkiExtension(
 						scheduleTimer(0);
 					}
 				}
+				if (Date.now() - lastClientHeartbeat >= COORDINATOR_HEARTBEAT_MS) {
+					touchClient(db, myId);
+					lastClientHeartbeat = Date.now();
+					interruptOrphanedTeachRequests(db);
+				}
 				const state = getRuntimeState(db);
+				if (manualWork && state.generation_token === manualWork.token && state.coordinator === myId) {
+					if (Date.now() - manualWork.startedAt >= MANUAL_TEACH_DEADLINE_MS) {
+						teachProgress(manualWork.request, "failed", "TEACH_TIMEOUT");
+						releaseGeneration(manualWork.token);
+					} else if (Date.parse(state.generation_until ?? "") - Date.now() < GENERATION_LEASE_MS - 60_000) {
+						setRuntimeState(db, { generation_until: new Date(Date.now() + GENERATION_LEASE_MS).toISOString() });
+					}
+				}
+				drainTeachQueue();
 				scheduleReplacementWork();
+				scheduleAutoRefillWork();
 				const generationExpired = Boolean(
 					pendingLLMCall && (!state.generation_until || Date.now() >= new Date(state.generation_until).getTime())
 				);
 				if (!generationExpired && state.coordinator === myId && Date.now() - lastCoordinatorRenewal >= COORDINATOR_HEARTBEAT_MS) {
 					ensureCoordinator(new Date());
 				}
+				publishForecast();
+				refreshStudyUndo(db);
 			} catch (err) {
 				console.error(`[pi-english-anki] Sync poll failed: ${err}`);
 			}
@@ -589,6 +749,7 @@ export default function piEnglishAnkiExtension(
 	}
 
 	function updateWidget(ctx: ExtensionContext, _face: string, lines: string[], judgingFrame = false) {
+		if (!judgingFrame) publishForecast();
 		// While the answer-judging animation is running it owns the widget: drop
 		// interleaved renders (sync-poll card paints, stray pet ticks) so the
 		// widget cannot alternate between the card and the spinner (flicker).
@@ -618,18 +779,17 @@ export default function piEnglishAnkiExtension(
 	}
 
 	/** Whether an already-stored review/new card can be claimed right now. */
-	function hasReadyQueuedCard(now: Date): boolean {
+	function hasReadyStoredCard(now: Date): boolean {
 		if (!db) return false;
 		const dueReview = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} LIMIT 1`)
 			.get(now.toISOString());
 		if (dueReview) return true;
-		if (pendingReplacementTypes(db).length > 0) return true;
 		// Replacement queued-new is always claimable (quota-free).
 		const replacementNew = db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 AND introduction_kind = 'replacement' ${SCHEDULABLE} LIMIT 1`)
 			.get(now.toISOString());
 		if (replacementNew) return true;
 		if (!hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now))) return false;
-		return Boolean(db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 ${SCHEDULABLE} LIMIT 1`).get(now.toISOString()));
+		return Boolean(db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) ${SCHEDULABLE} LIMIT 1`).get(now.toISOString()));
 	}
 
 	/** Atomically select, mark, and activate the next due card. */
@@ -642,6 +802,7 @@ export default function piEnglishAnkiExtension(
 				db.exec("ROLLBACK");
 				return undefined;
 			}
+			const undo = beginUndoContinuation(db);
 			// Review cards take priority over queued-new cards.
 			let due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 				.get(now.toISOString()) as ItemRow | undefined;
@@ -691,6 +852,7 @@ export default function piEnglishAnkiExtension(
 				...EMPTY_SENTENCE_CYCLE,
 				next_check_at: now.toISOString(),
 			});
+			finishUndoContinuation(db, undo);
 			db.exec("COMMIT");
 			return db.prepare("SELECT * FROM items WHERE id = ?").get(due.id) as unknown as ItemRow | undefined;
 		} catch (err) {
@@ -705,7 +867,7 @@ export default function piEnglishAnkiExtension(
 		if (!db) return false;
 		let state = getRuntimeState(db);
 		if (state.active_item_id !== item.id || !state.active_kind) return false;
-		if (item.type === "sentence") state = ensureSentenceCycle(db, item, state);
+		if (item.type === "sentence") state = withUndoContinuation(db, () => ensureSentenceCycle(db!, item, state));
 		const isReview = effectiveIsReview(item, state);
 		pendingItemId = item.id;
 		pendingFlipped = false;
@@ -730,16 +892,18 @@ export default function piEnglishAnkiExtension(
 		}
 	}
 
-	/** Add a target cue only when another word/phrase has the same meaning. */
+	/** Add a target cue when another word shares the meaning, or the meaning itself cannot uniquely identify the English. */
 	function activeForwardCue(item: ItemRow, direction: RecallDirection): ForwardCue | undefined {
 		if (!db || direction !== "forward" || (item.type !== "word" && item.type !== "phrase")) return undefined;
-		return meaningCollisions(db, item).length > 0 ? forwardCue(item) : undefined;
+		if (meaningCollisions(db, item).length > 0 || !meaningHasForwardSenseClue(item.meaning)) return forwardCue(item);
+		return undefined;
 	}
 
 	/** Toggle the pending card between its question and answer sides. */
 	function flipPending(ctx: ExtensionContext): boolean {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
+		invalidateStudyUndo(db);
 		let state = getRuntimeState(db);
 		if (state.active_item_id !== pendingItemId || state.active_version !== localVersion) {
 			renderGlobalCard(ctx);
@@ -874,6 +1038,7 @@ export default function piEnglishAnkiExtension(
 	async function answerPending(ctx: ExtensionContext, rawText: string): Promise<boolean> {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return false;
+		if (rawText.trim()) invalidateStudyUndo(db);
 		const state = getRuntimeState(db);
 		if (
 			state.active_item_id !== pendingItemId ||
@@ -943,7 +1108,7 @@ export default function piEnglishAnkiExtension(
 			verdict = result.verdict;
 			feedback = result.feedback;
 		}
-		const attempt: PendingAttempt = { ...attemptBase, verdict, feedback };
+		const attempt: PendingAttempt = { ...attemptBase, verdict, feedback, correctedAnswer: target };
 		// Auto-rate: correct -> Good, miss (partial/incorrect) -> Again.
 		const autoRating = verdict === "correct" ? Rating.Good : Rating.Again;
 		const recallNote = verdict === "correct"
@@ -1166,6 +1331,7 @@ export default function piEnglishAnkiExtension(
 					cur.active_exercise_id === attempt.exerciseId
 				))
 			) {
+				const undo = !attempt ? beginStudyUndo(db, item.id, rating === Rating.Again ? "again" : "good") : undefined;
 				if (item.type === "sentence" && rating === Rating.Again) {
 					db.prepare("UPDATE items SET progress = 0 WHERE id = ?").run(item.id);
 				}
@@ -1253,9 +1419,9 @@ export default function piEnglishAnkiExtension(
 				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
-				hasImmediateNext = hasReadyQueuedCard(now);
+				hasImmediateNext = hasReadyStoredCard(now);
 				const nextCheck = hasImmediateNext
-					? new Date(now.getTime() + (effective === Rating.Again ? AGAIN_FEEDBACK_GRACE_MS : 0)).toISOString()
+					? now.toISOString()
 					: new Date(now.getTime() + intervalMs()).toISOString();
 				setRuntimeState(db, {
 					active_item_id: null,
@@ -1268,6 +1434,7 @@ export default function piEnglishAnkiExtension(
 					coordinator_until: cur.coordinator_until,
 					last_activity: cur.last_activity,
 				});
+				if (undo) finishStudyUndo(db, undo);
 				applied = true;
 			}
 			db.exec("COMMIT");
@@ -1314,14 +1481,23 @@ export default function piEnglishAnkiExtension(
 			lines.push(statsLine(db));
 			updateWidget(ctx, FACES.error, lines);
 		}
-		// Anki-style queue: immediate only when another stored card is claimable.
-		if (hasImmediateNext) scheduleTimer(0);
-		else scheduleTimer();
+		// User-driven study advances stored inventory independently of automatic
+		// generation timers and replacement work. claimDueItem keeps due/quota rules.
+		const queued = hasImmediateNext ? claimDueItem(new Date()) : undefined;
+		if (queued) {
+			stopTimer();
+			showItem(ctx, queued);
+		} else if (hasImmediateNext && activeItem(db)) {
+			// Another runtime won the next-card claim after our rating committed.
+			renderGlobalCard(ctx);
+		} else {
+			scheduleTimer(hasImmediateNext ? 0 : intervalMs());
+		}
 		return true;
 	}
 
 	/** Atomically mark the pending card as well-known and enqueue its replacement. */
-	function skipPending(ctx: ExtensionContext): ItemRow | undefined {
+	function skipPending(ctx: ExtensionContext): { item: ItemRow; actionId: string } | undefined {
 		hydratePending(ctx);
 		if (pendingItemId == null || !db) return undefined;
 		const item = db.prepare("SELECT * FROM items WHERE id = ?").get(pendingItemId) as ItemRow | undefined;
@@ -1358,6 +1534,7 @@ export default function piEnglishAnkiExtension(
 			singleNext = { state: next.state, due: next.due < minDue ? minDue : next.due };
 		}
 		let applied = false;
+		let actionId = "";
 		try {
 			db.exec("BEGIN IMMEDIATE");
 			const cur = getRuntimeState(db);
@@ -1367,6 +1544,8 @@ export default function piEnglishAnkiExtension(
 				clearPendingLocals();
 				return undefined;
 			}
+			const undo = beginStudyUndo(db, item.id, "skip");
+			actionId = undo.record.actionId;
 			if (usesDirection) {
 				for (const d of perDirection) advanceReviewDirectional(db, item.id, d.direction, d.state, d.due, item.reviews + 1, now);
 				db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
@@ -1392,6 +1571,7 @@ export default function piEnglishAnkiExtension(
 				coordinator_until: new Date(now.getTime() + leaseMs()).toISOString(),
 				last_activity: now.toISOString(),
 			});
+			finishStudyUndo(db, undo);
 			applied = true;
 			db.exec("COMMIT");
 		} catch (err) {
@@ -1410,7 +1590,7 @@ export default function piEnglishAnkiExtension(
 				`${FACES.party} 好，${item.text} 记作很熟的内容，正在补充同类型卡片…`,
 				statsLine(db),
 			]);
-			return item;
+			return { item, actionId };
 		}
 		return undefined;
 	}
@@ -1460,6 +1640,7 @@ export default function piEnglishAnkiExtension(
 		}
 		const generationToken = claimGeneration();
 		if (!generationToken) { logGenStatus("replacement_no_gen_token"); return false; }
+		bindUndoReplacement(db, skipped.id, generationToken);
 
 		// One profile+budget snapshot per generation, after the generation claim and
 		// before any LLM await; the same snapshot feeds the generator, fallback,
@@ -1814,8 +1995,7 @@ export default function piEnglishAnkiExtension(
 			if (pendingLLMCall && !resetHungLlmCall()) return;
 			// Queued manual topics take priority over a fresh automatic lesson.
 			if (teachQueue.length > 0) {
-				manualTeachTopic = teachQueue.shift() ?? "";
-				await generateAndInsert(ctx, now);
+				drainTeachQueue();
 				return;
 			}
 			let batch = nextAdaptiveLessonBatch(db, now, plan);
@@ -1848,62 +2028,69 @@ export default function piEnglishAnkiExtension(
 		if (db) setRuntimeState(db, { next_check_at: new Date(Date.now() + Math.max(1, config.intervalMinutes) * 60_000).toISOString() });
 	}
 
-	async function generateAndInsert(ctx: ExtensionContext, _now: Date, batch?: LessonBatch) {
+	async function generateAndInsert(ctx: ExtensionContext, _now: Date, batch?: LessonBatch, background = false, strategy: AutoRefillStrategy = "reserve") {
 		const conversationSnapshot = buildConversation(ctx.sessionManager.getBranch());
 		// RPC sessions (the IELTS app) have no chat to mine for topics; fall back
 		// to the IELTS basic line so the adaptive daily plan still fills on ticks.
 		const emptyFallback = !conversationSnapshot.trim() && ctx.mode === "rpc"
 			? "雅思基础词汇（A1-A2，超级初学者）"
 			: "";
-		const conversation = manualTeachTopic || conversationSnapshot || emptyFallback;
-		const isManual = manualTeachTopic !== "";
+		const request = background ? undefined : manualTeachRequest;
+		const conversation = request?.topic || conversationSnapshot || emptyFallback;
+		const isManual = request != null;
+		if (isManual) batch = { wordItems: 5, clozeItems: 0 };
 		const usedFallback = !isManual && emptyFallback !== "";
-		manualTeachTopic = "";
-		const conversationUnchanged = () => buildConversation(ctx.sessionManager.getBranch()) === conversationSnapshot;
+		if (!background) manualTeachRequest = undefined;
+		const conversationUnchanged = () => isManual || buildConversation(ctx.sessionManager.getBranch()) === conversationSnapshot;
 		if (!conversation.trim()) {
-			if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
+			if (db && (!background || !activeItem(db))) updateWidget(ctx, FACES.idle, [statsLine(db)]);
 			logGenStatus("empty_conversation");
-			deferPacing();
+			if (!isManual && !background) deferPacing();
 			return;
 		}
 		if (!isManual && !usedFallback && conversation === lastRejectedConversation) {
-			if (db) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
+			if (db && (!background || !activeItem(db))) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
 			logGenStatus("cached_rejection");
-			deferPacing();
+			if (!isManual && !background) deferPacing();
 			return;
 		}
-		const generationToken = claimGeneration();
+		const generationToken = claimGeneration(new Date(), isManual);
 		if (!generationToken) {
 			// Another process holds the lease: keep the manual request queued
 			// instead of dropping it; the next tick or lease release retries it.
 			if (isManual) {
-				teachQueue.unshift(conversation);
-				if (!isCtxStale(ctx)) ctx.ui.notify(`已排队：另一轮生成仍在进行，结束后自动开始「${conversation}」`, "info");
+				teachQueue.unshift(request!);
+				teachProgress(request, "queued");
+				if (!request?.requestId && !isCtxStale(ctx)) ctx.ui.notify(`已排队：另一轮生成仍在进行，结束后自动开始「${conversation}」`, "info");
 			}
 			logGenStatus("no_gen_token");
 			return;
 		}
 
-		// One profile+budget snapshot per generation, after the generation claim and
-		// before any LLM await; the same snapshot feeds the initial generator,
-		// fallback, revisions, and critic so adaptive decisions stay consistent.
-		const adaptive: AdaptiveContext | null = db ? (() => {
-			const profile = computeLearnerProfile(db, new Date());
-			return { profile, budget: smoothBudget(db, deriveBudget(profile)) };
-		})() : null;
-		const recentLog = db ? formatAttemptLogBlock(recentAttemptLog(db)) : undefined;
 
 		const generation = sessionGeneration;
+		let saved = false;
+		let failureCode = "TEACH_CANCELLED";
+		if (request) manualWork = { request, token: generationToken, startedAt: Date.now() };
 		pendingLLMCall = true;
 		pendingLLMCallAt = Date.now();
-		if (db) updateWidget(ctx, FACES.teach, ["备课中，喵…"]);
 		try {
+			teachProgress(request, "generating");
+			if (db && !activeItem(db)) updateWidget(ctx, FACES.teach, ["备课中，喵…"]);
+			// One profile+budget snapshot per generation, after the generation claim and
+			// before any LLM await; the same snapshot feeds the initial generator,
+			// fallback, revisions, and critic so adaptive decisions stay consistent.
+			const adaptive: AdaptiveContext | null = db ? (() => {
+				const profile = computeLearnerProfile(db, new Date());
+				return { profile, budget: smoothBudget(db, deriveBudget(profile)) };
+			})() : null;
+			const recentLog = db ? formatAttemptLogBlock(recentAttemptLog(db)) : undefined;
 			let effectiveResolved = resolveModel(ctx);
 			if (!effectiveResolved) throw new Error("NO_MODEL");
 			logGenStatus(`model:${resolvedModelName}`);
 			let decision: LessonDecision;
 			try {
-				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch);
+				decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch, false, isManual);
 			} catch (err) {
 				if (sessionGeneration !== generation) return;
 				if (!effectiveResolved.fromSession && ctx.model &&
@@ -1913,7 +2100,7 @@ export default function piEnglishAnkiExtension(
 						model: ctx.model.id,
 						fromSession: true,
 					};
-					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch);
+					decision = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch, false, isManual);
 					if (sessionGeneration !== generation) return;
 					resolvedModelName = `${effectiveResolved.provider}/${effectiveResolved.model}（当前会话·降级）`;
 				} else {
@@ -1924,26 +2111,29 @@ export default function piEnglishAnkiExtension(
 			if (!ownsGeneration(getRuntimeState(db), generationToken)) return;
 			if (!decision.ready) {
 				lastRejectedConversation = conversation;
-				updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
+				if (!background || !activeItem(db)) updateWidget(ctx, FACES.idle, ["还在观察话题，等信息更完整些…", statsLine(db)]);
 				logGenStatus(`not_ready: ${decision.reason || ""}`);
-				deferPacing();
-				if (config.verbose && decision.reason) ctx.ui.notify(`暂不备课：${decision.reason}`, "info");
+				if (!isManual && !background) deferPacing();
+				if (!request?.requestId && config.verbose && decision.reason) ctx.ui.notify(`暂不备课：${decision.reason}`, "info");
 				return;
 			}
 
 			let lesson = decision;
 			// Quality gate: an independent critic must approve the generated content.
-			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
+			teachProgress(request, "checking");
+			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? replacementKnownList(db) : [], config, adaptive ?? undefined, batch);
 			if (sessionGeneration !== generation) return;
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			// Revision loop: address critic feedback before giving up.
 			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
-				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, verdict.issues, adaptive ?? undefined, recentLog, batch);
+				teachProgress(request, "revising");
+				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, verdict.issues, adaptive ?? undefined, recentLog, batch, false, isManual);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revised.ready) break;
 				lesson = revised;
-				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
+				teachProgress(request, "checking");
+				verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? replacementKnownList(db) : [], config, adaptive ?? undefined, batch);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 			}
@@ -1953,11 +2143,13 @@ export default function piEnglishAnkiExtension(
 			// unavailable critic stays fail-closed.
 			if (!verdict.pass && verdict.available) {
 				try {
-					const basic = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch, true);
+					teachProgress(request, "revising");
+					const basic = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch, true, isManual);
 					if (sessionGeneration !== generation) return;
 					if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 					if (basic.ready) {
-						const basicVerdict = await critiqueLesson(llm, ctx, effectiveResolved, basic, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
+						teachProgress(request, "checking");
+						const basicVerdict = await critiqueLesson(llm, ctx, effectiveResolved, basic, db ? replacementKnownList(db) : [], config, adaptive ?? undefined, batch);
 						if (sessionGeneration !== generation) return;
 						if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 						if (basicVerdict.pass) {
@@ -1971,14 +2163,15 @@ export default function piEnglishAnkiExtension(
 				}
 			}
 			if (!verdict.pass) {
+				failureCode = verdict.available ? "TEACH_QUALITY_REJECTED" : "TEACH_CHECK_UNAVAILABLE";
 				if (verdict.available) lastRejectedConversation = conversation;
-				updateWidget(ctx, FACES.idle, [
+				if (!background || !activeItem(db)) updateWidget(ctx, FACES.idle, [
 					verdict.available ? "内容质量未达标，稍后再试…" : "内容审查暂时不可用，稍后重试…",
 					statsLine(db),
 				]);
 				logGenStatus(`${verdict.available ? "critic_rejected" : "critic_unavailable"}: ${verdict.summary || ""}`);
-				deferPacing();
-				if (config.verbose) ctx.ui.notify(`备课被审查拒绝：${verdict.summary}`, "info");
+				if (!isManual && !background) deferPacing();
+				if (!request?.requestId && config.verbose) ctx.ui.notify(`备课被审查拒绝：${verdict.summary}`, "info");
 				return;
 			}
 			if (!conversationUnchanged()) return;
@@ -1999,17 +2192,19 @@ export default function piEnglishAnkiExtension(
 			for (let dupAttempt = 0; dupAttempt < MAX_DUPLICATE_RETRIES; dupAttempt++) {
 				const dupes = duplicateItems(lesson.items);
 				if (dupes.length === 0) break;
+				teachProgress(request, "revising");
 				logGenStatus(`duplicate_retry: ${dupes.map((d) => d.text).join("、")}`);
 				const dupFeedback: CritiqueIssue[] = dupes.map((d) => ({
 					severity: "blocker",
 					category: "dup",
 					description: `「${d.text}」与已有学习内容重复，请更换成其它不重复的单词/词组`,
 				}));
-				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? knownList(db) : [], config, dupFeedback, adaptive ?? undefined, recentLog, batch);
+				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, dupFeedback, adaptive ?? undefined, recentLog, batch, false, isManual);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revised.ready) break;
-				const revisedVerdict = await critiqueLesson(llm, ctx, effectiveResolved, revised, db ? knownList(db) : [], config, adaptive ?? undefined, batch);
+				teachProgress(request, "checking");
+				const revisedVerdict = await critiqueLesson(llm, ctx, effectiveResolved, revised, db ? replacementKnownList(db) : [], config, adaptive ?? undefined, batch);
 				if (sessionGeneration !== generation) return;
 				if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
 				if (!revisedVerdict.pass) break;
@@ -2021,25 +2216,35 @@ export default function piEnglishAnkiExtension(
 				logGenStatus(`duplicate_dropped: ${[...dupeKeys].join("、")}`);
 				lesson = { ...lesson, items: lesson.items.filter((it) => !dupeKeys.has(`${it.type} ${it.text}`)) };
 				if (lesson.items.length === 0) {
-					updateWidget(ctx, FACES.idle, ["生成内容与已有卡重复，稍后再试…", statsLine(db)]);
+					failureCode = "TEACH_DUPLICATE_BATCH";
+					if (!background || !activeItem(db)) updateWidget(ctx, FACES.idle, ["生成内容与已有卡重复，稍后再试…", statsLine(db)]);
 					logGenStatus(`duplicate_batch: ${[...dupeKeys].join("、").slice(0, 120)}`);
-					deferPacing();
+					if (!isManual && !background) deferPacing();
 					return;
 				}
 			}
 			const insertedAt = new Date();
 			let insertedFirst: ItemRow | undefined;
+			const insertedIds: number[] = [];
+			teachProgress(request, "saving");
 			db.exec("BEGIN IMMEDIATE");
 			try {
 				const state = getRuntimeState(db);
-				if (!ownsGeneration(state, generationToken, insertedAt) ||
-					state.active_item_id != null ||
+				if (!ownsGeneration(state, generationToken, insertedAt)) throw new Error("GENERATION_LEASE_LOST");
+				if (request && !ownsTeachRequest(request)) throw new Error("REQUEST_INTERRUPTED");
+				if (!isManual && !background && (state.active_item_id != null ||
 					!hasNewCardCapacity(loadPlan(db, insertedAt), countTodayNew(db, insertedAt)) ||
-					pendingReplacementTypes(db).length > 0 ||
-					getDueItem(db, insertedAt)) {
+					pendingReplacementTypes(db).length > 0 || getDueItem(db, insertedAt))) {
 					db.exec("ROLLBACK");
 					logGenStatus("insert_deferred");
 					return;
+				}
+				if (background) {
+					// Re-check quota/inventory after the model await. Another session may
+					// have introduced or manually added cards while this batch was prepared.
+					const fresh = autoRefillPlan(db, config, insertedAt, strategy);
+					lesson = { ...lesson, items: lesson.items.slice(0, fresh.slots) };
+					if (lesson.items.length === 0) { db.exec("ROLLBACK"); return; }
 				}
 				// Reject the whole batch if any item duplicates an existing canonical item.
 				for (const it of lesson.items) {
@@ -2047,6 +2252,7 @@ export default function piEnglishAnkiExtension(
 					if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fp)) {
 						db.exec("ROLLBACK");
 						logGenStatus(`duplicate_batch: ${it.type} ${it.text}`);
+						failureCode = "TEACH_DUPLICATE_BATCH";
 						return;
 					}
 				}
@@ -2059,34 +2265,54 @@ export default function piEnglishAnkiExtension(
 						keyWords: it.keyWords,
 					});
 					firstId ??= id;
+					insertedIds.push(id);
 				}
 				if (firstId == null) throw new Error("LESSON_INSERT_FAILED");
-				bumpStat(db, "total_learned", 1);
-				touchStreak(db, insertedAt);
-				markShown(db, firstId);
-				db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(insertedAt.toISOString(), firstId);
-				setRuntimeState(db, {
-					active_item_id: firstId,
-					active_kind: "teach",
-					active_direction: "forward",
-					active_version: state.active_version + 1,
-					...EMPTY_SENTENCE_CYCLE,
-					next_check_at: insertedAt.toISOString(),
-					generation_token: null,
-					generation_until: null,
-				});
-				insertedFirst = db.prepare("SELECT * FROM items WHERE id = ?").get(firstId) as ItemRow | undefined;
+				if (!isManual && !background) {
+					bumpStat(db, "total_learned", 1);
+					touchStreak(db, insertedAt);
+					markShown(db, firstId);
+					db.prepare("UPDATE items SET introduced_at = ? WHERE id = ?").run(insertedAt.toISOString(), firstId);
+					setRuntimeState(db, {
+						active_item_id: firstId,
+						active_kind: "teach",
+						active_direction: "forward",
+						active_version: state.active_version + 1,
+						...EMPTY_SENTENCE_CYCLE,
+						next_check_at: insertedAt.toISOString(),
+						generation_token: null,
+						generation_until: null,
+					});
+					insertedFirst = db.prepare("SELECT * FROM items WHERE id = ?").get(firstId) as ItemRow | undefined;
+				} else if (request?.requestId) {
+					// The receipt and cards become visible in the same successful commit.
+					writeTeachReceipt(db, { requestId: request.requestId, phase: "succeeded", itemsAdded: insertedIds.length,
+						itemIds: insertedIds, topic: request.topic, updatedAt: insertedAt.toISOString(), ownerId: myId });
+				}
 				db.exec("COMMIT");
+				saved = true;
+				if (request?.requestId) pendingTeachRequests.delete(request.requestId);
 			} catch (err) {
 				try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
 				throw err;
 			}
 			lastRejectedConversation = "";
 			logGenStatus(`ok: ${lesson.topic || ""}`);
+			if (background) {
+				logGenStatus(`auto_refill_ok: ${insertedIds.length}`);
+				// Stocking inventory never claims the active slot or changes pacing.
+				return insertedIds.length;
+			}
+			if (isManual) {
+				if (!request?.requestId) ctx.ui.notify(`已生成 ${insertedIds.length} 张新卡：「${request!.topic}」`, "info");
+				const next = !activeItem(db) ? claimDueItem(insertedAt) : undefined;
+				if (next && !request?.requestId) showItem(ctx, next); else renderGlobalCard(ctx);
+				return;
+			}
 			if (!insertedFirst) return;
 			showItem(ctx, insertedFirst);
 			if (lesson.topic && db) {
-				updateWidget(ctx, FACES.review, [
+				if (!background || !activeItem(db)) updateWidget(ctx, FACES.review, [
 					`${FACES.teach} 今日主题：${lesson.topic}`,
 					...renderCard(
 						insertedFirst,
@@ -2105,11 +2331,18 @@ export default function piEnglishAnkiExtension(
 		} catch (err) {
 			if (sessionGeneration !== generation) return;
 			const msg = (err as Error)?.message || String(err);
-			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
-			if (db) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`, statsLine(db)]);
+			const candidateCode = String((err as Error & { code?: string }).code || msg);
+			failureCode = /^[A-Z][A-Z0-9_]{0,79}$/.test(candidateCode) ? candidateCode : "TEACH_GENERATION_FAILED";
+			lastError = candidateCode.slice(0, 80);
+			if (db && (!background || !activeItem(db))) updateWidget(ctx, FACES.error, [`备课失败：${lastError}`, statsLine(db)]);
 			logGenStatus(`error: ${lastError}`);
-			deferPacing();
+			if (!isManual && !background) deferPacing();
 		} finally {
+			if (sessionGeneration === generation && request && !saved) {
+				if (db && !ownsGeneration(getRuntimeState(db), generationToken)) failureCode = "GENERATION_LEASE_LOST";
+				teachProgress(request, "failed", failureCode);
+			}
+			if (manualWork?.token === generationToken) manualWork = undefined;
 			if (db) releaseGeneration(generationToken);
 			if (sessionGeneration === generation) {
 				pendingLLMCall = false;
@@ -2263,8 +2496,11 @@ export default function piEnglishAnkiExtension(
 		}
 		const queueWasEmpty = pendingReplacementTypes(db).length === 0;
 		let skipped: ItemRow | undefined;
+		let undoActionId: string | undefined;
 		try {
-			skipped = skipPending(ctx);
+			const result = skipPending(ctx);
+			skipped = result?.item;
+			undoActionId = result?.actionId;
 		} catch (err) {
 			ctx.ui.notify(`标记失败：${(err as Error).message}`, "error");
 			return;
@@ -2275,7 +2511,7 @@ export default function piEnglishAnkiExtension(
 		}
 		scheduleReplacementWork();
 		// A due review must never wait for replacement generation.
-		resetPacing(db);
+		if (!continueStudyUndoAction(db, undoActionId!, () => resetPacing(db!))) return;
 		const dueReview = claimDueItem(new Date(), true);
 		if (dueReview) {
 			if (!showItem(ctx, dueReview)) renderGlobalCard(ctx);
@@ -2286,10 +2522,11 @@ export default function piEnglishAnkiExtension(
 		const generation = sessionGeneration;
 		const inserted = nextType ? await generateReplacementAndInsert(ctx, nextType, source) : false;
 		if (sessionGeneration !== generation) return;
+		if (db && wasStudyUndone(db, undoActionId)) return;
 		if (!inserted && db) {
 			// Generation failed or was waiting for info: lower the pacing window so
 			// the next tick can surface a due card instead of stalling on the grace gap.
-			resetPacing(db);
+			if (!continueStudyUndoAction(db, undoActionId!, () => resetPacing(db!))) return;
 			replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
 			stopReplacementTimer();
 			scheduleReplacementWork();
@@ -2407,6 +2644,7 @@ export default function piEnglishAnkiExtension(
 				config.intervalMinutes = 0;
 				persistConfig({ intervalMinutes: 0 });
 				stopTimer();
+				publishForecast();
 				ctx.ui.notify("自动检查已关闭", "info");
 				return;
 			}
@@ -2476,6 +2714,37 @@ export default function piEnglishAnkiExtension(
 		},
 	});
 
+	pi.registerCommand("anki:undo", {
+		description: "Undo the latest untouched manual rating or skip",
+		handler: async (args, ctx) => {
+			if (!db) return;
+			const parts = String(args ?? "").trim().split(/\s+/);
+			const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+			const correlated = parts.length === 3 && parts[1] === "--request-id" && uuid.test(parts[2]);
+			if (!uuid.test(parts[0]) || !(parts.length === 1 || correlated)) {
+				ctx.ui.notify("撤销请求无效，请使用 /anki:undo <actionId> --request-id <UUID>", "warning");
+				return;
+			}
+			const actionId = parts[0], requestId = correlated ? parts[2] : randomUUID();
+			try {
+				const result = undoStudyAction(db, actionId, requestId);
+				if (result.applied) {
+					stopTimer(); stopReplacementTimer();
+					clearPendingLocals(); localVersion = -1;
+					renderGlobalCard(ctx); scheduleReplacementWork(); publishForecast();
+				}
+				if (!correlated) ctx.ui.notify(result.status === "succeeded" ? "已撤销，回到刚才的卡片。" : "这次操作已不能撤销，当前学习进度未改变。", "info");
+			} catch {
+				const itemId = readStudyUndo(db)?.itemId ?? null;
+				// A display refresh failing after COMMIT cannot rewrite a successful receipt.
+				if (!db.prepare("SELECT 1 FROM stats WHERE key=?").get(`study_undo_result:${requestId}`)) {
+					setStat(db, `study_undo_result:${requestId}`, JSON.stringify({ requestId, actionId, itemId, status: "rejected", errorCode: "UNDO_FAILED", updatedAt: new Date().toISOString() }));
+				}
+				if (!correlated) ctx.ui.notify("暂时无法撤销，当前学习进度未改变。", "warning");
+			}
+		},
+	});
+
 	pi.registerCommand("anki:answer", {
 		description: "Submit bidirectional recall or progressive written sentence output",
 		handler: async (args, ctx) => {
@@ -2536,28 +2805,33 @@ export default function piEnglishAnkiExtension(
 	pi.registerCommand("anki:hint", {
 		description: "Show a recall hint or the current sentence level's initial-letter hint",
 		handler: async (_args, ctx) => {
+			if (db) invalidateStudyUndo(db);
 			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
 		},
 	});
 
 	pi.registerCommand("anki:teach", {
-		description: "Prepare a lesson on a specific topic now (bypasses readiness detection)",
+		description: "Generate a reviewed batch now, independently of study pacing and daily quota",
 		handler: async (args, ctx) => {
-			const topic = String(args ?? "").trim();
-			if (!topic) {
-				ctx.ui.notify("用法：/anki:teach <话题>（例如 /anki:teach async programming）", "info");
-				return;
+			let request: TeachRequest;
+			try { request = parseTeachRequest(String(args ?? "")); }
+			catch { ctx.ui.notify("用法：/anki:teach [--request-id UUID] <话题>", "error"); return; }
+			if (!db) { ctx.ui.notify("数据库不可用", "error"); return; }
+			if (request.requestId) {
+				db.exec("BEGIN IMMEDIATE");
+				try {
+					if (readTeachReceipt(db, request.requestId)) { db.exec("ROLLBACK"); return; }
+					teachProgress(request, "queued");
+					db.exec("COMMIT");
+				} catch (err) {
+					try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+					throw err;
+				}
+				pendingTeachRequests.set(request.requestId, request);
 			}
-			if (pendingLLMCall || teachQueue.length > 0) {
-				teachQueue.push(topic);
-				ctx.ui.notify(`已排队：当前生成结束后自动开始「${topic}」（第 ${teachQueue.length} 位）`, "info");
-				return;
-			}
-			manualTeachTopic = topic;
-			ctx.ui.notify(`将围绕「${topic}」备课`, "info");
-			void generateAndInsert(ctx, new Date())
-				.catch((err) => console.error(`[pi-english-anki] teach failed: ${err}`))
-				.finally(() => scheduleTimer());
+			teachQueue.push(request);
+			if (!request.requestId && (pendingLLMCall || teachQueue.length > 1)) ctx.ui.notify(`已排队：当前生成结束后自动开始「${request.topic}」`, "info");
+			drainTeachQueue();
 		},
 	});
 
@@ -2686,6 +2960,7 @@ export default function piEnglishAnkiExtension(
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		interruptManualRequests();
 		sessionGeneration++;
 		pendingChat = false;
 		stopReplacementTimer();
@@ -2724,6 +2999,7 @@ export default function piEnglishAnkiExtension(
 	});
 
 	pi.on("session_shutdown", async () => {
+		interruptManualRequests();
 		sessionGeneration++;
 		pendingChat = false;
 		stopReplacementTimer();

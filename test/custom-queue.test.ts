@@ -255,8 +255,8 @@ test("generateCustomCards surfaces an LLM refusal with its reason", async () => 
 test("critiqueLesson custom composition skips the fixed-composition gate", async () => {
 	// 11 items with 5 phrases trip the default full-batch composition rule...
 	const items: GeneratedItem[] = [];
-	for (let i = 0; i < 6; i++) items.push({ ...word(`fox${i}`), meaning: `狐狸${i}（名词）` });
-	for (let i = 0; i < 5; i++) items.push({ ...word(`lazy dog ${i}`), type: "phrase", meaning: `懒狗${i}（名词短语）` });
+	for (let i = 0; i < 6; i++) items.push({ ...word(`fox${i}`), meaning: `狐狸${i}（名词，一种动物）` });
+	for (let i = 0; i < 5; i++) items.push({ ...word(`lazy dog ${i}`), type: "phrase", meaning: `懒狗${i}（名词短语，懒惰的狗）` });
 	const passLlm = mockLlm(() => JSON.stringify({ pass: true, issues: [], summary: "ok" }));
 
 	const defaultVerdict = await critiqueLesson(

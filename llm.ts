@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LESSON_CLOZE_ITEMS, LESSON_MAX_PHRASES, LESSON_WORD_ITEMS, MAX_CUSTOM_PER_ADD, type PetConfig } from "./config.ts";
 import type { PiSdkLlmClient } from "./pi-sdk-llm.ts";
 import { normalizeMeaning, type ItemRow } from "./db.ts";
-import { questionHasForwardCue, questionHasReverseContext, type SentenceExerciseView } from "./render.ts";
+import { meaningHasForwardSenseClue, meaningHasVisiblePos, questionHasForwardCue, questionHasReverseContext, type SentenceExerciseView } from "./render.ts";
 import { coldStartProfile, deriveBudget, formatAdaptiveBlock, normalizeErrorTag, type AdaptiveContext } from "./learner-profile.ts";
 
 // -- LLM lesson generation ------------------------------------------------
@@ -14,6 +14,7 @@ const FORWARD_PROMPT_QUALITY = [
 	"- 例如 communicate 应写「交流（动词，指与他人交换信息或想法）」，communication 应写「交流（名词，指交换信息或想法的过程）」；提示「交流」无法区分动词与名词。词性须与 text 在例句中的当前用法一致，不能只标笼统的「单词」或「词组」。词性只解决词类歧义，同词性的近义词仍须补必要的义项或搭配线索。",
 	"- 消歧不限于批内或已学词的释义完全重复：即使其它近义词未入库、中文写法不同，也要检查常见合理答案。必要的词性、可数/不可数、义项范围或自然搭配属于题面线索，允许简短写在 meaning 的括号中，不属于应删去的用途/效果说明。",
 	"- 例如 information 不可只提示「信息/消息」：可写「信息（不可数名词，泛指事实或资料）」；message 可写「消息（可数名词，指发送或收到的一条留言）」。这说明词义范围，不能虚构近义词之间并不存在的区别。",
+	"- 例如 performance 不可只提示「表演」：show、act 同样自然。应写「一场具体的演出（可数名词，常与 give 搭配，强调演出本身或当场表现）」；只标「表演（名词）」也不够，必须补语境或搭配。",
 	"- 为有近义词的目标选择能体现词义的自然例句/搭配，example 必须原样包含 text，example_cn 准确翻译；把目标挖空后仍应提供有用语境，不能只用 I like ... 等空泛句。",
 	"- 自检以实际默认题面为准：学生只看到 meaning，不能假设例句挖空或首字母已经显示，例句仅作辅助。隐藏 text 和 example 后，学生能否仅从 meaning 判断所考词？若仍有多个同样自然且满足线索的常见答案，必须将必要限定写进 meaning；仍无法消歧就换学习项，用户指定必须保留的词则返回无法生成的原因，不能靠不自然英文或直接泄露目标英文来强行唯一。",
 ].join("\n");
@@ -192,6 +193,7 @@ export async function generateLesson(
 	// basicFallback: last-resort batch of the easiest everyday words after the
 	// critic keeps rejecting; already-known words are fine (the user can skip).
 	basicFallback = false,
+	forceGeneration = false,
 ): Promise<LessonDecision> {
 	const ctxAdaptive = adaptive ?? { profile: coldStartProfile(), budget: deriveBudget(coldStartProfile()) };
 	const budget = ctxAdaptive.budget;
@@ -218,6 +220,7 @@ export async function generateLesson(
 				"- 只有会话内容完全无法解读时才输出：{\"ready\":false,\"reason\":\"简短原因\"}",
 			]),
 		"",
+		...(forceGeneration ? ["用户已明确要求现在备课：必须生成 ready:true 的完整新批次，不要再判断是否值得备课；主题线索不足时使用雅思基础高频词补足。"] : []),
 		"学习项要求：",
 		...(basicFallback
 			? ["- 内容要真实常用：选自基础高频词表，例句短小自然"]
@@ -234,7 +237,7 @@ export async function generateLesson(
 				`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然`]
 			: ["- 教学项围绕同一主题组织（会话主题或雅思主题），形成一个统一的教学单元",
 				`- 每个学习项必须互不重复；${wordItems} 个单词/词组项彼此独立，各自配一个小巧自然的例句`]),
-		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
+		"- word/phrase 的 meaning 写一个首选中文义项，并在同一题面用括号标出当前词性和能排除常见近义词的最小语境或搭配（格式如「一场具体的演出（可数名词，常与 give 搭配）」）；用途、效果、操作后果写进 example/example_cn，不得写进 meaning（反例：「重新加载，使新改动生效」应拆为 meaning「重新加载（动词，把最新内容再载入一次）」，作用说明放例句）；释义只给一个首选说法，不并列近义改写（应写「生效」而非「生效，起作用」），确有多个义项才用「；」并列",
 		FORWARD_PROMPT_QUALITY,
 		"- 若某个常用英文词/词组与本项 text 会对应同一个中文释义（如 book 与 reserve 都表示「预订」），meaning 必须补上可区分的义项或场景，不得与其它学习项或已学内容的中文释义完全相同",
 		'- 只输出 JSON，不要任何其他文字：',
@@ -269,6 +272,7 @@ export async function generateLesson(
 			throw new Error("BAD_JSON");
 		}
 		if (parsed.ready === false) {
+			if (forceGeneration) throw new Error("INVALID_READY");
 			return {
 				ready: false,
 				reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
@@ -301,7 +305,9 @@ export async function generateLesson(
 		const retryNote = attempt === 0 ? ""
 			: `\n\n⚠ 上一次输出无法解析（${String((lastFormatError as Error)?.message ?? "")}）。请重新输出完整批次：只输出一个合法 JSON 对象（以 {"ready":true 开头且完整闭合），不要任何解释、markdown 代码围栏或多余文字，字符串正确转义。内容要求与难度预算保持不变。`;
 		const text = await llm.complete(ctx, resolved, {
-			systemPrompt: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
+			systemPrompt: forceGeneration
+				? "你是英语小宠物的备课助手，立即生成指定数量的新卡，只输出 JSON；主题信息不足时用基础词汇补足。"
+				: "你是英语小宠物的备课助手，只输出 JSON；信息不足时宁可等待。",
 			prompt: prompt + retryNote,
 			thinkingLevel: config.thinkingLevel,
 		});
@@ -410,11 +416,17 @@ export async function critiqueLesson(
 		if (item.type !== "word" && item.type !== "phrase") continue;
 		// Require a visible Chinese part-of-speech label independently of the model.
 		// Keep the general parser compatible with existing stored cards.
-		if (!/[（(【]\s*(?:不可数|可数|不及物|及物)?(?:名词|动词|形容词|副词|介词|代词|连词|数词|冠词|感叹词|助动词|情态动词)(?:短语|过去分词|现在分词)?(?=[，,；;）)】\s])/.test(item.meaning)) {
+		if (!meaningHasVisiblePos(item.meaning)) {
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "sense",
 				description: `「${item.text}」的中文题面缺少明确词性，请在 meaning 的括号中标注当前义项的名词、动词、形容词或动词短语等中文词性，并保留必要消歧线索；不能仅在例句或判分反馈中解释`,
+			});
+		} else if (!meaningHasForwardSenseClue(item.meaning)) {
+			budgetBlockers.push({
+				severity: "blocker",
+				category: "sense",
+				description: `「${item.text}」的中文题面只有词性、缺少能排除近义词的语境或搭配，请写成「义项（词性，语境或搭配）」；不能只写「表演」或「表演（名词）」，也不能把语境留到例句或判分反馈`,
 			});
 		}
 		const key = normalizeMeaning(item.meaning);
@@ -453,12 +465,12 @@ export async function critiqueLesson(
 			: [`- 批次组成：${compositionBatch.wordItems} 个单词/词组项以单词为主（词组不超过 ${phraseCapFor(compositionBatch.wordItems)} 个）${compositionBatch.clozeItems > 0 ? ` 加 ${compositionBatch.clozeItems > 1 ? compositionBatch.clozeItems + " 个语法填空" : "1 个语法填空"}` : ""}；同批学习项之间不得重复或近乎重复；违反记 blocker`]),
 		"- cloze 语法填空：___ 空格恰好一个且挖在真正的语法点上；括号原形提示与考点一致；meaning 答案唯一且为最小形式，代入后句子语法正确；若同一空存在其他语法正确的填法（时态/语态歧义）记 blocker；example 必须是代入答案后的完整句子；chunks 必须是 2-6 个意群且拼接覆盖完整句子；违反记 blocker",
 		"- 中文释义准确，不得机翻味",
-		"- word/phrase 的 meaning 必须是可直接回忆的最小释义，不得混入目的/效果等补充说明（反例：「重新加载，使新改动生效」只能保留「重新加载」），也不得并列近义改写（「生效，起作用」应只写「生效」）；违反记 blocker",
+		"- word/phrase 的 meaning 写一个首选中文义项，并在同一题面用括号标出当前词性和能排除常见近义词的最小语境或搭配；不得把目的/效果写进 meaning（反例：「重新加载，使新改动生效」应写成「重新加载（动词，把最新内容再载入一次）」并把作用放例句），也不得并列近义改写（「生效，起作用」应只写「生效」）；违反记 blocker",
 		"- 每张 word/phrase 的 meaning 缺少明确中文词性、词性与当前义项或例句不符，或只写「词组」等无法区分词类的标签，均记 sense blocker；不能根据隐藏 text 或例句猜出词性后放行。communicate / communication 仅提示「交流」必须拦截，并要求补动词 / 名词；名词、动词等词性线索属于必要题面，不属于冗余说明。",
 		"- word/phrase 的 example 必须原样包含所教 text（大小写不限）；违反记 blocker",
 		"- word/phrase 的中文释义与批内其它学习项或已学内容完全相同时（如 book 与 reserve 都是「预订」），必须给出可区分的义项或场景限定，否则记 blocker",
 		FORWARD_PROMPT_QUALITY,
-		"- 逐项模拟只看题面作答，主动寻找其它合理近义答案（包括未入库的词）：information 只给「信息/消息」且没有词性或义项限定，或例句无法帮助消歧，记 sense blocker。不能因本批没有 message 就放行；不能把必需的消歧限定误判为冗余。问题说明须写出具体替代答案和应补充的线索。",
+		"- 逐项模拟只看题面作答，主动寻找其它合理近义答案（包括未入库的词）：information 只给「信息/消息」、performance 只给「表演」，或仅有词性没有语境/搭配，记 sense blocker。不能因本批没有 message / show 就放行；不能把必需的消歧限定误判为冗余。问题说明须写出具体替代答案和应补充的线索。",
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
 		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；cloze 句子可以自然复用批次中 1-2 个单词或词组`,
 		"- 不得为凑结构硬造不自然句子",
@@ -713,7 +725,7 @@ export async function generateReplacement(
 		`{"ready":true,"item":${itemSchema}}`,
 		isCloze
 			? `语法填空要求：恰好一个 ___、空后括号给原形提示、考点是明确的语法点且答案唯一；meaning 填正确答案的最小形式，text 只放挖空句且句尾不得附加 = 答案或 → 答案，example 是代入答案后的完整句子，chunks 是覆盖完整句子的 2-6 个意群，句子词数在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间且自然真实。`
-			: "内容要真实常用：会话来源的贴近当前会话语境，雅思来源的选自雅思高频词表，难度贴合下面的画像与预算；meaning 只写最小中文释义（直接翻译），只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn；example 必须原样包含所教 text（大小写不限）；若某个常用英文词/词组与本项共用同一中文释义（如 book 与 reserve 都表示「预订」），meaning 必须补上可区分的义项或场景。",
+			: "内容要真实常用：会话来源的贴近当前会话语境，雅思来源的选自雅思高频词表，难度贴合下面的画像与预算；meaning 写一个首选中文义项，并在同一题面用括号标出当前词性和能排除常见近义词的最小语境或搭配，只给一个首选说法、不并列近义改写，用途/效果说明放 example/example_cn；example 必须原样包含所教 text（大小写不限）；若某个常用英文词/词组与本项共用同一中文释义（如 book 与 reserve 都表示「预订」，performance 与 show 都表示「表演」），meaning 必须补上可区分的义项或场景。",
 		...(isCloze ? [] : [FORWARD_PROMPT_QUALITY]),
 		"已有内容：" + (known.length ? known.join("；") : "（无）"),
 		...(recentLog
@@ -793,7 +805,7 @@ export async function generateCustomCards(
 		"- word 和 phrase 的例句短小自然，贴近提示词的实际使用场景",
 		"- cloze 是语法填空：一句英文恰好挖一个空（用 ___ 表示），空后括号给所填词的原形提示；考点必须是明确的语法点，答案唯一且为最小形式；meaning 填正确答案，text 只放挖空句，严禁句尾附加 = 答案；example 是代入答案后的完整句子，example_cn 填整句中文翻译；chunks 是 2-6 个按顺序拼接覆盖完整句子的意群",
 		`- cloze 的句子词数必须在 ${budget.wordRange[0]}-${budget.wordRange[1]} 之间，句法结构遵循预算的句法约束（见下方 difficulty_budget），句子必须真实自然；提示词只要词汇时可不用 cloze`,
-		"- word/phrase 的 meaning 只写可直接回忆的最小中文释义（直接翻译）；用途、效果等补充说明写进 example/example_cn，不得混入 meaning；释义只给一个首选说法，不并列近义改写，确有多个义项才用「；」并列",
+		"- word/phrase 的 meaning 写一个首选中文义项，并在同一题面用括号标出当前词性和能排除常见近义词的最小语境或搭配；用途、效果等补充说明写进 example/example_cn，不得混入 meaning；释义只给一个首选说法，不并列近义改写，确有多个义项才用「；」并列",
 		"- word/phrase 的 example 必须原样包含所教的 text（大小写不限），例句要真正用到这个词",
 		FORWARD_PROMPT_QUALITY,
 		"- 若某个常用英文词/词组与本项 text 共用同一中文释义（如 book 与 reserve 都表示「预订」），meaning 必须补上可区分的义项或场景，不得与本批其它卡或已有内容的中文释义完全相同",

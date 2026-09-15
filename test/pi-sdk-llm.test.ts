@@ -186,4 +186,217 @@ test("dispose during pending auth prevents runtime and session creation", async 
 	}
 });
 
+
+let transportFixtureId = 0;
+const gatewayHtml = '<!DOCTYPE html><html><head><title>Upstream failure</title></head><body>Unexpected response</body></html>';
+
+type TransportStep = { status?: number; error?: string; text?: string };
+
+async function withTransportFixture(
+	steps: TransportStep[],
+	run: (fixture: { client: InstanceType<typeof PiSdkLlmClient>; complete: () => Promise<string>; calls: () => number }) => Promise<void>,
+	options: { completeTimeoutMs?: number; abortTimeoutMs?: number } = {},
+) {
+	const registration = registerFauxProvider({ provider: `kaomoji-sdk-http-${++transportFixtureId}` });
+	const ctx = testContext(registration);
+	registration.setResponses(steps.map(step => fauxAssistantMessage(step.text ?? "", step.error == null
+		? {} : { stopReason: "error", errorMessage: step.error })));
+	let calls = 0;
+	const runtime = fauxRuntime(ctx);
+	const originalStream = runtime.streamSimple;
+	runtime.streamSimple = async (model: any, context: any, streamOptions: any) => {
+		const step = steps[calls++];
+		assert.ok(step, "transport made more attempts than the existing retry budget allows");
+		return originalStream(model, context, { ...streamOptions,
+			// Faux normally announces HTTP 200; replace that announcement with
+			// the fixture status instead of reporting a second response ourselves.
+			onResponse: step.status == null ? undefined : async () => streamOptions?.onResponse?.({ status: step.status, headers: {} }, model),
+		});
+	};
+	const client = new PiSdkLlmClient(async () => runtime, options);
+	try {
+		await run({ client, calls: () => calls, complete: () => client.complete(ctx,
+			{ provider: ctx.model.provider, model: ctx.model.id },
+			{ systemPrompt: "Reply briefly.", prompt: "test" }) });
+	} finally {
+		await client.dispose();
+		registration.unregister();
+	}
+}
+
+test("HTTP HTML failure reaches the existing session retry and then recovers", async () => {
+	await withTransportFixture([{ status: 503, error: gatewayHtml }, { status: 200, text: "recovered" }], async fixture => {
+		assert.equal(await fixture.complete(), "recovered");
+		assert.equal(fixture.calls(), 2);
+	});
+});
+
+test("HTTP 408 request timeouts retain the existing retry path", async () => {
+	for (const error of ["The request timed out", gatewayHtml]) {
+		await withTransportFixture([{ status: 408, error }, { status: 200, text: "recovered" }], async fixture => {
+			assert.equal(await fixture.complete(), "recovered");
+			assert.equal(fixture.calls(), 2);
+		});
+	}
+});
+
+test("HTML billing footer text does not turn a server failure into exhausted quota", async () => {
+	const html = gatewayHtml.replace('Unexpected response', '<footer><a>Billing</a> Learn about usage limits</footer>');
+	await withTransportFixture([{ status: 503, error: html }, { status: 200, text: "recovered" }], async fixture => {
+		assert.equal(await fixture.complete(), "recovered");
+		assert.equal(fixture.calls(), 2);
+	});
+	await withTransportFixture([{ error: html }], async fixture => {
+		await assert.rejects(fixture.complete(), (error: any) => error.code === "SDK_LLM_INVALID_RESPONSE");
+		assert.equal(fixture.calls(), 1, "unidentified error page must not guess quota or HTTP status");
+	});
+});
+
+test("exhausted HTTP failures retain status without HTML and remain limited to three attempts", async () => {
+	await withTransportFixture(Array.from({ length: 3 }, () => ({ status: 503, error: gatewayHtml })), async fixture => {
+		await assert.rejects(fixture.complete(), (error: any) => {
+			assert.equal(error.code, "SDK_LLM_HTTP_503");
+			assert.match(error.message, /HTTP 503/);
+			assert.doesNotMatch(error.message, /<!doctype|<html|<head|<body/i);
+			assert.ok(error.message.length < 150);
+			return true;
+		});
+		assert.equal(fixture.calls(), 3, "two retries must not gain another retry layer");
+	});
+});
+
+test("HTML auth failures do not retry incidental server-error text in the page", async () => {
+	for (const status of [401, 403]) {
+		await withTransportFixture([{ status, error: gatewayHtml.replace('Unexpected response', '500 502 service unavailable rate limit') }], async fixture => {
+			await assert.rejects(fixture.complete(), (error: any) => {
+				assert.equal(error.code, `SDK_LLM_HTTP_${status}`);
+				assert.match(error.message, new RegExp(`HTTP ${status}`));
+				assert.doesNotMatch(error.message, /500|502|rate limit|<html/);
+				return true;
+			});
+			assert.equal(fixture.calls(), 1);
+		});
+	}
+});
+
+test("non-HTML terminal HTTP bodies cannot manufacture a transient failure", async () => {
+	for (const status of [400, 401, 403, 404, 422]) {
+		await withTransportFixture([{ status, error: '{"error":{"message":"Invalid request 500 502 timeout"}}' }], async fixture => {
+			await assert.rejects(fixture.complete(), (error: any) => {
+				assert.equal(error.code, `SDK_LLM_HTTP_${status}`);
+				assert.doesNotMatch(error.message, /500|502|timeout/);
+				return true;
+			});
+			assert.equal(fixture.calls(), 1);
+		});
+	}
+});
+
+test("quota errors without response metadata still retain their independent code", async () => {
+	await withTransportFixture([{ error: 'You have hit your ChatGPT usage limit. Try again in ~500 min.' }], async fixture => {
+		await assert.rejects(fixture.complete(), (error: any) => error.code === "SDK_LLM_INSUFFICIENT_QUOTA");
+		assert.equal(fixture.calls(), 1);
+	});
+});
+
+test("unknown-status HTML error becomes an invalid-response code without guessing a status", async () => {
+	await withTransportFixture([{ error: gatewayHtml }], async fixture => {
+		await assert.rejects(fixture.complete(), (error: any) => {
+			assert.equal(error.code, "SDK_LLM_INVALID_RESPONSE");
+			assert.doesNotMatch(error.message, /HTTP|<html|<!doctype/i);
+			return true;
+		});
+		assert.equal(fixture.calls(), 1);
+	});
+});
+
+test("quota and billing errors retain terminal semantics even with HTTP 429", async () => {
+	for (const error of [
+		'{"error":{"type":"insufficient_quota","message":"quota exceeded"}}',
+		'{"error":{"code":"usage_limit_reached","message":"Please check billing"}}',
+		'You have hit your ChatGPT usage limit. Try again in ~60 min.',
+		'You have hit your ChatGPT usage limit. Try again in ~500 min.',
+		'{"error":{"code":"usage_limit_reached","message":"HTTP 429, try later"}}',
+		gatewayHtml.replace('Unexpected response', 'insufficient_quota'),
+	]) {
+		await withTransportFixture([{ status: 429, error }], async fixture => {
+			await assert.rejects(fixture.complete(), (result: any) => {
+				assert.equal(result.code, "SDK_LLM_INSUFFICIENT_QUOTA");
+				assert.doesNotMatch(result.message, /<html|<!doctype/i);
+				assert.match(result.message, /^quota exceeded/);
+				if (!error.startsWith('<')) assert.ok(result.message.includes(error));
+				return true;
+			});
+			assert.equal(fixture.calls(), 1, "subscription/account limits must not be retried");
+		});
+	}
+});
+
+test("successful HTML text is returned verbatim and is never treated as a transport failure", async () => {
+	await withTransportFixture([{ status: 200, text: gatewayHtml }], async fixture => {
+		assert.equal(await fixture.complete(), gatewayHtml);
+		assert.equal(fixture.calls(), 1);
+	});
+});
+
+test("a new attempt does not inherit the previous attempt's HTTP status", async () => {
+	await withTransportFixture([{ status: 503, error: gatewayHtml }, { error: "Permanent configuration failure" }], async fixture => {
+		await assert.rejects(fixture.complete(), (error: any) => {
+			assert.equal(error.code, undefined);
+			assert.equal(error.message, "Permanent configuration failure");
+			return true;
+		});
+		assert.equal(fixture.calls(), 2);
+	});
+});
+
+test("simultaneous sessions sharing one runtime keep HTTP status isolated", async () => {
+	const registration = registerFauxProvider({ provider: "kaomoji-sdk-http-concurrent" });
+	const ctx = testContext(registration);
+	const counts = new Map<string, number>();
+	const keyFor = (context: any) => {
+		const content = context.messages[context.messages.length - 1].content;
+		return typeof content === 'string' ? content : content.map((part: any) => part.text ?? '').join('');
+	};
+	registration.setResponses(Array.from({ length: 3 }, () => (context: any) => {
+		const key = keyFor(context);
+		return key === 'denied' || counts.get(key) === 1
+			? fauxAssistantMessage('', { stopReason: 'error', errorMessage: gatewayHtml })
+			: fauxAssistantMessage('recovered');
+	}));
+	const runtime = fauxRuntime(ctx);
+	const originalStream = runtime.streamSimple;
+	runtime.streamSimple = async (model: any, context: any, options: any) => {
+		const key = keyFor(context);
+		counts.set(key, (counts.get(key) ?? 0) + 1);
+		const status = key === 'denied' ? 403 : counts.get(key) === 1 ? 503 : 200;
+		await new Promise(resolve => setTimeout(resolve, key === 'denied' ? 8 : 1));
+		return originalStream(model, context, { ...options,
+			onResponse: async () => options?.onResponse?.({ status, headers: {} }, model),
+		});
+	};
+	const client = new PiSdkLlmClient(async () => runtime);
+	try {
+		const complete = (prompt: string) => client.complete(ctx, { provider: ctx.model.provider, model: ctx.model.id }, { systemPrompt: 'test', prompt });
+		const [denied, recovered] = await Promise.allSettled([complete('denied'), complete('recover')]);
+		assert.equal(denied.status, 'rejected');
+		if (denied.status === 'rejected') assert.equal(denied.reason.code, 'SDK_LLM_HTTP_403');
+		assert.deepEqual(recovered, { status: 'fulfilled', value: 'recovered' });
+		assert.equal(counts.get('denied'), 1);
+		assert.equal(counts.get('recover'), 2);
+	} finally {
+		await client.dispose();
+		registration.unregister();
+	}
+});
+
+test("the existing completion deadline also bounds HTTP retry backoff", async () => {
+	await withTransportFixture([{ status: 503, error: gatewayHtml }], async fixture => {
+		const started = Date.now();
+		await assert.rejects(fixture.complete(), /SDK_LLM_TIMEOUT/);
+		assert.ok(Date.now() - started < 1000, "retry backoff must not escape the completion deadline");
+		assert.equal(fixture.calls(), 1);
+	}, { completeTimeoutMs: 40, abortTimeoutMs: 20 });
+});
+
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { randomUUID } from "node:crypto";
 import { fauxAssistantMessage, registerFauxProvider, streamSimple as streamModel } from "@earendil-works/pi-ai/compat";
 
 const agentDir = mkdtempSync(join(tmpdir(), "kaomoji-tutor-test-"));
@@ -21,6 +22,7 @@ const sdkRuntimeFactory = async (ctx: any) => ({
 	},
 }) as any;
 const { default: extension, contentFingerprint } = await import("../index.ts");
+const { undoStudyAction } = await import("../study-undo.ts");
 let sessionSeq = 0;
 
 interface FakeTimer {
@@ -44,17 +46,19 @@ function installFakeTimers() {
 	(globalThis as any).clearTimeout = (timer: FakeTimer) => { timer.active = false; };
 
 	const kaomojiReplacement = (timer: FakeTimer) => (timer as unknown as { kaomojiReplacement?: boolean }).kaomojiReplacement;
+	const kaomojiAutoRefill = (timer: FakeTimer) => (timer as unknown as { kaomojiAutoRefill?: boolean }).kaomojiAutoRefill;
 	const kaomojiPoll = (timer: FakeTimer) => (timer as unknown as { kaomojiPoll?: boolean }).kaomojiPoll;
 	return {
 		/** Active timers that are NOT the kaomoji cross-session sync poll. */
-		active: () => timers.filter((timer) => timer.active && !kaomojiPoll(timer) && !kaomojiReplacement(timer)),
+		active: () => timers.filter((timer) => timer.active && !kaomojiPoll(timer) && !kaomojiReplacement(timer) && !kaomojiAutoRefill(timer)),
+		refills: () => timers.filter((timer) => timer.active && kaomojiAutoRefill(timer)),
 		replacements: () => timers.filter((timer) => timer.active && kaomojiReplacement(timer)),
 		/** Active cross-session sync poll timers. */
 		poll: () => timers.filter((timer) => timer.active && kaomojiPoll(timer)),
 		reset: () => { timers = []; },
 		async fire(timer?: FakeTimer) {
 			// By default fire the first active work timer (skipping the sync poll).
-			const target = timer ?? timers.find((entry) => entry.active && !kaomojiPoll(entry) && !kaomojiReplacement(entry));
+			const target = timer ?? timers.find((entry) => entry.active && !kaomojiPoll(entry) && !kaomojiReplacement(entry) && !kaomojiAutoRefill(entry));
 			assert.ok(target, "expected an active timer");
 			target.active = false;
 			target.callback();
@@ -209,8 +213,9 @@ test("first-showing word and phrase cards accept active-recall answers", { concu
 		assert.deepEqual({ ...claimedWord }, { active_item_id: 1, active_kind: "teach" }, "teach remains first-showing provenance");
 
 		await harness.commands["anki:answer"].handler("condition", harness.ctx);
-		assert.match(harness.widget().join(" "), /答对了/);
-		await fake.fire();
+		check = openTestDb();
+		assert.equal(check.prepare("SELECT verdict FROM attempts WHERE item_id=1").get()?.verdict, "correct");
+		check.close();
 		const phraseFace = harness.widget().join(" ");
 		assert.match(phraseFace, /复习时间到.*默写词组.*生效/);
 		assert.doesNotMatch(phraseFace, /take effect/, "first-showing question must not leak the target phrase");
@@ -777,7 +782,7 @@ test("successful replacement is one-for-one, critic-approved, and quota-free", {
 		registration.setResponses([
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
-				item: { type: "word", text: "deadline", phonetic: "/ˈdedlaɪn/", meaning: "截止时间（名词）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+				item: { type: "word", text: "deadline", phonetic: "/ˈdedlaɪn/", meaning: "截止时间（名词，义项线索）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
 		]);
@@ -818,13 +823,13 @@ test("replacement critic rejection preserves the FIFO obligation and inserts not
 		registration.setResponses([
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
-				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词，义项线索）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "reject" }], summary: "rejected" })),
 			// Basic-vocabulary fallback round: also rejected, queue still preserved.
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
-				item: { type: "word", text: "morning", phonetic: "", meaning: "早晨（名词）", example: "Good morning.", example_cn: "早上好。" },
+				item: { type: "word", text: "morning", phonetic: "", meaning: "早晨（名词，义项线索）", example: "Good morning.", example_cn: "早上好。" },
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "reject" }], summary: "rejected" })),
 		]);
@@ -861,7 +866,7 @@ test("conversation changes during replacement critique make the result stale", {
 		registration.setResponses([
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
-				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词，义项线索）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
 			})),
 			async () => { criticStarted(); await gate; return fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })); },
 		]);
@@ -902,7 +907,7 @@ test("successful refill clears stale future pacing and shows a newly due review 
 		registration.setResponses([
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
-				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词，义项线索）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
 			})),
 			async () => { criticStarted(); await gate; return fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })); },
 		]);
@@ -1018,16 +1023,16 @@ function insertDueWord(db: DatabaseSync, text: string, meaning: string) {
 
 function lessonItems() {
 	const words: { type: string; text: string; phonetic: string; meaning: string; example: string; example_cn: string }[] = [
-		{ type: "word", text: "coordinate", phonetic: "/koʊˈɔːrdɪneɪt/", meaning: "协调（动词）", example: "We coordinate shared work.", example_cn: "我们协调共享工作。" },
-		{ type: "word", text: "commit", phonetic: "/kəˈmɪt/", meaning: "提交（动词）", example: "They commit the change.", example_cn: "他们提交了改动。" },
-		{ type: "word", text: "persist", phonetic: "/pərˈsɪst/", meaning: "持久化（动词）", example: "We persist the data.", example_cn: "我们持久化数据。" },
-		{ type: "word", text: "refresh", phonetic: "/rɪˈfreʃ/", meaning: "刷新（动词）", example: "The view will refresh.", example_cn: "视图会刷新。" },
-		{ type: "word", text: "merge", phonetic: "/mɜːrdʒ/", meaning: "合并（动词）", example: "I merge both branches.", example_cn: "我合并两个分支。" },
-		{ type: "word", text: "expire", phonetic: "/ɪkˈspaɪər/", meaning: "过期（动词）", example: "The lease will expire.", example_cn: "租约会过期。" },
-		{ type: "word", text: "claim", phonetic: "/kleɪm/", meaning: "认领（动词）", example: "One client must claim the lock.", example_cn: "只能有一个客户端认领锁。" },
-		{ type: "phrase", text: "single source of truth", phonetic: "", meaning: "唯一事实来源（名词短语）", example: "SQLite is the single source of truth.", example_cn: "SQLite 是唯一事实来源。" },
-		{ type: "phrase", text: "take effect", phonetic: "", meaning: "生效（动词短语）", example: "The fix will take effect.", example_cn: "修复会生效。" },
-		{ type: "phrase", text: "in flight", phonetic: "", meaning: "进行中（介词短语）", example: "The request is in flight.", example_cn: "请求进行中。" },
+		{ type: "word", text: "coordinate", phonetic: "/koʊˈɔːrdɪneɪt/", meaning: "协调（动词，义项线索）", example: "We coordinate shared work.", example_cn: "我们协调共享工作。" },
+		{ type: "word", text: "commit", phonetic: "/kəˈmɪt/", meaning: "提交（动词，义项线索）", example: "They commit the change.", example_cn: "他们提交了改动。" },
+		{ type: "word", text: "persist", phonetic: "/pərˈsɪst/", meaning: "持久化（动词，义项线索）", example: "We persist the data.", example_cn: "我们持久化数据。" },
+		{ type: "word", text: "refresh", phonetic: "/rɪˈfreʃ/", meaning: "刷新（动词，义项线索）", example: "The view will refresh.", example_cn: "视图会刷新。" },
+		{ type: "word", text: "merge", phonetic: "/mɜːrdʒ/", meaning: "合并（动词，义项线索）", example: "I merge both branches.", example_cn: "我合并两个分支。" },
+		{ type: "word", text: "expire", phonetic: "/ɪkˈspaɪər/", meaning: "过期（动词，义项线索）", example: "The lease will expire.", example_cn: "租约会过期。" },
+		{ type: "word", text: "claim", phonetic: "/kleɪm/", meaning: "认领（动词，义项线索）", example: "One client must claim the lock.", example_cn: "只能有一个客户端认领锁。" },
+		{ type: "phrase", text: "single source of truth", phonetic: "", meaning: "唯一事实来源（名词短语，义项线索）", example: "SQLite is the single source of truth.", example_cn: "SQLite 是唯一事实来源。" },
+		{ type: "phrase", text: "take effect", phonetic: "", meaning: "生效（动词短语，义项线索）", example: "The fix will take effect.", example_cn: "修复会生效。" },
+		{ type: "phrase", text: "in flight", phonetic: "", meaning: "进行中（介词短语，义项线索）", example: "The request is in flight.", example_cn: "请求进行中。" },
 	];
 	const cloze = {
 		type: "cloze", text: "The fix that ___ (commit) this morning won't take effect until you reload.", phonetic: "", meaning: "was committed",
@@ -1726,8 +1731,8 @@ test("adaptive new-card mode starts at 17 without manual quota changes", { concu
 		}
 		db.close();
 
+		await fake.fire();
 		for (let index = 1; index <= 17; index++) {
-			await fake.fire();
 			assert.match(harness.widget().join(" "), new RegExp(`自适应-${index}`));
 			await harness.commands["anki:good"].handler("", harness.ctx);
 		}
@@ -1791,11 +1796,11 @@ test("today remaining counts due cards plus only the available new-card quota", 
 		const tomorrow = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1).toISOString();
 		const due = Number((after.prepare("SELECT COUNT(*) AS n FROM items WHERE shown=1 AND due_at < ?").get(tomorrow) as any).n);
 		after.close();
-		assert.deepEqual({ planned, queued }, { planned: 1, queued: 2 });
+		assert.deepEqual({ planned, queued }, { planned: 2, queued: 1 });
 		assert.match(
 			harness.widget().join(" "),
-			new RegExp(`今日剩余卡片（复习 ${due} · 新卡 1）`),
-			"status separates cards still due later today from one quota-eligible new card",
+			new RegExp(`今日剩余卡片（复习 ${due}）`),
+			"the immediately activated new card consumes the final quota slot; the remaining hidden card is excluded",
 		);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -1834,8 +1839,8 @@ test("dailyNewLimit zero allows every queued planned card to surface", { concurr
 		const db = openTestDb();
 		for (const [text, meaning] of [["one", "一"], ["two", "二"], ["three", "三"]]) insertDueWord(db, text, meaning);
 		db.close();
+		await fake.fire();
 		for (const [text, meaning] of [["one", "一"], ["two", "二"], ["three", "三"]]) {
-			await fake.fire(fake.active().find((timer) => timer.delay === 0) ?? fake.active()[0]);
 			assert.match(harness.widget().join(" "), new RegExp(meaning));
 			assert.doesNotMatch(harness.widget().join(" "), new RegExp(text));
 			if (text !== "three") await harness.commands["anki:good"].handler("", harness.ctx);
@@ -2116,12 +2121,12 @@ test("basic-vocabulary fallback rescues a rejected replacement", { concurrency: 
 		registration.setResponses([
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
-				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
+				item: { type: "word", text: "deadline", phonetic: "", meaning: "截止时间（名词，义项线索）", example: "The deadline is tomorrow.", example_cn: "截止时间是明天。" },
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: false, issues: [{ severity: "blocker", category: "natural", description: "reject" }], summary: "rejected" })),
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
-				item: { type: "word", text: "morning", phonetic: "", meaning: "早晨（名词）", example: "Good morning.", example_cn: "早上好。" },
+				item: { type: "word", text: "morning", phonetic: "", meaning: "早晨（名词，义项线索）", example: "Good morning.", example_cn: "早上好。" },
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
 		]);
@@ -2679,7 +2684,7 @@ test("manual teach requests queue behind an in-flight generation", { concurrency
 				await firstGate;
 				return fauxAssistantMessage(JSON.stringify({ ready: false, reason: "gated" }));
 			},
-			fauxAssistantMessage(lessonResponse("queued lesson")),
+			fauxAssistantMessage(manualLessonResponse("queued lesson")),
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
@@ -2699,7 +2704,7 @@ test("manual teach requests queue behind an in-flight generation", { concurrency
 		const active = db.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
 		db.close();
 		assert.ok(n > 0, "queued teach generated and inserted after the busy generation finished");
-		assert.ok(active.active_item_id != null, "the first queued card was activated");
+		assert.equal(active.active_item_id, null, "manual batch is retained while normal study pacing still delays activation");
 		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
 	} finally {
 		registration.unregister();
@@ -2711,11 +2716,11 @@ test("teach retries generation when the batch duplicates existing cards", { conc
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-teach-duplicate-retry" });
 	const word = (text: string, meaning: string) => ({
-		type: "word", text, phonetic: "", meaning: `${meaning}（名词）`,
+		type: "word", text, phonetic: "", meaning: `${meaning}（名词，义项线索）`,
 		example: `We review the word ${text} today.`, example_cn: "例句翻译",
 	});
 	const phrase = (text: string, meaning: string) => ({
-		type: "phrase", text, phonetic: "", meaning: `${meaning}（动词短语）`,
+		type: "phrase", text, phonetic: "", meaning: `${meaning}（动词短语，义项线索）`,
 		example: `They use the phrase ${text} here.`, example_cn: "例句翻译",
 	});
 	const cloze = () => ({
@@ -3064,8 +3069,7 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		const inFlight = a.commands["anki:answer"].handler("alph", a.ctx);
 		await started;
 		await b.commands["anki:good"].handler("", b.ctx); // B rates alpha.
-		assert.ok(fake.active().some((timer) => timer.delay === 0), "next due card is scheduled immediately");
-		await fake.fire(fake.active().find((timer) => timer.delay === 0)); // B advances the global slot to beta.
+		assert.match(b.widget().join(" "), /贝塔/, "B immediately advances the global slot before the old evaluation returns");
 		releaseResponse();
 		await inFlight;
 		const check = openTestDb();
@@ -3177,7 +3181,7 @@ test("a sentence hint invalidates an in-flight clean evaluation", { concurrency:
 	}
 });
 
-test("wrong-answer teaching remains visible before the next due card", { concurrency: false }, async () => {
+test("manual Again immediately advances to the next due card without a feedback lock", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
@@ -3189,9 +3193,13 @@ test("wrong-answer teaching remains visible before the next due card", { concurr
 		db.close();
 		await fake.fire();
 		await harness.commands["anki:again"].handler("", harness.ctx);
-		assert.match(harness.widget().join(" "), /没关系，待会儿再考你一次/, "Again feedback is rendered");
-		assert.equal(fake.active().length, 1);
-		assert.ok(fake.active()[0].delay >= 14_900 && fake.active()[0].delay <= 15_000, "feedback gets a readable grace period");
+		assert.match(harness.widget().join(" "), /贝塔/, "the next due card is immediately usable");
+		const check = openTestDb();
+		assert.equal(check.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
+		assert.ok(Date.parse(String(check.prepare("SELECT due_at FROM direction_state WHERE item_id=1 AND direction='forward'").get()?.due_at)) > Date.now(), "Again still schedules the failed direction for a future review");
+		assert.equal(check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id=1 AND explicit_rating='again'").get()?.n, 1);
+		check.close();
+		assert.equal(fake.active().length, 0, "no timer locks the next stored card");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -3210,10 +3218,8 @@ test("Anki-style: correct rating immediately surfaces the next due card", { conc
 		db.close();
 		await fake.fire(); // surface first due card
 		assert.match(a.widget().join(" "), /阿尔法|贝塔/, "first card shown");
-		await a.commands["anki:good"].handler("", a.ctx); // correct rating -> scheduleTimer(0)
-		assert.equal(fake.active().length, 1);
-		assert.equal(fake.active()[0].delay, 0, "command handler must not overwrite the immediate timer");
-		await fake.fire(); // immediate next-card tick
+		await a.commands["anki:good"].handler("", a.ctx);
+		assert.equal(fake.active().length, 0, "the rating command directly claims existing inventory");
 		const w = a.widget().join(" ");
 		assert.ok(/阿尔法|贝塔/.test(w), "next due card surfaced without waiting");
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
@@ -3448,7 +3454,7 @@ test("manual /anki:good is recorded as a conservative self-report, not objective
 		const attempt = check.prepare("SELECT kind, status, explicit_rating, assistance_level, question_text FROM attempts WHERE item_id = 1").get() as any;
 		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写单词「香蕉」的英文" });
+		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写单词「香蕉」的英文（以 b 开头）" });
 		assert.deepEqual({ ...mastery }, { stage: "exposure", unassisted_good: 0, assisted_good: 0 }, "self-report produces no objective evidence");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -3540,7 +3546,6 @@ test("meaning-colliding forward reviews show target cues and matching audit snap
 		check.close();
 		assert.equal(attempt.question_text, "默写单词「预订」的英文（以 b 开头；例：I want to ____ a table for two.）");
 
-		await fake.fire();
 		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（以 r 开头；例：I want to _______ a table for two\.）/);
 		await harness.commands["anki:answer"].handler("reserve", harness.ctx);
 		check = openTestDb();
@@ -3553,24 +3558,41 @@ test("meaning-colliding forward reviews show target cues and matching audit snap
 	}
 });
 
-test("non-colliding forward reviews keep the bare prompt", { concurrency: false }, async () => {
+test("unique forward reviews with a POS-plus-clue meaning keep the bare prompt", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
 		const harness = await makeSession({ sessionId: "unambiguous-word" });
 		const db = openTestDb();
-		db.prepare("INSERT INTO items(type,text,meaning,example,learned_at,due_at,shown) VALUES('word','apple','苹果',?,?,?,1)")
+		db.prepare("INSERT INTO items(type,text,meaning,example,learned_at,due_at,shown) VALUES('word','apple','苹果（可数名词，一种常见水果）',?,?,?,1)")
 			.run("I eat an apple every day.", new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
 		const shown = harness.widget().join(" ");
-		assert.match(shown, /默写单词「苹果」的英文/);
+		assert.match(shown, /默写单词「苹果（可数名词，一种常见水果）」的英文/);
 		assert.doesNotMatch(shown, /以 . 开头/);
 		await harness.commands["anki:answer"].handler("apple", harness.ctx);
 		const check = openTestDb();
 		const attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 1 ORDER BY id DESC LIMIT 1").get() as any;
 		check.close();
-		assert.equal(attempt.question_text, "默写单词「苹果」的英文");
+		assert.equal(attempt.question_text, "默写单词「苹果（可数名词，一种常见水果）」的英文");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("thin unique forward reviews still show letter and masked-example context", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		const harness = await makeSession({ sessionId: "thin-unique-word" });
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,example,learned_at,due_at,shown) VALUES('word','apple','苹果',?,?,?,1)")
+			.run("I eat an apple every day.", new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /默写单词「苹果」的英文（以 a 开头；例：I eat an _____ every day\.）/);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -3580,7 +3602,7 @@ test("non-colliding forward reviews keep the bare prompt", { concurrency: false 
 // -- /anki:add custom queue release (harness level) ------------------------
 
 function queueWord(text: string, meaning: string) {
-	return { type: "word", text, phonetic: "/x/", meaning: `${meaning}（名词）`, example: `The ${text} helps.`, example_cn: `${meaning}有帮助。` };
+	return { type: "word", text, phonetic: "/x/", meaning: `${meaning}（名词，义项线索）`, example: `The ${text} helps.`, example_cn: `${meaning}有帮助。` };
 }
 
 function queueCloze() {
@@ -3873,7 +3895,7 @@ test("after a custom release, the remaining quota triggers a partial lesson batc
 			ready: true,
 			topic: "aviation",
 			items: ["aviation", "cockpit", "turbulence", "altitude", "runway", "hangar", "taxiway", "beacon", "vector"].map((text) => ({
-				type: "word", text, phonetic: "/x/", meaning: `词 ${text}（名词）`,
+				type: "word", text, phonetic: "/x/", meaning: `词 ${text}（名词，义项线索）`,
 				example: `The ${text} matters.`, example_cn: `${text} 很重要。`,
 			})),
 		});
@@ -3892,7 +3914,7 @@ test("after a custom release, the remaining quota triggers a partial lesson batc
 
 		await fake.fire(); // release: alpha activated (teach).
 		await harness.commands["anki:good"].handler("", harness.ctx);
-		await fake.fire(); // beta claimed as a custom new card.
+		assert.match(harness.widget().join(" "), /贝塔/, "rating alpha immediately claims the next stored custom card");
 		await harness.commands["anki:good"].handler("", harness.ctx);
 		// The rating pushed the pacing window to the next interval; simulate the
 		// elapsed interval so the deferred partial-batch generation can run.
@@ -3930,8 +3952,8 @@ test("/anki:add enqueues critic-approved cards and releases the first one immedi
 			fauxAssistantMessage(JSON.stringify({
 				ready: true,
 				items: [
-					{ type: "word", text: "napkin", phonetic: "/ˈnæpkɪn/", meaning: "餐巾（名词）", example: "Please hand me a napkin.", example_cn: "请递给我一张餐巾。" },
-					{ type: "word", text: "receipt", phonetic: "/rɪˈsiːt/", meaning: "收据（名词）", example: "Keep the receipt for returns.", example_cn: "退货要保留收据。" },
+					{ type: "word", text: "napkin", phonetic: "/ˈnæpkɪn/", meaning: "餐巾（名词，义项线索）", example: "Please hand me a napkin.", example_cn: "请递给我一张餐巾。" },
+					{ type: "word", text: "receipt", phonetic: "/rɪˈsiːt/", meaning: "收据（名词，义项线索）", example: "Keep the receipt for returns.", example_cn: "退货要保留收据。" },
 				],
 			})),
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
@@ -3978,7 +4000,7 @@ test("background replacements drain FIFO with an active card and do not change i
 	const registration = registerFauxProvider({ provider: "kaomoji-background-replacement" });
 	try {
 		registration.setResponses(["morning", "evening"].flatMap((text) => [
-			fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text, meaning: text === "morning" ? "早晨（名词）" : "傍晚（名词）", example: `Good ${text}.`, example_cn: "你好。" } })),
+			fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text, meaning: text === "morning" ? "早晨（名词，义项线索）" : "傍晚（名词，义项线索）", example: `Good ${text}.`, example_cn: "你好。" } })),
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
 		]));
 		const { model, registry } = fauxModelRegistry(registration);
@@ -4020,7 +4042,7 @@ test("background replacement rejection retries empty RPC context after cooldown 
 	try {
 		registration.setResponses([
 			fauxAssistantMessage(JSON.stringify({ ready: false, reason: "try later" })),
-			fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text: "morning", meaning: "早晨（名词）", example: "Good morning.", example_cn: "早上好。" } })),
+			fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text: "morning", meaning: "早晨（名词，义项线索）", example: "Good morning.", example_cn: "早上好。" } })),
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
@@ -4062,7 +4084,7 @@ test("two sessions share one background replacement lease", { concurrency: false
 	const gate = new Promise<void>((resolve) => { release = resolve; });
 	try {
 		registration.setResponses([
-			async () => { await gate; return fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text: "morning", meaning: "早晨（名词）", example: "Good morning.", example_cn: "早上好。" } })); },
+			async () => { await gate; return fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text: "morning", meaning: "早晨（名词，义项线索）", example: "Good morning.", example_cn: "早上好。" } })); },
 			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
@@ -4100,7 +4122,7 @@ test("direct skip completion cancels the worker busy cooldown and immediately co
 	let started!: () => void;
 	const gate = new Promise<void>((resolve) => { release = resolve; });
 	const generating = new Promise<void>((resolve) => { started = resolve; });
-	const generated = (text: string) => fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text, meaning: text === "morning" ? "早晨（名词）" : "傍晚（名词）", example: `Good ${text}.`, example_cn: "你好。" } }));
+	const generated = (text: string) => fauxAssistantMessage(JSON.stringify({ ready: true, item: { type: "word", text, meaning: text === "morning" ? "早晨（名词，义项线索）" : "傍晚（名词，义项线索）", example: `Good ${text}.`, example_cn: "你好。" } }));
 	try {
 		registration.setResponses([
 			async () => { started(); await gate; return generated("morning"); },
@@ -4135,4 +4157,1053 @@ test("direct skip completion cancels the worker busy cooldown and immediately co
 		assert.equal(registration.state.callCount, 4);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally { release(); registration.unregister(); fake.restore(); }
+});
+
+function manualLessonResponse(topic = "manual vocabulary") {
+	return JSON.stringify({ ready: true, topic, items: lessonItems().slice(0, 5) });
+}
+
+test("desktop RPC fills today's remaining stock in serial batches even with five existing cards, then stays idle across restart", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "desktop-daily-batches" });
+	const previousClient = process.env.IELTS_ANKI_CLIENT;
+	process.env.IELTS_ANKI_CLIENT = "desktop";
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({ ready: true, topic: "batch one", items: lessonItems().slice(0, 10) })),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+			fauxAssistantMessage(JSON.stringify({ ready: true, topic: "batch two", items: [queueWord("morning", "早晨"), queueWord("garden", "花园"), queueWord("window", "窗户")] })),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 18 });
+		const harness = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		const db = openTestDb();
+		for (let i = 0; i < 5; i++) insertDueWord(db, `stored-${i}`, `库存${i}`);
+		db.exec("UPDATE items SET introduction_kind='planned'");
+		const before = db.prepare("SELECT active_item_id,active_version,next_check_at FROM runtime_state").get();
+		await fake.fire(fake.refills()[0]); await fake.flush();
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items WHERE shown=0").get()?.n, 15);
+		assert.equal(fake.refills().length, 1, "the remaining batch is scheduled immediately");
+		await fake.fire(fake.refills()[0]); await fake.flush();
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items WHERE shown=0").get()?.n, 18);
+		assert.equal(registration.state.callCount, 4);
+		const status = JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='auto_refill_status'").get()?.value));
+		assert.equal(status.strategy, "daily"); assert.equal(status.phase, "ready");
+		assert.equal(status.inventory + status.queued, status.target);
+		assert.deepEqual(db.prepare("SELECT active_item_id,active_version,next_check_at FROM runtime_state").get(), before);
+		await fake.firePoll();
+		assert.equal(fake.refills().length, 0);
+		await harness.handlers.session_start({ reason: "reload" }, harness.ctx);
+		assert.equal(fake.refills().length, 0, "reopening does not generate another day-sized batch");
+		assert.equal(registration.state.callCount, 4);
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally { if (previousClient == null) delete process.env.IELTS_ANKI_CLIENT; else process.env.IELTS_ANKI_CLIENT = previousClient; registration.unregister(); fake.restore(); }
+});
+
+test("desktop daily save rechecks a smaller remaining quota after another session introduces cards", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "desktop-daily-concurrent" });
+	const previousClient = process.env.IELTS_ANKI_CLIENT;
+	process.env.IELTS_ANKI_CLIENT = "desktop";
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	try {
+		registration.setResponses([async () => { await gate; return fauxAssistantMessage(manualLessonResponse()); }, fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 5 });
+		const harness = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		const db = openTestDb();
+		await fake.fire(fake.refills()[0]);
+		for (let i = 0; i < 3; i++) insertDueWord(db, `introduced-${i}`, `已学${i}`);
+		db.prepare("UPDATE items SET shown=1,introduction_kind='planned',introduced_at=?").run(new Date().toISOString());
+		release(); await fake.flush(); await fake.flush();
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items WHERE shown=0").get()?.n, 2);
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items").get()?.n, 5);
+		assert.equal(fake.refills().length, 0);
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally { release(); if (previousClient == null) delete process.env.IELTS_ANKI_CLIENT; else process.env.IELTS_ANKI_CLIENT = previousClient; registration.unregister(); fake.restore(); }
+});
+
+test("a newer desktop session supersedes a late daily batch without duplicating inventory", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "desktop-daily-takeover" });
+	const previousClient = process.env.IELTS_ANKI_CLIENT;
+	process.env.IELTS_ANKI_CLIENT = "desktop";
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	try {
+		registration.setResponses([
+			async () => { await gate; return fauxAssistantMessage(manualLessonResponse()); },
+			fauxAssistantMessage(manualLessonResponse()),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 5 });
+		const a = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		await fake.fire(fake.refills()[0]);
+		const b = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		await fake.fire(fake.refills()[0]); await fake.flush();
+		release(); await fake.flush(); await fake.flush();
+		const db = openTestDb();
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items").get()?.n, 5);
+		assert.equal(JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='auto_refill_status'").get()?.value)).phase, "ready");
+		db.close();
+		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+	} finally { release(); if (previousClient == null) delete process.env.IELTS_ANKI_CLIENT; else process.env.IELTS_ANKI_CLIENT = previousClient; registration.unregister(); fake.restore(); }
+});
+
+test("a desktop environment marker alone does not enable background preparation in CLI mode", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const previousClient = process.env.IELTS_ANKI_CLIENT;
+	process.env.IELTS_ANKI_CLIENT = "desktop";
+	try {
+		const harness = await createHarness();
+		assert.equal(fake.refills().length, 0);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally { if (previousClient == null) delete process.env.IELTS_ANKI_CLIENT; else process.env.IELTS_ANKI_CLIENT = previousClient; fake.restore(); }
+});
+
+test("desktop daily failure keeps prepared cards and retries only the missing batch after thirty seconds", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "desktop-daily-retry" });
+	const previousClient = process.env.IELTS_ANKI_CLIENT;
+	const realDateNow = Date.now;
+	process.env.IELTS_ANKI_CLIENT = "desktop";
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({ ready: true, topic: "batch one", items: lessonItems().slice(0, 10) })),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+			fauxAssistantMessage(JSON.stringify({ ready: false, reason: "temporary refusal" })),
+			fauxAssistantMessage(JSON.stringify({ ready: true, topic: "batch two", items: [queueWord("morning", "早晨"), queueWord("garden", "花园"), queueWord("window", "窗户")] })),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 13 });
+		const harness = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		const db = openTestDb();
+		await fake.fire(fake.refills()[0]); await fake.flush();
+		await fake.fire(fake.refills()[0]); await fake.flush();
+		const waiting = JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='auto_refill_status'").get()?.value));
+		assert.equal(waiting.phase, "retry_wait");
+		assert.equal(waiting.inventory, 10); assert.equal(waiting.target, 13);
+		assert.ok(Date.parse(waiting.retryAt) - Date.now() > 29_000);
+		await fake.firePoll();
+		assert.equal(fake.refills().length, 0);
+		Date.now = () => Date.parse(waiting.retryAt) + 1;
+		await fake.firePoll();
+		await fake.fire(fake.refills()[0]); await fake.flush();
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items WHERE shown=0").get()?.n, 13);
+		assert.equal(registration.state.callCount, 5);
+		assert.equal(JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='auto_refill_status'").get()?.value)).phase, "ready");
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally { Date.now = realDateNow; if (previousClient == null) delete process.env.IELTS_ANKI_CLIENT; else process.env.IELTS_ANKI_CLIENT = previousClient; registration.unregister(); fake.restore(); }
+});
+
+test("RPC automatically stocks five cards during reviews without changing the active card or study history", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "auto-stock-review" });
+	try {
+		registration.setResponses([fauxAssistantMessage(manualLessonResponse()), fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 18 });
+		const harness = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		const db = openTestDb();
+		for (let i = 0; i < 36; i++) insertDueWord(db, `review-${i}`, `复习${i}`);
+		db.exec("UPDATE items SET shown=1,reviews=1; UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=7,next_check_at='2099-01-01T00:00:00.000Z' WHERE id=1");
+		const beforeState = db.prepare("SELECT active_item_id,active_version,next_check_at FROM runtime_state").get();
+		const beforeItems = db.prepare("SELECT * FROM items").all();
+		await fake.fire(fake.refills()[0]);
+		await fake.flush();
+		assert.equal(registration.state.callCount, 2);
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items WHERE shown=0 AND introduced_at IS NULL").get()?.n, 5);
+		assert.deepEqual(db.prepare("SELECT active_item_id,active_version,next_check_at FROM runtime_state").get(), beforeState);
+		assert.deepEqual(db.prepare("SELECT * FROM items WHERE id<=36").all(), beforeItems);
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM attempts").get()?.n, 0);
+		assert.equal(JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='auto_refill_status'").get()?.value)).phase, "ready");
+		await fake.firePoll();
+		assert.equal(fake.refills().length, 0, "a stocked reserve does not generate repeatedly");
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally { registration.unregister(); fake.restore(); }
+});
+
+test("RPC refill failure publishes a retry without delaying due reviews", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "auto-stock-failure" });
+	try {
+		registration.setResponses([fauxAssistantMessage(JSON.stringify({ ready: false, reason: "temporary refusal" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 5 });
+		const harness = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		const db = openTestDb();
+		insertDueWord(db, "review-retry", "复习");
+		db.exec("UPDATE items SET shown=1,reviews=1");
+		const pacing = db.prepare("SELECT next_check_at FROM runtime_state").get();
+		await fake.fire(fake.refills()[0]);
+		await fake.flush();
+		const status = JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='auto_refill_status'").get()?.value));
+		assert.equal(status.phase, "retry_wait");
+		assert.ok(Date.parse(status.retryAt) > Date.now());
+		assert.deepEqual(db.prepare("SELECT next_check_at FROM runtime_state").get(), pacing);
+		await fake.fire();
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 1);
+		assert.equal(registration.state.callCount, 1);
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally { registration.unregister(); fake.restore(); }
+});
+
+test("RPC refill discards a late batch after another session uses today's quota", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "auto-stock-quota" });
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	try {
+		registration.setResponses([async () => { await gate; return fauxAssistantMessage(manualLessonResponse()); }, fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 5 });
+		const harness = await makeSession({ model, modelRegistry: registry, mode: "rpc", branch: [] });
+		const db = openTestDb();
+		await fake.fire(fake.refills()[0]);
+		for (let i = 0; i < 5; i++) insertDueWord(db, `introduced-${i}`, `已学${i}`);
+		db.prepare("UPDATE items SET shown=1,introduction_kind='planned',introduced_at=?").run(new Date().toISOString());
+		release();
+		await fake.flush();
+		await fake.flush();
+		assert.equal(db.prepare("SELECT COUNT(*) n FROM items").get()?.n, 5);
+		assert.equal(JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='auto_refill_status'").get()?.value)).phase, "quota_reached");
+		db.close();
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally { release(); registration.unregister(); fake.restore(); }
+});
+function manualBadQualityResponse() {
+	const lesson = JSON.parse(manualLessonResponse());
+	lesson.items[0].meaning = "协调";
+	return JSON.stringify(lesson);
+}
+
+// Manual preparation is inventory work; its dedicated receipt is the UI contract.
+const manualId = (n: number) => `11111111-1111-4111-8111-${String(n).padStart(12, "0")}`;
+function manualReceipt(db: DatabaseSync, n: number): any {
+	const raw = db.prepare("SELECT value FROM stats WHERE key=?").get(`teach_request:${manualId(n)}`) as any;
+	return raw ? JSON.parse(raw.value) : undefined;
+}
+async function settleManual(fake: ReturnType<typeof installFakeTimers>, db: DatabaseSync, n: number) {
+	for (let i = 0; i < 20; i++) {
+		const receipt = manualReceipt(db, n);
+		if (receipt?.phase === "succeeded" || receipt?.phase === "failed") return receipt;
+		await fake.flush();
+	}
+	assert.fail(`manual request did not settle: ${JSON.stringify(manualReceipt(db, n))}`);
+}
+
+test("manual preparation saves new inventory with active card, full quota, due review and replacement pending", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-inventory" });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		registration.setResponses([fauxAssistantMessage(manualLessonResponse()), fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		insertDueWord(db, "existing", "现有的（形容词）");
+		insertDueWord(db, "reservoir", "水库（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1, introduction_kind='planned', introduced_at=?, reviews=4 WHERE id=1").run(new Date().toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=1, active_kind='review', active_direction='reverse', active_version=17, next_check_at='2099-01-01T00:00:00.000Z' WHERE id=1").run();
+		db.prepare("INSERT INTO stats(key,value) VALUES('pending_replacements','[\"word\"]')").run();
+		db.prepare("INSERT INTO attempts(id,item_id,review_cycle_id,claim_key,question_version,evaluation_version,kind,assistance_level,status,started_at) VALUES('attempt-before',1,'cycle-before','claim-before',1,1,'review','none','self_report',?)").run(new Date().toISOString());
+		const oldItems = db.prepare("SELECT * FROM items ORDER BY id").all();
+		const oldAttempts = db.prepare("SELECT * FROM attempts").all();
+		const studyState = () => {
+			const state = { ...db!.prepare("SELECT * FROM runtime_state").get() };
+			for (const field of ["coordinator", "coordinator_until", "generation_token", "generation_until", "last_activity"]) delete state[field];
+			return state;
+		};
+		const before = studyState();
+		const capturedStart = capturedLlmContexts.length;
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(1)} 旅行 日常交流`, s.ctx);
+		const receipt = await settleManual(fake, db, 1);
+		assert.equal(receipt.phase, "succeeded", JSON.stringify(receipt));
+		assert.equal(receipt.itemsAdded, 5);
+		assert.equal(receipt.topic, "旅行 日常交流");
+		assert.deepEqual(receipt.itemIds, db.prepare("SELECT id FROM items WHERE id>2 ORDER BY id").all().map(row => row.id));
+		assert.deepEqual(db.prepare("SELECT * FROM items WHERE id<=2 ORDER BY id").all(), oldItems);
+		assert.deepEqual(db.prepare("SELECT * FROM attempts").all(), oldAttempts);
+		assert.deepEqual(studyState(), before);
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM items WHERE id>2 AND shown=0 AND introduced_at IS NULL").get()?.n, 5);
+		assert.equal(db.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get()?.value, '["word"]');
+		const contexts = capturedLlmContexts.slice(capturedStart);
+		assert.equal(contexts.length, 2);
+		for (const context of contexts) assert.match(context, /reservoir/, "generator and critic include unshown inventory");
+		assert.match(contexts[0], /必须生成 ready:true/);
+		assert.match(contexts[0], /立即生成指定数量的新卡/);
+		assert.doesNotMatch(contexts[0], /信息不足时宁可等待/);
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(1)} duplicate delivery`, s.ctx);
+		await fake.flush();
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM items").get()?.n, 7);
+		assert.deepEqual(manualReceipt(db, 1), receipt);
+		assert.equal(manualReceipt(db, 999), undefined, "global successful generation does not invent another request receipt");
+	} finally {
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("manual preparation queue wakes on poll despite active card and disabled automatic timer", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-poll" });
+	let a: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let b: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		registration.setResponses([fauxAssistantMessage(manualLessonResponse()), fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1, verbose: true });
+		a = await makeSession({ model, modelRegistry: registry });
+		b = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		insertDueWord(db, "existing", "现有的（形容词）");
+		db.prepare("UPDATE items SET shown=1,introduction_kind='planned',introduced_at=? WHERE id=1").run(new Date().toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=9,generation_token='foreign',generation_until=?,coordinator='foreign',coordinator_until=?").run(new Date(Date.now()+300_000).toISOString(), new Date(Date.now()+300_000).toISOString());
+		const start = capturedLlmContexts.length;
+		const notesBefore = [a.notifications().slice(), b.notifications().slice()];
+		await a.commands["anki:teach"].handler(`--request-id ${manualId(2)} 排队备课`, a.ctx);
+		await b.commands["anki:teach"].handler(`--request-id ${manualId(2)} 同号重复`, b.ctx);
+		assert.equal(manualReceipt(db, 2).phase, "queued");
+		assert.equal(capturedLlmContexts.length, start);
+		db.prepare("UPDATE stats SET value='ok: unrelated auto batch' WHERE key='last_gen_status'").run();
+		await fake.firePoll();
+		assert.equal(manualReceipt(db, 2).phase, "queued");
+		db.prepare("UPDATE runtime_state SET generation_token=NULL,generation_until=NULL").run();
+		await fake.firePoll();
+		const receipt = await settleManual(fake, db, 2);
+		assert.equal(receipt.phase, "succeeded", JSON.stringify(receipt));
+		assert.equal(receipt.itemsAdded, 5);
+		await fake.firePoll();
+		assert.deepEqual([a.notifications(), b.notifications()], notesBefore, "queued receipt updates stay out of the generic learning notification channel");
+		assert.equal(capturedLlmContexts.length - start, 2, "same id accepted by exactly one runtime");
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM items").get()?.n, 6);
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 1);
+	} finally {
+		if (a) await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		if (b) await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("manual preparation survives conversation changes and renews its healthy pipeline lease", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-lease" });
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		registration.setResponses([async () => { await gate; return fauxAssistantMessage(manualLessonResponse()); }, fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		const branch = [{ type: "message", message: { role: "user", content: [{ type: "text", text: "original topic" }] } }];
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession({ model, modelRegistry: registry, branch });
+		db = openTestDb();
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(3)} explicit topic`, s.ctx);
+		await fake.flush();
+		assert.equal(manualReceipt(db, 3).phase, "generating");
+		const token = db.prepare("SELECT generation_token FROM runtime_state").get()?.generation_token;
+		db.prepare("UPDATE runtime_state SET generation_until=?").run(new Date(Date.now()+100).toISOString());
+		await fake.firePoll();
+		const state = db.prepare("SELECT generation_token,generation_until FROM runtime_state").get() as any;
+		assert.equal(state.generation_token, token);
+		assert.ok(Date.parse(state.generation_until) - Date.now() > 240_000, "lease is renewed before five-minute expiry");
+		branch[0].message.content[0].text = "unrelated later conversation";
+		release();
+		const receipt = await settleManual(fake, db, 3);
+		assert.equal(receipt.phase, "succeeded", JSON.stringify(receipt));
+		assert.equal(receipt.itemsAdded, 5);
+	} finally {
+		release();
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("manual preparation failure and shutdown publish terminal receipts without pacing or partial cards", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-failure" });
+	let release!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		const nextCheck = db.prepare("SELECT next_check_at FROM runtime_state").get()?.next_check_at;
+		registration.setResponses([fauxAssistantMessage("bad json"), fauxAssistantMessage("bad json"), fauxAssistantMessage("bad json")]);
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(4)} fail`, s.ctx);
+		const failed = await settleManual(fake, db, 4);
+		assert.equal(failed.phase, "failed");
+		assert.equal(failed.errorCode, "BAD_JSON");
+		assert.equal(failed.itemsAdded, 0);
+		assert.equal(db.prepare("SELECT next_check_at FROM runtime_state").get()?.next_check_at, nextCheck);
+		registration.setResponses([async () => { await gate; return fauxAssistantMessage(manualLessonResponse()); }]);
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(5)} interrupted`, s.ctx);
+		await fake.flush();
+		const shuttingDown = s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		assert.equal(manualReceipt(db, 5).phase, "failed");
+		assert.equal(manualReceipt(db, 5).errorCode, "REQUEST_INTERRUPTED");
+		release(); await shuttingDown; await fake.flush();
+		s = undefined;
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM items").get()?.n, 0);
+	} finally {
+		release();
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("manual preparation retries ready:false and exposes checking before success", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-force" });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(JSON.stringify({ ready: false, reason: "no conversation" })),
+			fauxAssistantMessage(manualLessonResponse()),
+			async () => {
+				assert.equal(manualReceipt(db!, 6).phase, "checking");
+				assert.equal(db!.prepare("SELECT COUNT(*) AS n FROM items").get()?.n, 0, "no items before approval");
+				return fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }));
+			},
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		const start = capturedLlmContexts.length;
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(6)} 新批次`, s.ctx);
+		const receipt = await settleManual(fake, db, 6);
+		assert.equal(receipt.phase, "succeeded", JSON.stringify(receipt));
+		assert.equal(receipt.itemsAdded, 5);
+		assert.equal(capturedLlmContexts.length - start, 3);
+	} finally {
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("manual preparation rolls back inserted cards when the success receipt cannot commit", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-atomic" });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		registration.setResponses([fauxAssistantMessage(manualLessonResponse()), fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" }))]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		db.exec(`CREATE TRIGGER reject_success_receipt BEFORE UPDATE OF value ON stats
+			WHEN NEW.key='teach_request:${manualId(7)}' AND json_extract(NEW.value,'$.phase')='succeeded'
+			BEGIN SELECT RAISE(FAIL,'test receipt persistence failure'); END`);
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(7)} rollback`, s.ctx);
+		const receipt = await settleManual(fake, db, 7);
+		assert.equal(receipt.phase, "failed");
+		assert.equal(receipt.itemsAdded, 0);
+		assert.equal(receipt.errorCode, "ERR_SQLITE_ERROR");
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM items").get()?.n, 0);
+		assert.equal(db.prepare("SELECT generation_token FROM runtime_state").get()?.generation_token, null);
+	} finally {
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("manual preparation keeps quality revisions fail closed with a matching receipt", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-quality" });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		registration.setResponses([
+			fauxAssistantMessage(manualBadQualityResponse()),
+			async () => {
+				assert.equal(manualReceipt(db!, 8).phase, "revising");
+				return fauxAssistantMessage(manualBadQualityResponse());
+			},
+			fauxAssistantMessage(manualBadQualityResponse()),
+			fauxAssistantMessage(manualBadQualityResponse()),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1, verbose: true });
+		s = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		const notesBefore = s.notifications().slice();
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(8)} quality`, s.ctx);
+		const receipt = await settleManual(fake, db, 8);
+		assert.equal(receipt.phase, "failed");
+		assert.deepEqual(s.notifications(), notesBefore, "quality rejection is published only to this request receipt");
+		assert.equal(receipt.errorCode, "TEACH_QUALITY_REJECTED");
+		assert.equal(receipt.itemsAdded, 0);
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM items").get()?.n, 0);
+	} finally {
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("manual receipt progress never emits generic notifications while an answer is being judged", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "manual-answer-notify" });
+	let releaseAnswer!: () => void;
+	const gate = new Promise<void>(resolve => { releaseAnswer = resolve; });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	let answer: Promise<void> | undefined;
+	try {
+		registration.setResponses([
+			async () => { await gate; return fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "表达正确" })); },
+			fauxAssistantMessage(manualLessonResponse()),
+			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "approved" })),
+		]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1, verbose: true });
+		s = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		insertDueWord(db, "existing", "现有的（形容词）");
+		db.prepare("UPDATE items SET shown=1 WHERE id=1").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		answer = s.commands["anki:answer"].handler("preexisting", s.ctx);
+		await fake.flush();
+		const notesBefore = s.notifications().slice();
+		await s.commands["anki:teach"].handler(`--request-id ${manualId(9)} parallel lesson`, s.ctx);
+		const receipt = await settleManual(fake, db, 9);
+		assert.equal(receipt.phase, "succeeded", JSON.stringify(receipt));
+		assert.deepEqual(s.notifications(), notesBefore, "receipt-specific generation must not look like an answer rejection");
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attempts").get()?.n, 0, "answer remains pending until its own evaluation returns");
+		releaseAnswer(); await answer; answer = undefined;
+		assert.equal(db.prepare("SELECT verdict FROM attempts WHERE item_id=1").get()?.verdict, "correct");
+	} finally {
+		releaseAnswer(); if (answer) await answer;
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("Again advances stored new cards with automatic checks off while replacement generation is still pending", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "again-next-during-refill" });
+	let release!: () => void;
+	let started!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const running = new Promise<void>(resolve => { started = resolve; });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		registration.setResponses([async () => {
+			started(); await gate;
+			return fauxAssistantMessage(JSON.stringify({ ready: false, reason: "test refill still waiting" }));
+		}]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 2 });
+		s = await makeSession({ model, modelRegistry: registry });
+		db = openTestDb();
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）");
+		insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+		db.prepare("INSERT INTO items(type,text,meaning,status,learned_at,due_at,shown) VALUES('word','known','已会（形容词）','mastered',?,'2099-01-01T00:00:00.000Z',1)").run(new Date().toISOString());
+		db.prepare("UPDATE items SET shown=1,introduction_kind='planned',introduced_at=? WHERE id=1").run(new Date().toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		db.prepare("INSERT INTO stats(key,value) VALUES('pending_replacements','[\"word\"]')").run();
+		await fake.firePoll();
+		const contextsBefore = capturedLlmContexts.length;
+		await fake.fire(fake.replacements()[0]);
+		await running;
+		await s.commands["anki:again"].handler("", s.ctx);
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2, "stored new card is claimed before the unresolved refill returns");
+		assert.equal(db.prepare("SELECT shown FROM items WHERE id=2").get()?.shown, 1);
+		assert.equal(db.prepare("SELECT reviews FROM items WHERE id=1").get()?.reviews, 1);
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id=1 AND explicit_rating='again'").get()?.n, 1);
+		assert.equal(db.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get()?.value, '["word"]');
+		assert.equal(capturedLlmContexts.length - contextsBefore, 1, "advancing inventory performs no model call");
+		assert.match(s.widget().join(" "), /贝塔/);
+		assert.ok(fake.active().every(timer => timer.delay >= 60_000), "only the pending model deadline remains; no next-card grace timer");
+	} finally {
+		release(); await fake.flush();
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); registration.unregister(); fake.restore();
+	}
+});
+
+test("automatic Again immediately advances due inventory while preserving the original answer for each direction", { concurrency: false }, async () => {
+	for (const [type, direction, text, meaning, expected] of [
+		["word", "forward", "alpha", "阿尔法（名词，义项线索）", "alpha"],
+		["phrase", "reverse", "in advance", "提前（副词短语）", "提前（副词短语）"],
+		["cloze", "forward", "She ___ (be) at home yesterday.", "was", "was"],
+	] as const) {
+		const fake = installFakeTimers();
+		const registration = registerFauxProvider({ provider: `again-original-answer-${type}` });
+		let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+		let db: DatabaseSync | undefined;
+		try {
+			registration.setResponses([fauxAssistantMessage(JSON.stringify({ verdict: "incorrect", feedback: "请核对原题答案" }))]);
+			const { model, registry } = fauxModelRegistry(registration);
+			writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+			s = await makeSession({ model, modelRegistry: registry });
+			db = openTestDb();
+			db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduced_at) VALUES(?,?,?,?,?,1,?)").run(type, text, meaning, new Date().toISOString(), new Date(0).toISOString(), new Date().toISOString());
+			db.prepare("UPDATE items SET introduction_kind='planned' WHERE id=1").run();
+			insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+			db.prepare("UPDATE items SET shown=1 WHERE id=2").run();
+			db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_direction=?,active_version=1").run(direction);
+			await s.commands["anki:answer"].handler("wrong answer", s.ctx);
+			assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2, `${type}: due review remains eligible despite full new quota`);
+			const attempt = db.prepare("SELECT item_id,verdict,explicit_rating,feedback_json FROM attempts").get() as any;
+			assert.equal(attempt.item_id, 1);
+			assert.equal(attempt.verdict, "incorrect");
+			assert.equal(attempt.explicit_rating, "again");
+			assert.equal(JSON.parse(attempt.feedback_json).correctedAnswer, expected, "correction stays bound to the old card after B is activated");
+			assert.equal(db.prepare("SELECT reviews FROM items WHERE id=1").get()?.reviews, 1);
+			assert.equal(db.prepare("SELECT reviews FROM items WHERE id=2").get()?.reviews, 0);
+			assert.equal(fake.active().length, 0);
+		} finally {
+			if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+			db?.close(); registration.unregister(); fake.restore();
+		}
+	}
+});
+
+test("Again does not mistake replacement backlog or quota-blocked or future cards for ready inventory", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		s = await makeSession();
+		db = openTestDb();
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）");
+		insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+		insertDueWord(db, "gamma", "伽马（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1,introduction_kind='planned',introduced_at=? WHERE id=1").run(new Date().toISOString());
+		db.prepare("UPDATE items SET shown=1,due_at='2099-01-01T00:00:00.000Z' WHERE id=3").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		db.prepare("INSERT INTO stats(key,value) VALUES('pending_replacements','[\"word\"]')").run();
+		await s.commands["anki:again"].handler("", s.ctx);
+		const state = db.prepare("SELECT active_item_id,next_check_at FROM runtime_state").get() as any;
+		assert.equal(state.active_item_id, null);
+		assert.ok(Date.parse(state.next_check_at) - Date.now() > 590_000, "no stored eligible card preserves the normal automatic interval");
+		assert.equal(db.prepare("SELECT shown FROM items WHERE id=2").get()?.shown, 0, "new-card daily quota is respected");
+		assert.equal(db.prepare("SELECT due_at FROM items WHERE id=3").get()?.due_at, "2099-01-01T00:00:00.000Z", "future review is untouched");
+		assert.match(s.widget().join(" "), /没关系，待会儿再考你一次/);
+		assert.ok(fake.active()[0].delay > 590_000);
+	} finally {
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); fake.restore();
+	}
+});
+
+test("a stale second manual Again cannot rate the newly claimed card", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	let a: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let b: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		a = await makeSession(); b = await makeSession();
+		db = openTestDb();
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）");
+		insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		await fake.firePoll();
+		await a.commands["anki:again"].handler("", a.ctx);
+		await b.commands["anki:again"].handler("", b.ctx);
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attempts").get()?.n, 1);
+		assert.deepEqual(db.prepare("SELECT reviews FROM items ORDER BY id").all().map(row => row.reviews), [1, 0]);
+	} finally {
+		if (a) await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
+		if (b) await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
+		db?.close(); fake.restore();
+	}
+});
+
+function readForecast(db: DatabaseSync) {
+	const raw = db.prepare("SELECT value FROM stats WHERE key='next_card_forecast'").get()?.value;
+	assert.equal(typeof raw, "string", "every attached session has a next-card projection");
+	return JSON.parse(String(raw));
+}
+
+test("forecast follows active card advancement with automatic scheduling disabled", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession(); db = openTestDb();
+		assert.equal(readForecast(db).status, "disabled");
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		await fake.firePoll();
+		assert.equal(readForecast(db).activeItemId, 1);
+		assert.equal(readForecast(db).status, "current_card");
+		assert.equal(readForecast(db).hasReadyAfterCurrent, false);
+		insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+		await fake.firePoll();
+		assert.equal(readForecast(db).hasReadyAfterCurrent, true);
+		await s.commands["anki:again"].handler("", s.ctx);
+		assert.equal(readForecast(db).activeItemId, 2, "a preview for the old card must not remain attached to the next one");
+		assert.equal(readForecast(db).hasReadyAfterCurrent, false);
+		await s.commands["anki:again"].handler("", s.ctx);
+		assert.equal(readForecast(db).activeItemId, null);
+		assert.equal(readForecast(db).status, "disabled");
+		assert.equal(readForecast(db).scheduledAt, null);
+		assert.equal(db.prepare("SELECT COUNT(*) AS n FROM attempts").get()?.n, 2);
+	} finally {
+		if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+		db?.close(); fake.restore();
+	}
+});
+
+test("forecast belongs to the live coordinator and is cleared when its timer is disabled", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	let older: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let owner: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		older = await makeSession();
+		writeFileSync(`${agentDir}/kaomoji-english-tutor.json`, JSON.stringify({ intervalMinutes: 0.1, dailyNewLimit: 1, adaptiveNewCards: false }));
+		owner = await makeSession(); db = openTestDb();
+		insertDueWord(db, "future", "未来（名词，义项线索）");
+		const now = Date.now();
+		db.prepare("UPDATE items SET shown=1,due_at=?").run(new Date(now + 3000).toISOString());
+		db.prepare("UPDATE runtime_state SET next_check_at=?").run(new Date(now + 6000).toISOString());
+		await owner.commands["anki:interval"].handler("0.1", owner.ctx);
+		const original = readForecast(db);
+		assert.ok(original.scheduledAt);
+		await fake.firePoll();
+		assert.deepEqual(readForecast(db), original, "the disabled follower cannot replace the owner's actual timer promise");
+		await older.handlers.session_shutdown({ reason: "quit" }, older.ctx); older = undefined;
+		assert.deepEqual(readForecast(db), original, "shutdown of an old owner must not clear the new owner's forecast");
+		await owner.commands["anki:interval"].handler("off", owner.ctx);
+		assert.equal(readForecast(db).status, "disabled");
+		assert.equal(readForecast(db).scheduledAt, null);
+		assert.equal(readForecast(db).checkAt, null, "cancellation publishes immediately, without waiting for polling");
+		await owner.commands["anki:interval"].handler("0.1", owner.ctx);
+		assert.ok(readForecast(db).scheduledAt);
+		await owner.handlers.session_shutdown({ reason: "quit" }, owner.ctx); owner = undefined;
+		assert.equal(readForecast(db).scheduledAt, null);
+		assert.equal(readForecast(db).checkAt, null, "owner shutdown cannot leave an automatic promise behind");
+	} finally {
+		if (older) await older.handlers.session_shutdown({ reason: "quit" }, older.ctx);
+		if (owner) await owner.handlers.session_shutdown({ reason: "quit" }, owner.ctx);
+		db?.close(); fake.restore();
+	}
+});
+
+test("expired coordinator lets different-config followers clear stale promises only once", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const sessions: Awaited<ReturnType<typeof makeSession>>[] = [];
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		sessions.push(await makeSession());
+		let offPoll = fake.poll()[0];
+		writeFileSync(`${agentDir}/kaomoji-english-tutor.json`, JSON.stringify({ intervalMinutes: 5, dailyNewLimit: 20, adaptiveNewCards: false }));
+		sessions.push(await makeSession());
+		let onPoll = fake.poll().find(timer => timer !== offPoll)!;
+		writeFileSync(`${agentDir}/kaomoji-english-tutor.json`, JSON.stringify({ intervalMinutes: 0.1, dailyNewLimit: 1, adaptiveNewCards: false }));
+		const owner = await makeSession(); sessions.push(owner); db = openTestDb();
+		insertDueWord(db, "future", "未来（名词，义项线索）");
+		const now = Date.now();
+		db.prepare("UPDATE items SET shown=1,due_at=?").run(new Date(now + 3000).toISOString());
+		db.prepare("UPDATE runtime_state SET next_check_at=?").run(new Date(now + 6000).toISOString());
+		await owner.commands["anki:interval"].handler("0.1", owner.ctx);
+		assert.ok(readForecast(db).scheduledAt);
+		const ownerId = db.prepare("SELECT coordinator FROM runtime_state").get()?.coordinator;
+		db.exec("CREATE TABLE forecast_writes(n INTEGER); INSERT INTO forecast_writes VALUES(0); CREATE TRIGGER count_forecast_writes AFTER UPDATE OF value ON stats WHEN NEW.key='next_card_forecast' BEGIN UPDATE forecast_writes SET n=n+1; END;");
+		db.prepare("UPDATE runtime_state SET coordinator_until=?").run(new Date(0).toISOString());
+		async function pollAndRenew(timer: FakeTimer) {
+			const before = new Set(fake.poll());
+			await fake.fire(timer);
+			return fake.poll().find(next => !before.has(next))!;
+		}
+		offPoll = await pollAndRenew(offPoll);
+		const neutral = readForecast(db);
+		assert.equal(neutral.status, "waiting_check");
+		assert.equal(neutral.availableAt, null);
+		assert.equal(neutral.scheduledAt, null);
+		assert.equal(neutral.checkAt, null);
+		for (let i = 0; i < 3; i++) {
+			onPoll = await pollAndRenew(onPoll);
+			offPoll = await pollAndRenew(offPoll);
+			assert.deepEqual(readForecast(db), neutral, "followers must not apply their own conflicting interval/quota settings");
+		}
+		assert.equal(db.prepare("SELECT n FROM forecast_writes").get()?.n, 1, "neutral clearing is one semantic update, never per-poll churn");
+		assert.equal(db.prepare("SELECT coordinator FROM runtime_state").get()?.coordinator, ownerId, "publishing must not acquire the expired lease");
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		onPoll = await pollAndRenew(onPoll);
+		assert.equal(readForecast(db).status, "current_card");
+		assert.equal(readForecast(db).activeItemId, 1);
+		assert.equal(readForecast(db).hasReadyAfterCurrent, false);
+	} finally {
+		for (const session of sessions) await session.handlers.session_shutdown({ reason: "quit" }, session.ctx);
+		db?.close(); fake.restore();
+	}
+});
+
+function undoReceipt(db: DatabaseSync) {
+	return JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key='study_undo'").get()?.value));
+}
+function learningRows(db: DatabaseSync) {
+	return {
+		items: db.prepare("SELECT * FROM items ORDER BY id").all(),
+		directions: db.prepare("SELECT * FROM direction_state ORDER BY item_id,direction").all(),
+		attempts: db.prepare("SELECT * FROM attempts ORDER BY id").all(),
+		mastery: db.prepare("SELECT * FROM mastery_state ORDER BY item_id").all(),
+		exercises: db.prepare("SELECT * FROM exercises ORDER BY id").all(),
+		stats: db.prepare("SELECT key,value FROM stats WHERE key IN ('total_reviews','total_skipped','total_learned','streak_days','last_active_date','pending_replacements') ORDER BY key").all(),
+		state: db.prepare("SELECT active_item_id,active_kind,active_direction,active_review_cycle_id,active_exercise_id,active_cycle_outcome,active_retry_count,active_assistance_level,next_check_at FROM runtime_state").get(),
+	};
+}
+async function invokeUndo(s: Awaited<ReturnType<typeof makeSession>>, db: DatabaseSync, actionId: string, requestId = randomUUID()) {
+	await s.commands["anki:undo"].handler(`${actionId} --request-id ${requestId}`, s.ctx);
+	return JSON.parse(String(db.prepare("SELECT value FROM stats WHERE key=?").get(`study_undo_result:${requestId}`)?.value));
+}
+
+test("undo restores manual ratings and untouched next-card introduction after restart", { concurrency: false }, async () => {
+	for (const kind of ["good", "again"]) {
+		const fake = installFakeTimers();
+		let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+		let db: DatabaseSync | undefined;
+		try {
+			writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+			s = await makeSession(); db = openTestDb();
+			insertDueWord(db, "alpha", "阿尔法（名词，义项线索）"); insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+			db.prepare("UPDATE items SET shown=1 WHERE id=1").run();
+			db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_direction='reverse',active_version=3,active_assistance_level='revealed'").run();
+			db.prepare("INSERT INTO stats(key,value) VALUES('total_reviews','9'),('total_learned','4'),('streak_days','3'),('last_active_date','2020-01-01')").run();
+			await fake.firePoll();
+			const before = learningRows(db);
+			await s.commands[`anki:${kind}`].handler("", s.ctx);
+			assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
+			assert.equal(db.prepare("SELECT introduced_at FROM items WHERE id=2").get()?.introduced_at != null, true);
+			const receipt = undoReceipt(db);
+			assert.equal(receipt.available, true); assert.equal(receipt.kind, kind); assert.equal(receipt.itemId, 1);
+			await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+			s = await makeSession();
+			const version = Number(db.prepare("SELECT active_version FROM runtime_state").get()?.active_version);
+			assert.equal((await invokeUndo(s, db, receipt.actionId)).status, "succeeded");
+			assert.deepEqual(learningRows(db), before, "restore exact source learning data, next introduction and counters");
+			assert.ok(Number(db.prepare("SELECT active_version FROM runtime_state").get()?.active_version) > version, "old in-flight commands cannot target the restored card version");
+			const after = learningRows(db);
+			assert.equal((await invokeUndo(s, db, receipt.actionId)).status, "rejected", "a new request cannot undo the same action twice");
+			assert.deepEqual(learningRows(db), after);
+		} finally { if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); fake.restore(); }
+	}
+});
+
+test("undo rejects subsequent text answers, hints, edits, generation and stale actions", { concurrency: false }, async () => {
+	for (const change of ["answer", "hint", "edit", "generation", "rating"]) {
+		const fake = installFakeTimers();
+		let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+		let db: DatabaseSync | undefined;
+		try {
+			writeConfig({ intervalMinutes: 0, dailyNewLimit: 0 });
+			s = await makeSession(); db = openTestDb();
+			insertDueWord(db, "alpha", "阿尔法（名词，义项线索）"); insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+			db.prepare("UPDATE items SET shown=1").run();
+			db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+			await fake.firePoll(); await s.commands["anki:again"].handler("", s.ctx);
+			const old = undoReceipt(db);
+			if (change === "answer") await s.commands["anki:answer"].handler("beta", s.ctx);
+			if (change === "hint") await s.commands["anki:hint"].handler("", s.ctx);
+			if (change === "edit") db.prepare("UPDATE items SET meaning='另一会话修订（名词，义项线索）',content_version=content_version+1 WHERE id=1").run();
+			if (change === "generation") insertDueWord(db, "newlycreated", "新生成（形容词）");
+			if (change === "rating") await s.commands["anki:again"].handler("", s.ctx);
+			const preserved = learningRows(db);
+			const result = await invokeUndo(s, db, old.actionId);
+			assert.equal(result.status, "rejected", change); assert.equal(result.itemId, 1, "stale result still refers to its requested action");
+			assert.deepEqual(learningRows(db), preserved, "never overwrite later business changes");
+		} finally { if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); fake.restore(); }
+	}
+});
+
+test("undo skip cancels only its in-flight refill and ignores the late model result", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "undo-skip-pending" });
+	let release!: () => void, started!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const running = new Promise<void>(resolve => { started = resolve; });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	let skip: Promise<void> | undefined;
+	try {
+		registration.setResponses([async () => { started(); await gate; return fauxAssistantMessage(JSON.stringify({ ready: true, item: queueWord("morning", "早晨") })); }]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession({ model, modelRegistry: registry }); db = openTestDb();
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		await fake.firePoll();
+		const before = learningRows(db);
+		skip = s.commands["anki:skip"].handler("", s.ctx);
+		await running;
+		const receipt = undoReceipt(db);
+		assert.equal(receipt.kind, "skip"); assert.equal(receipt.available, true);
+		assert.ok(db.prepare("SELECT generation_token FROM runtime_state").get()?.generation_token);
+		assert.equal((await invokeUndo(s, db, receipt.actionId)).status, "succeeded");
+		assert.deepEqual(learningRows(db), before);
+		assert.equal(db.prepare("SELECT generation_token FROM runtime_state").get()?.generation_token, null);
+		release(); await skip; await fake.flush();
+		assert.deepEqual(learningRows(db), before, "late refill must not insert a new card or change restored pacing");
+	} finally { release(); if (skip) await skip; if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); registration.unregister(); fake.restore(); }
+});
+
+test("undo skip restores both directions with next review displayed and preserves committed refill", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 0 });
+		s = await makeSession(); db = openTestDb();
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）"); insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		await fake.firePoll(); const before = learningRows(db);
+		await s.commands["anki:skip"].handler("", s.ctx);
+		const first = undoReceipt(db);
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
+		const requestId = randomUUID();
+		assert.equal((await invokeUndo(s, db, first.actionId, requestId)).status, "succeeded");
+		assert.deepEqual(learningRows(db), before);
+		assert.equal((await invokeUndo(s, db, first.actionId, requestId)).status, "succeeded", "identical request is idempotent");
+		assert.deepEqual(learningRows(db), before);
+		await s.commands["anki:skip"].handler("", s.ctx);
+		const second = undoReceipt(db);
+		const conflict = undoStudyAction(db, second.actionId, requestId);
+		assert.equal(conflict.status, "rejected"); assert.equal(conflict.errorCode, "UNDO_REQUEST_CONFLICT");
+		insertDueWord(db, "committedrefill", "已入库（名词，义项线索）");
+		db.prepare("UPDATE stats SET value='[]' WHERE key='pending_replacements'").run();
+		const committed = learningRows(db);
+		assert.equal((await invokeUndo(s, db, second.actionId)).status, "rejected");
+		assert.deepEqual(learningRows(db), committed, "never delete or overwrite already committed refill work");
+	} finally { if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); fake.restore(); }
+});
+
+test("undo restores sentence-cycle rating and newly displayed sentence setup", { concurrency: false }, async () => {
+	for (const sourceSentence of [false, true]) {
+		const fake = installFakeTimers();
+		let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+		let db: DatabaseSync | undefined;
+		try {
+			writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+			s = await makeSession(); db = openTestDb();
+			if (sourceSentence) insertSentence(db); else insertDueWord(db, "alpha", "阿尔法（名词，义项线索）");
+			insertSentence(db);
+			db.prepare("UPDATE items SET shown=1 WHERE id=1").run();
+			db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+			await fake.firePoll();
+			if (sourceSentence) {
+				const cycle = db.prepare("SELECT active_review_cycle_id,active_exercise_id FROM runtime_state").get()!;
+				db.prepare("INSERT INTO attempts(id,item_id,exercise_id,review_cycle_id,claim_key,question_version,evaluation_version,kind,assistance_level,status,verdict,started_at,completed_at) VALUES('existing',1,?,?,'existing',1,1,'sentence_production','none','evaluated','incorrect',?,?)")
+					.run(cycle.active_exercise_id, cycle.active_review_cycle_id, new Date().toISOString(), new Date().toISOString());
+			}
+			const before = learningRows(db);
+			await s.commands["anki:again"].handler("", s.ctx);
+			assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
+			assert.equal((await invokeUndo(s, db, undoReceipt(db).actionId)).status, "succeeded");
+			assert.deepEqual(learningRows(db), before, "restore linked old attempt fields and remove only the next card's new cycle setup");
+		} finally { if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); fake.restore(); }
+	}
+});
+
+test("undo with no next card restores cloze scheduling and rolls back atomically on failure", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 0, dailyNewLimit: 1 });
+		s = await makeSession(); db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,chunks) VALUES('cloze','She ___ (be) here.','is',?,'1970-01-01T00:00:00.000Z',1,'[\"She\",\"is here.\"]')").run(new Date().toISOString());
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		await fake.firePoll(); const before = learningRows(db);
+		await s.commands["anki:again"].handler("", s.ctx);
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, null);
+		const receipt = undoReceipt(db), rated = learningRows(db);
+		db.exec("CREATE TRIGGER prevent_undo_test BEFORE DELETE ON attempts BEGIN SELECT RAISE(ABORT,'test-only failure'); END;");
+		assert.equal((await invokeUndo(s, db, receipt.actionId)).errorCode, "UNDO_FAILED");
+		assert.deepEqual(learningRows(db), rated, "a failure mid-undo cannot partially restore counters or the active card");
+		db.exec("DROP TRIGGER prevent_undo_test");
+		assert.equal((await invokeUndo(s, db, receipt.actionId)).status, "succeeded");
+		assert.deepEqual(learningRows(db), before);
+	} finally { if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); fake.restore(); }
+});
+
+test("undo cached success cannot cancel a newer study timer", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+		s = await makeSession(); db = openTestDb();
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		await fake.firePoll();
+		await s.commands["anki:again"].handler("", s.ctx);
+		const first = undoReceipt(db), requestId = randomUUID();
+		assert.equal((await invokeUndo(s, db, first.actionId, requestId)).status, "succeeded");
+		await s.commands["anki:again"].handler("", s.ctx);
+		const second = undoReceipt(db), waiting = learningRows(db), timer = fake.active()[0];
+		assert.ok(timer?.active);
+		assert.equal((await invokeUndo(s, db, first.actionId, requestId)).status, "succeeded", "the old durable result may still be read");
+		assert.deepEqual(learningRows(db), waiting);
+		assert.deepEqual(undoReceipt(db), second);
+		assert.ok(timer.active && fake.active().includes(timer), "cached results cannot perform local cancellation or rescheduling");
+	} finally { if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); fake.restore(); }
+});
+
+test("undo newer rating keeps its pacing and receipt when an older skip fails late", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "undo-old-skip-late" });
+	let release!: () => void, started!: () => void;
+	const gate = new Promise<void>(resolve => { release = resolve; });
+	const running = new Promise<void>(resolve => { started = resolve; });
+	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
+	let db: DatabaseSync | undefined;
+	let skip: Promise<void> | undefined;
+	try {
+		registration.setResponses([async () => { started(); await gate; return fauxAssistantMessage(JSON.stringify({ ready: false, reason: "test-only no replacement" })); }]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		s = await makeSession({ model, modelRegistry: registry }); db = openTestDb();
+		insertDueWord(db, "alpha", "阿尔法（名词，义项线索）"); insertDueWord(db, "beta", "贝塔（名词，义项线索）");
+		db.prepare("UPDATE items SET shown=1 WHERE id=1").run();
+		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
+		await fake.firePoll();
+		skip = s.commands["anki:skip"].handler("", s.ctx); await running;
+		// A timer may claim stored inventory while the old refill remains in flight.
+		await s.commands["anki:interval"].handler("10", s.ctx);
+		await fake.fire(fake.active().find(timer => timer.delay > 590_000));
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
+		await s.commands["anki:again"].handler("", s.ctx);
+		const newer = undoReceipt(db), waiting = learningRows(db);
+		assert.equal(newer.itemId, 2); assert.equal(newer.available, true);
+		release(); await skip; await fake.flush();
+		assert.deepEqual(learningRows(db), waiting, "old skip cleanup cannot alter the newer rating's pacing");
+		assert.deepEqual(undoReceipt(db), newer);
+		assert.equal((await invokeUndo(s, db, newer.actionId)).status, "succeeded");
+		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
+	} finally { release(); if (skip) await skip; if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); registration.unregister(); fake.restore(); }
 });

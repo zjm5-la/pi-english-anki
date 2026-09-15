@@ -25,6 +25,8 @@ import {
 import {
 	forwardCue,
 	forwardCueSuffix,
+	meaningHasForwardSenseClue,
+	meaningHasVisiblePos,
 	questionHasForwardCue,
 	recallQuestionText,
 } from "../render.ts";
@@ -161,6 +163,19 @@ test("forwardCue: first Latin letter + underscore-masked example for the exact t
 		}),
 	);
 	assert.equal(inflected?.context, undefined, "a substring inside booking is not the exact target");
+});
+
+test("meaningHasForwardSenseClue requires POS plus a same-paren collocation or sense limit", () => {
+	assert.equal(meaningHasVisiblePos("表演"), false);
+	assert.equal(meaningHasForwardSenseClue("表演"), false);
+	assert.equal(meaningHasVisiblePos("表演（名词）"), true);
+	assert.equal(meaningHasForwardSenseClue("表演（名词）"), false);
+	assert.equal(meaningHasForwardSenseClue("【名词】表演"), false);
+	assert.equal(
+		meaningHasForwardSenseClue("一场具体的演出（可数名词，常与 give 搭配，强调演出本身或当场表现）"),
+		true,
+	);
+	assert.equal(meaningHasForwardSenseClue("【动词】交流（指与他人交换信息或想法）"), true);
 });
 
 test("recallQuestionText adds forward collision cues and reverse sense context", () => {
@@ -441,14 +456,14 @@ test("critic deterministically rejects a batch with two identical normalized mea
 		{
 			type: "word",
 			text: "book",
-			meaning: "预订（动词）",
+			meaning: "预订（动词，提前占座位或房间）",
 			example: "I want to book a table.",
 			example_cn: "我想订个位子。",
 		},
 		{
 			type: "word",
 			text: "bank",
-			meaning: "银行（名词）",
+			meaning: "银行（名词，存放钱的机构）",
 			example: "The bank opens at nine.",
 			example_cn: "银行九点开门。",
 		},
@@ -546,7 +561,7 @@ test("generation and critic prompts carry the example-must-contain-text and sens
 	const word: GeneratedItem = {
 		type: "word",
 		text: "reload",
-		meaning: "重新加载（动词）",
+		meaning: "重新加载（动词，把最新内容再载入一次）",
 		example: "Reload the extension.",
 		example_cn: "重新加载扩展。",
 	};

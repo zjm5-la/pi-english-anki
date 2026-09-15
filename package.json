@@ -13,6 +13,7 @@
     "index.ts",
     "chat.ts",
     "adaptive-load.ts",
+    "auto-refill.ts",
     "config.ts",
     "conversation.ts",
     "db.ts",
@@ -23,6 +24,9 @@
     "sentence-cycle.ts",
     "learner-profile.ts",
     "pi-sdk-llm.ts",
+    "teach-request.ts",
+    "next-card-forecast.ts",
+    "study-undo.ts",
     "sync.ts",
     "README.md"
   ],

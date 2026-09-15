@@ -196,7 +196,26 @@ export function recallQuestionText(
 	return cue ? base + forwardCueSuffix(cue) : base;
 }
 
-/** Disambiguation for colliding Chinese → English prompts. */
+/** Visible Chinese POS used by the critic and by the forward-cue gate. */
+const CHINESE_POS =
+	"(?:(?:不可数|可数|复数|单数|专有|集合|普通)?名词|(?:不及物|及物)?动词|形容词|副词|介词|代词|连词|数词|冠词|感叹词|助动词|情态动词)(?:短语|过去分词|现在分词)?";
+
+export function meaningHasVisiblePos(meaning: string): boolean {
+	return new RegExp(`[（(【]\\s*${CHINESE_POS}(?=[，,；;）)】\\s])`).test(meaning);
+}
+
+/**
+ * Forward production needs more than a POS tag: a same-paren sense or
+ * collocation clue so show cannot pass for performance. Bare「表演」or
+ * 「表演（名词）」fail;「一场具体的演出（可数名词，常与 give 搭配）」passes.
+ */
+export function meaningHasForwardSenseClue(meaning: string): boolean {
+	if (!meaningHasVisiblePos(meaning)) return false;
+	if (new RegExp(`[（(]\\s*${CHINESE_POS}\\s*[，,；;][^）)]+[）)]`).test(meaning)) return true;
+	return new RegExp(`【\\s*${CHINESE_POS}\\s*】[^（(]{0,40}[（(][^）)]+[）)]`).test(meaning);
+}
+
+/** Disambiguation for colliding or underdetermined Chinese → English prompts. */
 export interface ForwardCue {
 	initial: string;
 	context?: string;
