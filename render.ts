@@ -195,7 +195,7 @@ export function recallQuestionText(
 	const lexical = lexicalMeaning(item.meaning);
 	const safeCore = maskTarget(lexical.meaning, item.text) ?? "根据语境回忆目标词";
 	const safeDetails = [lexical.partOfSpeech, maskTarget(lexical.clarification, item.text)].filter(Boolean).join("，");
-	const meaning = cue ? maskTarget(item.meaning, item.text) ?? `${safeCore}${safeDetails ? `（${safeDetails}）` : ""}` : item.meaning;
+	const meaning = item.type === "word" || item.type === "phrase" ? maskTarget(item.meaning, item.text) ?? `${safeCore}${safeDetails ? `（${safeDetails}）` : ""}` : item.meaning;
 	const base = `默写${label}「${meaning}」的英文`;
 	return cue ? base + forwardCueSuffix(cue) : base;
 }
@@ -247,9 +247,6 @@ export function meaningHasForwardSenseClue(meaning: string): boolean {
 /** Same conservative context as the desktop: grammatical labels alone do not
  * establish that a Chinese cue has exactly one English answer. */
 export interface ForwardCue {
-	initial: string;
-	shape?: string;
-	letterCount?: number;
 	context?: string;
 	chineseContext?: string;
 }
@@ -304,7 +301,7 @@ function maskTarget(raw: string | null, target: string, requireMatch = false): s
 	const pattern = normalized.split(/\s+/).map(word => `(?:${wordForms(word).map(escape).join("|")})(?:['’]s|['’])?`).join("\\s+");
 	const matcher = new RegExp(`(?<![A-Za-z])${pattern}(?![A-Za-z])`, "giu");
 	let matched = false;
-	const masked = raw.replace(matcher, match => { matched = true; return "_".repeat(match.length); });
+	const masked = raw.replace(matcher, () => { matched = true; return "____"; });
 	if (requireMatch && !matched) return null;
 	const residual = normalized.split(/\s+/).map(escape).join("\\s+");
 	if (new RegExp(residual, "iu").test(masked)) return null;
@@ -312,27 +309,20 @@ function maskTarget(raw: string | null, target: string, requireMatch = false): s
 }
 
 export function forwardCue(item: ItemRow): ForwardCue | undefined {
-	const initial = item.text.match(/[A-Za-z]/)?.[0]?.toLowerCase();
-	if (!initial) return undefined;
-	const words = item.text.trim().split(/\s+/);
-	const lengths = words.map(word => (word.match(/[A-Za-z]/g) ?? []).length);
-	const letterCount = lengths.reduce((sum, length) => sum + length, 0);
-	const shape = words.length === 1 ? `${letterCount} 个字母` : `${words.length} 个词（${lengths.join(" + ")} 个字母）`;
-	return { initial, shape, letterCount,
-		context: maskTarget(item.example, item.text, true) ?? undefined,
-		chineseContext: maskTarget(item.example_cn, item.text) ?? undefined };
+	const context = maskTarget(item.example, item.text, true) ?? undefined;
+	const chineseContext = maskTarget(item.example_cn, item.text) ?? undefined;
+	return context || chineseContext ? { context, chineseContext } : undefined;
 }
 
 export function forwardCueSuffix(cue: ForwardCue): string {
 	return `（${[
-		cue.letterCount === 1 ? "" : `以 ${cue.initial} 开头`, cue.shape,
 		cue.context ? `例：${cue.context}` : "",
 		cue.chineseContext ? `语境：${cue.chineseContext}` : "",
 	].filter(Boolean).join("；")}）`;
 }
 
 export function questionHasForwardCue(questionText: string | null | undefined): boolean {
-	return /（(?:以 [A-Za-z] 开头|1 个字母)/.test(questionText ?? "");
+	return /（(?:例：|语境：)/.test(questionText ?? "");
 }
 
 /** True when a reverse prompt carries the card's example sentence as sense context. */

@@ -37,7 +37,7 @@ test("every vocabulary generation path disambiguates before answering, including
 		assert.match(prompt, /communicate 应写「交流（动词/);
 		assert.match(prompt, /communication 应写「交流（名词/);
 		assert.match(prompt, /词性只解决词类歧义，同词性的近义词仍须补必要的义项或搭配线索/);
-		assert.match(prompt, /学生只看到 meaning，不能假设例句挖空或首字母已经显示/);
+		assert.match(prompt, /学生只看到 meaning，不能假设例句挖空已经显示/);
 		assert.match(prompt, /隐藏 text 和 example 后/);
 		assert.match(prompt, /即使其它近义词未入库、中文写法不同/);
 		assert.match(prompt, /词性、可数\/不可数、义项范围或自然搭配/);
@@ -52,8 +52,8 @@ test("every vocabulary generation path disambiguates before answering, including
 		assert.match(prompt, /goal \/ target \/ aim/);
 		assert.match(prompt, /释义复述.*不是区分同义词的证据/);
 		assert.match(prompt, /必要部分必须前置到 meaning/);
-		assert.match(prompt, /首字母和字母数/);
-		assert.match(prompt, /不是证明这些词语义互斥/);
+		assert.match(prompt, /禁止用首字母、词长、字母数或按字符数挖空来替代语义消歧/);
+		assert.match(prompt, /无法安全生成则解释原因/);
 	}
 });
 
@@ -71,7 +71,7 @@ test("known goal target aim paraphrases are rejected locally even if the model w
 	}
 });
 
-test("interchangeable goal sense requires accurate explicit spelling cues and a maskable example", async () => {
+test("spelling hints are rejected even when accurate and accompanied by a maskable example", async () => {
 	for (const [hint, example] of [
 		["以 t 开头，共 4 个字母", "My goal is to study English every day."],
 		["以 g 开头，共 6 个字母", "My goal is to study English every day."],
@@ -84,17 +84,17 @@ test("interchangeable goal sense requires accurate explicit spelling cues and a 
 		assert.equal(result.pass, false, hint + example);
 		assert.equal(prompts.length, 0);
 	}
-	const { llm, prompts } = capture({ pass: true, issues: [], summary: "spelling target is explicit; semantic alternatives remain valid words" });
-	const result = await critiqueLesson(llm, ctx, resolved, { topic: "学习计划", items: [{ type: "word", text: "goal", meaning: "目标（可数名词，每天学习英语的计划；以 g 开头，共 4 个字母）", example: "My goal is to study English every day.", example_cn: "我的目标是每天学习英语。" }] }, [], config, undefined, null);
-	assert.equal(result.pass, true);
-	assert.equal(prompts.length, 1, "accurate spelling cues do not bypass the independent semantic critic");
-	const audit = JSON.parse(/<forward_audit>(.*?)<\/forward_audit>/s.exec(prompts[0])![1]);
-	assert.deepEqual(audit[0].knownAlternatives, ["target", "aim"]);
-	assert.match(audit[0].maskedExample, /My _+ is to study English every day\./);
-	assert.doesNotMatch(audit[0].maskedExample, /\bgoal\b/i);
-	assert.equal(audit[0].explicitSpellingTarget, true);
-	assert.match(prompts[0], /空列表绝不表示没有近义词/);
-	assert.match(prompts[0], /这个布尔值不是语义唯一证明/);
+	for (const [target, meaning, example] of [
+		["goal", "目标（可数名词，每天学习英语的计划；以 g 开头，共 4 个字母）", "My goal is to study English every day."],
+		["apple", "苹果（可数名词，一种水果；以 a 开头，共 5 个字母）", "I eat an apple every day."],
+		["look after", "照顾（动词短语，照料小孩；首字母是 l，词长 9）", "I look after my sister."],
+	]) {
+		const { llm, prompts } = capture({ pass: true, issues: [], summary: "approved" });
+		const result = await critiqueLesson(llm, ctx, resolved, { topic: "词汇", items: [{ type: target.includes(" ") ? "phrase" : "word", text: target, meaning, example }] }, [], config, undefined, null);
+		assert.equal(result.pass, false, target);
+		assert.equal(prompts.length, 0);
+		assert.ok(result.issues.some(issue => /禁止用拼写提示/.test(issue.description)));
+	}
 });
 
 test("the narrow goal-family guard does not reject unrelated football or physical-target senses", async () => {
@@ -106,6 +106,12 @@ test("the narrow goal-family guard does not reject unrelated football or physica
 		const result = await critiqueLesson(llm, ctx, resolved, { topic: "运动", items: [{ type: "word", text: target, meaning, example }] }, [], config, undefined, null);
 		assert.equal(prompts.length, 1);
 		assert.equal(result.pass, false, "passing the local counterexample guard never means automatic approval");
+		const audit = JSON.parse(/<forward_audit>(.*?)<\/forward_audit>/s.exec(prompts[0])![1]);
+		assert.equal(audit[0].explicitSpellingTarget, undefined);
+		assert.match(audit[0].maskedExample, /____/);
+		assert.doesNotMatch(audit[0].maskedExample, /_{5}/);
+		assert.match(prompts[0], /空列表绝不表示没有近义词/);
+		assert.match(prompts[0], /语境存在不是语义唯一证明/);
 	}
 });
 
@@ -214,5 +220,18 @@ test("contradictory or negated target hints cannot be waived by the critic", asy
 		const result = await critiqueLesson(llm, ctx, resolved, { topic: "目标", items: [{ type: "word", text: "goal", meaning: `目标（可数名词，${hint}）`, example: "My goal is to learn fifty English words.", example_cn: "我的目标是学习五十个英语单词。" }] }, [], config, undefined, null);
 		assert.equal(result.pass, false, hint);
 		assert.equal(prompts.length, 0, hint);
+	}
+});
+
+
+test("displayed context uses substitution grading for synonyms and real conflicts", async () => {
+	for (const [answer, verdict] of [["target", "correct"], ["banana", "incorrect"]] as const) {
+		const { llm, prompts } = capture({ verdict, feedback: "test" });
+		const result = await evaluateAttempt(llm, ctx, { type: "word", text: "goal", meaning: "目标（可数名词，指希望达到的结果）" } as ItemRow, answer, resolved, "forward", "默写单词「目标」的英文（例：My ____ is to learn English.；语境：我的目标是学英语。）");
+		assert.equal(result.verdict, verdict);
+		assert.match(prompts[0], /语境存在不代表答案唯一/);
+		assert.match(prompts[0], /即使与目标词不同.*也算 correct/);
+		assert.match(prompts[0], /与题面实际语境或语法矛盾的答案不算 correct/);
+		assert.doesNotMatch(prompts[0], /题面线索已唯一指向/);
 	}
 });

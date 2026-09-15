@@ -3454,7 +3454,7 @@ test("manual /anki:good is recorded as a conservative self-report, not objective
 		const attempt = check.prepare("SELECT kind, status, explicit_rating, assistance_level, question_text FROM attempts WHERE item_id = 1").get() as any;
 		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写单词「香蕉」的英文（以 b 开头；6 个字母）" });
+		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写单词「香蕉」的英文" });
 		assert.deepEqual({ ...mastery }, { stage: "exposure", unassisted_good: 0, assisted_good: 0 }, "self-report produces no objective evidence");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
@@ -3537,21 +3537,21 @@ test("meaning-colliding forward reviews show target cues and matching audit snap
 		db.close();
 
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（以 b 开头；4 个字母；例：I want to ____ a table for two\.）/);
+		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（例：I want to ____ a table for two\.）/);
 		await harness.commands["anki:answer"].handler("", harness.ctx);
-		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（以 b 开头/);
+		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（例：/);
 		await harness.commands["anki:answer"].handler("book", harness.ctx);
 		let check = openTestDb();
 		let attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 1 ORDER BY id DESC LIMIT 1").get() as any;
 		check.close();
-		assert.equal(attempt.question_text, "默写单词「预订」的英文（以 b 开头；4 个字母；例：I want to ____ a table for two.）");
+		assert.equal(attempt.question_text, "默写单词「预订」的英文（例：I want to ____ a table for two.）");
 
-		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（以 r 开头；7 个字母；例：I want to _______ a table for two\.）/);
+		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（例：I want to ____ a table for two\.）/);
 		await harness.commands["anki:answer"].handler("reserve", harness.ctx);
 		check = openTestDb();
 		attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 2 ORDER BY id DESC LIMIT 1").get() as any;
 		check.close();
-		assert.equal(attempt.question_text, "默写单词「预订」的英文（以 r 开头；7 个字母；例：I want to _______ a table for two.）");
+		assert.equal(attempt.question_text, "默写单词「预订」的英文（例：I want to ____ a table for two.）");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -3570,12 +3570,12 @@ test("forward reviews retain pre-answer context even with a POS-plus-clue meanin
 		await fake.fire();
 		const shown = harness.widget().join(" ");
 		assert.match(shown, /默写单词「苹果（可数名词，一种常见水果）」的英文/);
-		assert.match(shown, /以 a 开头；5 个字母；例：I eat an _____ every day/);
+		assert.match(shown, /例：I eat an ____ every day/);
 		await harness.commands["anki:answer"].handler("apple", harness.ctx);
 		const check = openTestDb();
 		const attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 1 ORDER BY id DESC LIMIT 1").get() as any;
 		check.close();
-		assert.equal(attempt.question_text, "默写单词「苹果（可数名词，一种常见水果）」的英文（以 a 开头；5 个字母；例：I eat an _____ every day.）");
+		assert.equal(attempt.question_text, "默写单词「苹果（可数名词，一种常见水果）」的英文（例：I eat an ____ every day.）");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -3593,7 +3593,7 @@ test("goal review with generic parentheses logs the same pre-answer context used
 		db.close();
 		await fake.fire();
 		const shown = harness.widget().join(" ");
-		assert.match(shown, /以 g 开头；4 个字母/);
+		assert.doesNotMatch(shown, /首字母|开头|字母|词长/);
 		assert.match(shown, /My main ____ this month/);
 		assert.match(shown, /语境：我这个月的主要目标/);
 		const legacy = openTestDb();
@@ -3605,14 +3605,14 @@ test("goal review with generic parentheses logs the same pre-answer context used
 		const check = openTestDb();
 		const attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id=1 ORDER BY id DESC LIMIT 1").get() as any;
 		check.close();
-		assert.match(attempt.question_text, /以 g 开头；4 个字母；例：My main ____ this month/);
+		assert.match(attempt.question_text, /例：My main ____ this month/);
 		assert.match(attempt.question_text, /语境：我这个月的主要目标/);
 		assert.doesNotMatch(attempt.question_text, /\bgoal\b/i);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally { fake.restore(); }
 });
 
-test("thin unique forward reviews still show letter and masked-example context", { concurrency: false }, async () => {
+test("thin unique forward reviews show masked-example context without spelling hints", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
@@ -3622,7 +3622,7 @@ test("thin unique forward reviews still show letter and masked-example context",
 			.run("I eat an apple every day.", new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 		await fake.fire();
-		assert.match(harness.widget().join(" "), /默写单词「苹果」的英文（以 a 开头；5 个字母；例：I eat an _____ every day\.）/);
+		assert.match(harness.widget().join(" "), /默写单词「苹果」的英文（例：I eat an ____ every day\.）/);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();

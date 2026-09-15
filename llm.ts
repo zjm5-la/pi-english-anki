@@ -18,8 +18,8 @@ export const FORWARD_PROMPT_QUALITY = [
 	"- 为有近义词的目标选择能体现词义的自然例句/搭配，example 必须原样包含 text，example_cn 准确翻译；把目标挖空后仍应提供有用语境，不能只用 I like ... 等空泛句。",
 	"- 逐张做同词性替换检验：先列出至少一个自然的常见候选（确无候选须说明），再把每个候选代入 meaning 的实际场景和遮住目标词的 example；候选不必已入库、也不必共享完全相同的中文释义。解释为什么替换不成立，不能只宣称「上下文明确」。",
 	"- 括号里有说明不等于完成消歧：把「目标」改写成「希望达到/达成的结果」「想要实现的事情」，或写「强调结果、常与 set 搭配」，仍然同时容纳 goal / target / aim。释义复述、目标词的英文释义和空泛例句都不是区分同义词的证据；真实场景/搭配的必要部分必须前置到 meaning，而不是只存在于 example 或反馈。",
-	"- goal / target / aim 的泛指目标义项不能靠虚构「goal 只能长期、target 只能具体、aim 只能主观」来强行区分；必须实际替换检验。若仍可互换，换词或换练习；需保留目标时，在 meaning 明确写本次学习目标的正确首字母和字母数（goal：以 g 开头，共 4 个字母；target：以 t 开头，共 6 个字母；aim：以 a 开头，共 3 个字母），并配真实场景与可遮目标的例句。这是指定拼写练习目标，不是证明这些词语义互斥。",
-	"- 自检以实际默认题面为准：学生只看到 meaning，不能假设例句挖空或首字母已经显示，例句仅作辅助。隐藏 text 和 example 后，学生能否仅从 meaning 判断所考词？若仍有多个同样自然且满足线索的常见答案，必须将必要限定写进 meaning；仍可互换时加入真实正确的首字母/词长学习目标提示，或换学习项。用户指定必须保留的词不能靠不自然英文或直接泄露完整目标英文来强行唯一，也不能在后台假设非 App 客户端显示额外提示。",
+	"- goal / target / aim 的泛指目标义项不能靠虚构「goal 只能长期、target 只能具体、aim 只能主观」来强行区分；必须实际替换检验。若仍可互换，换词或换练习；用户指定必须保留的词若无法自然消歧，则解释限制，不生成或修成一道假装答案唯一的题。禁止用首字母、词长、字母数或按字符数挖空来替代语义消歧，也不得直接泄露目标拼写。",
+	"- 自检以实际默认题面为准：学生只看到 meaning，不能假设例句挖空已经显示，例句仅作辅助。隐藏 text 和 example 后，学生能否仅从 meaning 判断所考词？若仍有多个同样自然且满足线索的常见答案，必须将必要限定写进 meaning；仍可互换时换学习项或练习形式，无法安全生成则解释原因。用户指定必须保留的词不能靠不自然英文或直接泄露完整目标英文来强行唯一，也不能在后台假设非 App 客户端显示额外提示。",
 ].join("\n");
 
 export interface GeneratedItem {
@@ -52,14 +52,9 @@ function knownForwardAlternatives(item: GeneratedItem): string[] {
 	return ["goal", "target", "aim"].filter(word => word !== singular).map(word => target.endsWith("s") ? `${word}s` : word);
 }
 
-function hasMatchingSpellingTarget(item: GeneratedItem): boolean {
-	const target = item.text.trim().toLowerCase();
-	const initials = [...item.meaning.matchAll(/(?:以\s*([a-z])\s*开头|首字母\s*(?:为|是|[:：])?\s*([a-z]))/gi)];
-	const lengths = [...item.meaning.matchAll(/(\d+)\s*(?:个)?\s*(?:英文)?字母/g)];
-	const negated = /(?:不|非).{0,4}(?:以\s*[a-z]\s*开头|首字母|\d+\s*(?:个)?\s*(?:英文)?字母)/i.test(item.meaning);
-	return !negated && initials.length > 0 && lengths.length > 0
-		&& initials.every(match => (match[1] || match[2]).toLowerCase() === target[0])
-		&& lengths.every(match => Number(match[1]) === target.replace(/[^a-z]/g, "").length);
+/** Reject spelling scaffolding in new default prompts, independent of model approval. */
+function hasSpellingHint(meaning: string): boolean {
+	return /首字母|词长|字母数|以\s*[a-z]\s*开头|(?:\d+|[一二三四五六七八九十两]+)\s*(?:个)?\s*(?:英文)?字母|(?:starts?|begins?)\s+with\s+[a-z]\b|\b\d+[- ]letters?\b/i.test(meaning);
 }
 
 function stringArray(value: unknown): string[] | undefined {
@@ -456,11 +451,14 @@ export async function critiqueLesson(
 			});
 		}
 		const alternatives = knownForwardAlternatives(item);
-		if (alternatives.length && (!hasMatchingSpellingTarget(item) || !forwardCue(item as ItemRow)?.context)) {
+		if (hasSpellingHint(item.meaning)) {
+			budgetBlockers.push({ severity: "blocker", category: "sense", description: `「${item.text}」的默认题面包含首字母、词长或字母数提示。禁止用拼写提示替代语义消歧；请改用真实场景，仍可互换则换学习项或练习，无法安全修订则解释原因` });
+		}
+		if (alternatives.length) {
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "sense",
-				description: `「${item.text}」的泛指目标题面仍可回答 ${alternatives.join(" / ")}；「希望达到/达成的结果」「想要实现的事情」只是释义复述，不能当消歧证据。请换学习项，或在 meaning 明确写与目标匹配的首字母和字母数，并补真实场景及能遮住目标的例句；不得编造这些词不能互换的区别`,
+				description: `「${item.text}」的泛指目标题面仍可回答 ${alternatives.join(" / ")}；「希望达到/达成的结果」「想要实现的事情」只是释义复述，不能当消歧证据。请换学习项或练习形式，无法安全修订则解释原因；不得以首字母或词长绕过检查，也不得编造这些词不能互换的区别`,
 			});
 		}
 		const key = normalizeMeaning(item.meaning);
@@ -492,7 +490,6 @@ export async function critiqueLesson(
 		visibleMeaning: item.meaning,
 		maskedExample: forwardCue(item as ItemRow)?.context ?? null,
 		knownAlternatives: knownForwardAlternatives(item),
-		explicitSpellingTarget: hasMatchingSpellingTarget(item),
 	}));
 
 	const prompt = [
@@ -515,8 +512,8 @@ export async function critiqueLesson(
 		"- 不得与已学内容重复：" + (known.length ? known.join("、") : "（暂无）"),
 		`- cloze 句子须符合预算（词数 ${budget.wordRange[0]}-${budget.wordRange[1]}，句法结构遵循 difficulty_budget）；cloze 句子可以自然复用批次中 1-2 个单词或词组`,
 		"- 不得为凑结构硬造不自然句子",
-		"- 对 forward_audit 每一项执行同词性替换检验：列出常见候选，逐个代入 visibleMeaning 和 maskedExample。knownAlternatives 仅给已知反例，空列表绝不表示没有近义词；必须独立寻找候选。不能因为词性齐全、括号更长或另一候选未入库就 pass。若例句仍可替换，要求真实前置语境并明确首字母/词长学习目标，或换词/练习；不得伪造语义互斥。",
-		"- maskedExample 为 null 表示未能安全遮住实际目标，不能声称已有挖空语境。例句和中文翻译须真实相符且提供实际场景；即使 explicitSpellingTarget 为 true，也必须继续审查事实、搭配自然性及题面是否说明真实场景，这个布尔值不是语义唯一证明。",
+		"- 对 forward_audit 每一项执行同词性替换检验：列出常见候选，逐个代入 visibleMeaning 和 maskedExample。knownAlternatives 仅给已知反例，空列表绝不表示没有近义词；必须独立寻找候选。不能因为词性齐全、括号更长或另一候选未入库就 pass。若例句仍可替换，要求真实前置语境；无法自然消歧则换词/练习或解释原因。禁止以首字母、词长、字母数替代语义消歧；不得伪造语义互斥。",
+		"- maskedExample 为 null 表示未能安全遮住实际目标，不能声称已有挖空语境。例句和中文翻译须真实相符且提供实际场景；语境存在不是语义唯一证明，仍须实际替换检验并审查事实、搭配自然性。",
 		"- 只有明确问题才标 blocker；小瑕疵标 minor",
 		"",
 		formatAdaptiveBlock(ctxAdaptive.profile, budget),
@@ -608,8 +605,10 @@ export async function evaluateAttempt(
 			]
 		: cuePresent
 		? [
-			"- correct: 英文与目标完全一致，或仅大小写/标点/多余空格差异，且满足题面的首字母/语境线索",
-			`- 题面线索已唯一指向目标「${target}」：不满足线索的答案（如首字母不符、与语境例句矛盾）即使中文意思相同也不是 correct`,
+			"- correct: 英文自然且符合实际题面的中文义项、词性和语境即可；即使与目标词不同，只要能自然代入已展示的挖空例句和中文语境，也算 correct",
+			"- 语境存在不代表答案唯一：逐项检查学生答案能否自然替换目标，不得仅因首字母、词长或拼写不同拒绝合理同义答案，也不得使用题面未展示的例句或隐藏信息来排除答案",
+			"- 与题面实际语境或语法矛盾的答案不算 correct；必须说明具体冲突，不能只说不是目标词",
+			`- 同义答案判 correct 时，反馈须点明本题目标是「${target}」；只解释有根据的用法差异，不得编造同义词不能互换的区别`,
 			"- partial: 英文有小错（拼写/字形），但明显是想写这个目标词",
 			"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
 		]
