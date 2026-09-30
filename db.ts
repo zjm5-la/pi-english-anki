@@ -811,6 +811,17 @@ export function getDueItem(db: DatabaseSync, now: Date): ItemRow | undefined {
 		.get(now.toISOString()) as ItemRow | undefined;
 }
 
+/** Earliest strictly-future review due time, or null. Reviews are never
+ * quota-blocked, so a card due seconds from now must not wait a full pacing
+ * interval for the next work check. The card just rated keeps the deliberate
+ * automatic-interval re-test pacing and is excluded via `excludeItemId`. */
+export function earliestUpcomingReviewDue(db: DatabaseSync, now: Date, excludeItemId?: number): string | null {
+	const row = db
+		.prepare(`SELECT MIN(due_at) AS due FROM items WHERE shown = 1 AND due_at > ? ${SCHEDULABLE} AND id != ?`)
+		.get(now.toISOString(), excludeItemId ?? -1) as { due: string | null } | undefined;
+	return row?.due ?? null;
+}
+
 /** Shared predicate for items eligible to be surfaced by the scheduler.
  * Excludes corrupt, quarantined, or legacy-duplicate content. */
 export const SCHEDULABLE =

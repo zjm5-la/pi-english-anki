@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { DEFAULTS } from "../config.ts";
-import { getStat, openDb, setStat } from "../db.ts";
+import { earliestUpcomingReviewDue, getStat, openDb, setStat } from "../db.ts";
 import { buildNextCardForecast, NEXT_CARD_FORECAST_STAT, writeNextCardForecast, type ForecastTiming } from "../next-card-forecast.ts";
 
 const NOW = new Date("2026-09-09T04:00:00.000Z");
@@ -93,7 +93,53 @@ test("replacement generation never becomes a promise, but due reviews bypass it"
 		f.word(1);
 		const review = f.forecast();
 		assert.equal(review.source, "review");
-		assert.equal(review.scheduledAt, iso(6000));
+		assert.equal(review.status, "ready");
+		assert.equal(review.scheduledAt, iso(6000), "an idle backlog runs no LLM, so the work timer keeps its countdown");
+	} finally { f.close(); }
+});
+
+test("earliest upcoming review due bounds the next work check", () => {
+	const f = fixture();
+	try {
+		const imminent = f.word(1, iso(30000));
+		const later = f.word(1, iso(600000));
+		assert.equal(earliestUpcomingReviewDue(f.db, NOW), iso(30000));
+		assert.equal(earliestUpcomingReviewDue(f.db, NOW, imminent), iso(600000), "the just-rated card keeps its automatic re-test pacing");
+		f.db.prepare("UPDATE items SET due_at=? WHERE id=?").run(iso(-1000), imminent);
+		assert.equal(earliestUpcomingReviewDue(f.db, NOW), iso(600000));
+		f.db.prepare("UPDATE items SET due_at=? WHERE id=?").run(iso(-1000), later);
+		assert.equal(earliestUpcomingReviewDue(f.db, NOW), null);
+	} finally { f.close(); }
+});
+
+test("in-flight generation replaces the fallback countdown with honest ready/generating states", () => {
+	const f = fixture();
+	try {
+		// A review becomes due right after a skip while the replacement LLM runs;
+		// the 10-minute work timer must not become a release promise.
+		const review = f.word(1, iso(-2000));
+		setStat(f.db, "pending_replacements", '["word"]');
+		f.db.prepare("UPDATE runtime_state SET generation_token='t',generation_until=?").run(iso(60000));
+		const next = f.forecast();
+		assert.equal(next.source, "review");
+		assert.equal(next.status, "ready");
+		assert.equal(next.scheduledAt, null);
+		// Claimable-now planned inventory must not lose the headline to a
+		// scheduled future review while generation is in flight.
+		const planned = f.word(0, iso(-1000));
+		f.db.prepare("UPDATE items SET introduction_kind='planned' WHERE id=?").run(planned);
+		f.db.prepare("UPDATE items SET due_at=? WHERE id=?").run(iso(600000), review);
+		const headline = f.forecast();
+		assert.equal(headline.source, "stored_new");
+		assert.equal(headline.status, "generating");
+		assert.equal(headline.scheduledAt, null);
+		// Without generation or backlog the plain pacing countdown keeps its promise.
+		f.db.exec("DELETE FROM stats WHERE key='pending_replacements'");
+		f.db.prepare("UPDATE runtime_state SET generation_token=NULL,generation_until=NULL").run();
+		const paced = f.forecast();
+		assert.equal(paced.source, "stored_new");
+		assert.equal(paced.status, "ready");
+		assert.equal(paced.scheduledAt, iso(6000));
 	} finally { f.close(); }
 });
 

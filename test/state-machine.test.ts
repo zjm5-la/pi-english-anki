@@ -675,8 +675,7 @@ test("consecutive skips preserve FIFO replacement obligations", { concurrency: f
 		db.close();
 		await fake.fire();
 		await harness.commands["anki:skip"].handler("", harness.ctx);
-		await fake.fire();
-		assert.match(harness.widget().join(" "), /清除定时器/, "queued new card surfaces after deferred replacement generation");
+		assert.match(harness.widget().join(" "), /清除定时器/, "the next stored card surfaces immediately after a skip");
 		assert.doesNotMatch(harness.widget().join(" "), /clear a timer/, "queued new card hides the target phrase");
 		await harness.commands["anki:skip"].handler("", harness.ctx);
 		const check = openTestDb();
@@ -754,6 +753,8 @@ test("skipping a legacy sentence card replaces it with a cloze card", { concurre
 		await fake.fire();
 		assert.match(harness.widget().join(" "), /句子输出（L1\/3）/, "legacy sentence card still surfaces normally");
 		await harness.commands["anki:skip"].handler("", harness.ctx);
+		assert.ok(fake.replacements().length > 0, "replacement worker is armed after a skip");
+		await fake.fire(fake.replacements()[0]);
 		await fake.flush();
 		assert.match(harness.widget().join(" "), /语法填空/, "replacement cloze card is shown");
 		const check = openTestDb();
@@ -794,6 +795,9 @@ test("successful replacement is one-for-one, critic-approved, and quota-free", {
 		db.close();
 		await fake.fire();
 		await harness.commands["anki:skip"].handler("", harness.ctx);
+		assert.ok(fake.replacements().length > 0, "replacement worker is armed after a skip");
+		await fake.fire(fake.replacements()[0]);
+		await fake.flush();
 		const check = openTestDb();
 		const items = check.prepare("SELECT text,shown,status,introduction_kind,introduced_at FROM items ORDER BY id").all() as any[];
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -839,6 +843,9 @@ test("replacement critic rejection preserves the FIFO obligation and inserts not
 		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
 		await fake.fire();
 		await harness.commands["anki:skip"].handler("", harness.ctx);
+		assert.ok(fake.replacements().length > 0, "replacement worker is armed after a skip");
+		await fake.fire(fake.replacements()[0]);
+		await fake.flush();
 		const check = openTestDb();
 		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -877,11 +884,12 @@ test("conversation changes during replacement critique make the result stale", {
 		harness.ctx.sessionManager.getBranch = () => [{ type: "message", message: { role: "user", content: [{ type: "text", text: conversation }] } }];
 		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
 		await fake.fire();
-		const inFlight = harness.commands["anki:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
+		await fake.fire(fake.replacements()[0]);
 		await started;
 		conversation = "new topic";
 		releaseCritic();
-		await inFlight;
+		await fake.flush();
 		const check = openTestDb();
 		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -916,7 +924,8 @@ test("successful refill clears stale future pacing and shows a newly due review 
 		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "replacement-late-due" });
 		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
 		await fake.fire();
-		const inFlight = harness.commands["anki:skip"].handler("", harness.ctx);
+		await harness.commands["anki:skip"].handler("", harness.ctx);
+		await fake.fire(fake.replacements()[0]);
 		await started;
 		const during = openTestDb();
 		during.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','overdue','已到期',?,?,1)")
@@ -925,7 +934,7 @@ test("successful refill clears stale future pacing and shows a newly due review 
 			.run(new Date(Date.now() + 600_000).toISOString());
 		during.close();
 		releaseCritic();
-		await inFlight;
+		await fake.flush();
 		const check = openTestDb();
 		const count = Number((check.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -991,7 +1000,7 @@ test("stale replacement completion cannot mutate a new session", { concurrency: 
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,status) VALUES('word','old','旧词',?,?,1,'mastered')")
 			.run(new Date().toISOString(), new Date(Date.now() + 86_400_000).toISOString());
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('phrase','new session card','新会话卡片',?,?)")
-			.run(new Date().toISOString(), new Date(0).toISOString());
+			.run(new Date().toISOString(), new Date(Date.now() + 60_000).toISOString());
 		db.prepare("INSERT INTO stats(key,value) VALUES('pending_replacements','[\"word\"]')").run();
 		db.close();
 		await fake.fire();
@@ -1006,7 +1015,7 @@ test("stale replacement completion cannot mutate a new session", { concurrency: 
 		const due = check.prepare("SELECT shown FROM items WHERE id=2").get() as any;
 		check.close();
 		assert.equal(due.shown, 0);
-		assert.equal(fake.active().length, 1);
+		assert.equal(fake.active().length, 1, "exactly one work timer survives the reload; the stale generation adds none");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -2136,6 +2145,9 @@ test("basic-vocabulary fallback rescues a rejected replacement", { concurrency: 
 		const db = openTestDb(); insertDueWord(db, "timer", "定时器"); db.close();
 		await fake.fire();
 		await harness.commands["anki:skip"].handler("", harness.ctx);
+		assert.ok(fake.replacements().length > 0, "replacement worker is armed after a skip");
+		await fake.fire(fake.replacements()[0]);
+		await fake.flush();
 		const check = openTestDb();
 		const items = check.prepare("SELECT text,introduction_kind FROM items ORDER BY id").all() as any[];
 		const queue = JSON.parse(String((check.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any).value));
@@ -4145,7 +4157,7 @@ test("two sessions share one background replacement lease", { concurrency: false
 	} finally { release(); registration.unregister(); fake.restore(); }
 });
 
-test("direct skip completion cancels the worker busy cooldown and immediately continues refill", { concurrency: false }, async () => {
+test("background replacement chain drains the FIFO one-by-one after a skip", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-direct-refill-resume" });
 	let release!: () => void;
@@ -4168,15 +4180,15 @@ test("direct skip completion cancels the worker busy cooldown and immediately co
 		const seeded = openTestDb();
 		seeded.prepare("INSERT INTO stats(key,value) VALUES('pending_replacements','[\"word\"]')").run();
 		seeded.close();
-		const skip = harness.commands["anki:skip"].handler("", harness.ctx);
-		await generating;
+		// The skip serves the next stored card immediately; the replacement FIFO
+		// drains only through the background worker, one card at a time.
+		await harness.commands["anki:skip"].handler("", harness.ctx);
 		await fake.fire(fake.replacements()[0]);
-		assert.equal(fake.replacements().length, 1);
-		assert.ok(fake.replacements()[0].delay > 29_000, "worker backs off while direct skip is generating");
+		await generating;
 		release();
-		await skip;
-		assert.equal(fake.replacements().length, 1);
-		assert.equal(fake.replacements()[0].delay, 0, "successful direct generation replaces the stale busy timer");
+		await fake.flush();
+		assert.equal(fake.replacements().length, 1, "worker re-arms after each completed generation");
+		assert.equal(fake.replacements()[0].delay, 0, "a successful generation has no backoff");
 		await fake.fire(fake.replacements()[0]);
 		await fake.flush();
 		const check = openTestDb();
@@ -5076,7 +5088,6 @@ test("undo skip cancels only its in-flight refill and ignores the late model res
 	const running = new Promise<void>(resolve => { started = resolve; });
 	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
 	let db: DatabaseSync | undefined;
-	let skip: Promise<void> | undefined;
 	try {
 		registration.setResponses([async () => { started(); await gate; return fauxAssistantMessage(JSON.stringify({ ready: true, item: queueWord("morning", "早晨") })); }]);
 		const { model, registry } = fauxModelRegistry(registration);
@@ -5087,7 +5098,8 @@ test("undo skip cancels only its in-flight refill and ignores the late model res
 		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
 		await fake.firePoll();
 		const before = learningRows(db);
-		skip = s.commands["anki:skip"].handler("", s.ctx);
+		await s.commands["anki:skip"].handler("", s.ctx);
+		await fake.fire(fake.replacements()[0]);
 		await running;
 		const receipt = undoReceipt(db);
 		assert.equal(receipt.kind, "skip"); assert.equal(receipt.available, true);
@@ -5095,9 +5107,9 @@ test("undo skip cancels only its in-flight refill and ignores the late model res
 		assert.equal((await invokeUndo(s, db, receipt.actionId)).status, "succeeded");
 		assert.deepEqual(learningRows(db), before);
 		assert.equal(db.prepare("SELECT generation_token FROM runtime_state").get()?.generation_token, null);
-		release(); await skip; await fake.flush();
+		release(); await fake.flush();
 		assert.deepEqual(learningRows(db), before, "late refill must not insert a new card or change restored pacing");
-	} finally { release(); if (skip) await skip; if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); registration.unregister(); fake.restore(); }
+	} finally { release(); if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); registration.unregister(); fake.restore(); }
 });
 
 test("undo skip restores both directions with next review displayed and preserves committed refill", { concurrency: false }, async () => {
@@ -5212,7 +5224,6 @@ test("undo newer rating keeps its pacing and receipt when an older skip fails la
 	const running = new Promise<void>(resolve => { started = resolve; });
 	let s: Awaited<ReturnType<typeof makeSession>> | undefined;
 	let db: DatabaseSync | undefined;
-	let skip: Promise<void> | undefined;
 	try {
 		registration.setResponses([async () => { started(); await gate; return fauxAssistantMessage(JSON.stringify({ ready: false, reason: "test-only no replacement" })); }]);
 		const { model, registry } = fauxModelRegistry(registration);
@@ -5222,7 +5233,9 @@ test("undo newer rating keeps its pacing and receipt when an older skip fails la
 		db.prepare("UPDATE items SET shown=1 WHERE id=1").run();
 		db.prepare("UPDATE runtime_state SET active_item_id=1,active_kind='review',active_version=1").run();
 		await fake.firePoll();
-		skip = s.commands["anki:skip"].handler("", s.ctx); await running;
+		await s.commands["anki:skip"].handler("", s.ctx);
+		await fake.fire(fake.replacements()[0]);
+		await running;
 		// A timer may claim stored inventory while the old refill remains in flight.
 		await s.commands["anki:interval"].handler("10", s.ctx);
 		await fake.fire(fake.active().find(timer => timer.delay > 590_000));
@@ -5230,10 +5243,10 @@ test("undo newer rating keeps its pacing and receipt when an older skip fails la
 		await s.commands["anki:again"].handler("", s.ctx);
 		const newer = undoReceipt(db), waiting = learningRows(db);
 		assert.equal(newer.itemId, 2); assert.equal(newer.available, true);
-		release(); await skip; await fake.flush();
+		release(); await fake.flush();
 		assert.deepEqual(learningRows(db), waiting, "old skip cleanup cannot alter the newer rating's pacing");
 		assert.deepEqual(undoReceipt(db), newer);
 		assert.equal((await invokeUndo(s, db, newer.actionId)).status, "succeeded");
 		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
-	} finally { release(); if (skip) await skip; if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); registration.unregister(); fake.restore(); }
+	} finally { release(); if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); registration.unregister(); fake.restore(); }
 });

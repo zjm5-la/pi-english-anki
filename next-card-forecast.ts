@@ -57,9 +57,11 @@ export function buildNextCardForecast(db: DatabaseSync, config: PetConfig, timin
 		const due = timestamp(row.due_at);
 		if (due == null) continue;
 		if (row.shown === 1) candidates.push({ source: "review", due, priority: 0 });
-		else if (row.introduction_kind === "replacement") candidates.push({ source: "replacement", due, priority: 1 });
+		// Planned inventory is the front of the new-card queue; replacements join
+		// the back, so they rank below planned cards in "what's next" projections.
+		else if (row.introduction_kind === "replacement") candidates.push({ source: "replacement", due, priority: 2 });
 		else if (row.introduction_kind == null || row.introduction_kind === "planned" || row.introduction_kind === "custom") {
-			if (capacity) candidates.push({ source: "stored_new", due, priority: 2 });
+			if (capacity) candidates.push({ source: "stored_new", due, priority: 1 });
 			else quotaBlocked = true;
 		}
 	}
@@ -77,15 +79,23 @@ export function buildNextCardForecast(db: DatabaseSync, config: PetConfig, timin
 		? candidates.filter(candidate => available(candidate) <= workCheck && (candidate.source !== "stored_new" || sameDay(at, workCheck)))
 			.sort((a, b) => a.priority - b.priority || a.due - b.due)
 		: [];
-	// An in-flight LLM may finish before this timer and restore replacement-first
-	// ordering, so even that shortcut cannot promise new inventory past a backlog.
+	// An in-flight replacement may finish before this timer and append a new
+	// queued card, so a backlog still cannot promise new inventory at a check.
 	const scheduled = eligibleAtCheck.find(candidate => candidate.source === "review" || !pendingReplacement);
-	const first = scheduled ?? candidates.sort((a, b) => available(a) - available(b) || a.priority - b.priority)[0];
+	// An actively running generation makes the work-check timer a promise the
+	// LLM can contradict in either direction, and a claimable-now card is the
+	// honest headline even when a later timer promises another card. A merely
+	// queued replacement backlog runs no LLM, so the work timer keeps its
+	// promise and the countdown stays honest.
+	const inFlight = generationBusy;
+	const readyNow = candidates.filter(candidate => available(candidate) <= at)
+		.sort((a, b) => a.priority - b.priority || a.due - b.due)[0];
+	const first = readyNow ?? scheduled ?? candidates.sort((a, b) => available(a) - available(b) || a.priority - b.priority)[0];
 	if (first) {
 		base.source = first.source;
 		base.availableAt = iso(available(first));
 		base.status = available(first) <= at ? "ready" : first.due > at ? "waiting_due" : "waiting_check";
-		if (scheduled) base.scheduledAt = iso(workCheck);
+		if (scheduled && !inFlight) base.scheduledAt = iso(workCheck);
 	} else if (customPending) {
 		base.source = "custom_queue";
 		base.status = "waiting_check";

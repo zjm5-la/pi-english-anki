@@ -10,7 +10,7 @@ import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { dailyLoadPlan, formatDailyLoadPlan, hasNewCardCapacity, nextAdaptiveLessonBatch, remainingNewCardSlots } from "./adaptive-load.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { buildConversation } from "./conversation.ts";
@@ -24,7 +24,7 @@ import { interruptOrphanedTeachRequests, parseTeachRequest, readTeachReceipt, wr
 
 import { autoRefillPlan, autoRefillStrategy, writeAutoRefillStatus, type AutoRefillStrategy } from "./auto-refill.ts";
 import { buildNextCardForecast, writeNextCardForecast } from "./next-card-forecast.ts";
-import { beginStudyUndo, finishStudyUndo, beginUndoContinuation, finishUndoContinuation, withUndoContinuation, continueStudyUndoAction, initializeStudyUndo, invalidateStudyUndo, refreshStudyUndo, readStudyUndo, bindUndoReplacement, wasStudyUndone, undoStudyAction } from "./study-undo.ts";
+import { beginStudyUndo, finishStudyUndo, beginUndoContinuation, finishUndoContinuation, withUndoContinuation, continueStudyUndoAction, initializeStudyUndo, invalidateStudyUndo, refreshStudyUndo, readStudyUndo, bindUndoReplacement, undoStudyAction } from "./study-undo.ts";
 
 export { contentFingerprint };
 
@@ -309,7 +309,7 @@ export default function piEnglishAnkiExtension(
 			const ctx = latestCtx;
 			if (generation !== sessionGeneration || !db || !ctx || isCtxStale(ctx)) return;
 			if (Date.now() < replacementRetryAt) { scheduleReplacementWork(); return; }
-			if (pendingLLMCall || answerJudging) {
+			if ((pendingLLMCall && !resetHungLlmCall()) || answerJudging) {
 				replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
 				scheduleReplacementWork();
 				return;
@@ -812,22 +812,20 @@ export default function piEnglishAnkiExtension(
 				return undefined;
 			}
 			if (!due) {
-				// Replacement queued-new cards are quota-free and take priority over planned.
-				const replacement = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND introduction_kind = 'replacement' ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
-					.get(now.toISOString()) as ItemRow | undefined;
-				if (replacement) {
-					due = replacement;
-					isReview = false;
-				} else {
-					// Enforce today's automatic or fixed planned/custom first-display quota.
-					if (!hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now))) {
-						db.exec("ROLLBACK");
-						return undefined;
-					}
+				// Planned inventory is the front of the new-card queue; a skipped
+				// card's replacement is generated in the background and joins the
+				// back, so it never jumps ahead of stored planned cards.
+				if (hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now))) {
 					due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 						.get(now.toISOString()) as ItemRow | undefined;
-					isReview = false;
 				}
+				if (!due) {
+					// Replacement queued-new cards are quota-free and claimable once the
+					// planned queue is exhausted (or its daily quota is).
+					due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND introduction_kind = 'replacement' ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
+						.get(now.toISOString()) as ItemRow | undefined;
+				}
+				isReview = false;
 			}
 			if (!due) {
 				db.exec("ROLLBACK");
@@ -1419,9 +1417,14 @@ export default function piEnglishAnkiExtension(
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
 				hasImmediateNext = hasReadyStoredCard(now);
+				// A review due seconds from now must not wait a full pacing interval:
+				// cap the fallback check at the earliest upcoming review due time,
+				// excluding this card's own deliberate automatic-interval re-test.
+				const pacedCheck = new Date(now.getTime() + intervalMs()).toISOString();
+				const upcomingDue = earliestUpcomingReviewDue(db, now, item.id);
 				const nextCheck = hasImmediateNext
 					? now.toISOString()
-					: new Date(now.getTime() + intervalMs()).toISOString();
+					: upcomingDue !== null && upcomingDue < pacedCheck ? upcomingDue : pacedCheck;
 				setRuntimeState(db, {
 					active_item_id: null,
 					active_kind: null,
@@ -1942,16 +1945,21 @@ export default function piEnglishAnkiExtension(
 			return;
 		}
 
-		// Already-shown due reviews always win; never make them wait on replacement LLM work.
-		const dueReview = claimDueItem(now, true);
-		if (dueReview) {
-			if (!showItem(ctx, dueReview)) renderGlobalCard(ctx);
+		// Stored cards first: claiming is pure DB work and never waits on the LLM.
+		// Reviews win, then planned inventory, then queued replacements at the back.
+		const due = claimDueItem(new Date());
+		if (due) {
+			if (!showItem(ctx, due)) renderGlobalCard(ctx);
+			return;
+		}
+		if (getRuntimeState(db).active_item_id != null) {
+			renderGlobalCard(ctx);
 			return;
 		}
 
-		// A skipped card reserves one same-type replacement after due reviews.
+		// A skipped card's replacement generates in the background and joins the
+		// back of the new-card queue; the FIFO obligation blocks fresh lessons.
 		const replacementType = pendingReplacementTypes(db)[0];
-		let replacementWaiting = false;
 		if (replacementType) {
 			const inserted = await generateReplacementAndInsert(ctx, replacementType);
 			if (inserted) return;
@@ -1966,22 +1974,14 @@ export default function piEnglishAnkiExtension(
 				return;
 			}
 			// Generation is waiting for better context; keep the FIFO obligation but
-			// allow an already-due card to surface.
+			// the pacing reset may unblock a stored card that was pacing-gated.
 			resetPacing(db);
-			replacementWaiting = true;
-		}
-
-		// 1. Due item first: select + mark + activate in one transaction.
-		const due = claimDueItem(new Date());
-		if (due) {
-			if (!showItem(ctx, due)) renderGlobalCard(ctx);
+			const afterGeneration = claimDueItem(new Date());
+			if (afterGeneration) {
+				if (!showItem(ctx, afterGeneration)) renderGlobalCard(ctx);
+			}
 			return;
 		}
-		if (getRuntimeState(db).active_item_id != null) {
-			renderGlobalCard(ctx);
-			return;
-		}
-		if (replacementWaiting) return;
 
 		// 2. Queued /anki:add cards claim the day's remaining new-card quota FIFO,
 		// ahead of fresh lesson generation (pure DB work, no LLM).
@@ -2493,7 +2493,6 @@ export default function piEnglishAnkiExtension(
 			ctx.ui.notify("当前没有可跳过的卡片", "info");
 			return;
 		}
-		const queueWasEmpty = pendingReplacementTypes(db).length === 0;
 		let skipped: ItemRow | undefined;
 		let undoActionId: string | undefined;
 		try {
@@ -2508,29 +2507,19 @@ export default function piEnglishAnkiExtension(
 			ctx.ui.notify("当前没有可跳过的卡片", "info");
 			return;
 		}
+		// The replacement is generated by the background loop and joins the back
+		// of the new-card queue: serve the next stored card immediately instead.
 		scheduleReplacementWork();
-		// A due review must never wait for replacement generation.
 		if (!continueStudyUndoAction(db, undoActionId!, () => resetPacing(db!))) return;
-		const dueReview = claimDueItem(new Date(), true);
-		if (dueReview) {
-			if (!showItem(ctx, dueReview)) renderGlobalCard(ctx);
+		const queued = claimDueItem(new Date());
+		if (queued) {
+			if (!showItem(ctx, queued)) renderGlobalCard(ctx);
 			return;
 		}
-		const nextType = pendingReplacementTypes(db)[0];
-		const source = queueWasEmpty && nextType === skipped.type ? skipped : undefined;
-		const generation = sessionGeneration;
-		const inserted = nextType ? await generateReplacementAndInsert(ctx, nextType, source) : false;
-		if (sessionGeneration !== generation) return;
-		if (db && wasStudyUndone(db, undoActionId)) return;
-		if (!inserted && db) {
-			// Generation failed or was waiting for info: lower the pacing window so
-			// the next tick can surface a due card instead of stalling on the grace gap.
-			if (!continueStudyUndoAction(db, undoActionId!, () => resetPacing(db!))) return;
-			replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
-			stopReplacementTimer();
-			scheduleReplacementWork();
-			scheduleTimer();
-		}
+		// The synchronous claim misses cards that become due seconds later, and the
+		// fallback work timer waits a full pacing interval: re-check at the grace
+		// boundary so stored cards surface in seconds while generation runs.
+		scheduleTimer(REPLACEMENT_GRACE_MS);
 	}
 
 	// -- Commands ---------------------------------------------------------
