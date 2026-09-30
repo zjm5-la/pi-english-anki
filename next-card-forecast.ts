@@ -57,9 +57,9 @@ export function buildNextCardForecast(db: DatabaseSync, config: PetConfig, timin
 		const due = timestamp(row.due_at);
 		if (due == null) continue;
 		if (row.shown === 1) candidates.push({ source: "review", due, priority: 0 });
-		// Planned inventory is the front of the new-card queue; replacements join
-		// the back, so they rank below planned cards in "what's next" projections.
-		else if (row.introduction_kind === "replacement") candidates.push({ source: "replacement", due, priority: 2 });
+		// New cards rank by due time (shared priority), mirroring the claim order;
+		// the kind only labels the source and drives quota eligibility.
+		else if (row.introduction_kind === "replacement") candidates.push({ source: "replacement", due, priority: 1 });
 		else if (row.introduction_kind == null || row.introduction_kind === "planned" || row.introduction_kind === "custom") {
 			if (capacity) candidates.push({ source: "stored_new", due, priority: 1 });
 			else quotaBlocked = true;

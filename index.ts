@@ -812,19 +812,16 @@ export default function piEnglishAnkiExtension(
 				return undefined;
 			}
 			if (!due) {
-				// Planned inventory is the front of the new-card queue; a skipped
-				// card's replacement is generated in the background and joins the
-				// back, so it never jumps ahead of stored planned cards.
-				if (hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now))) {
-					due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
-						.get(now.toISOString()) as ItemRow | undefined;
-				}
-				if (!due) {
-					// Replacement queued-new cards are quota-free and claimable once the
-					// planned queue is exhausted (or its daily quota is).
-					due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND introduction_kind = 'replacement' ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
-						.get(now.toISOString()) as ItemRow | undefined;
-				}
+				// New cards surface in due-time order: a replacement generated now sorts
+				// after older planned inventory, and an older replacement sorts ahead of
+				// a newer batch. Quota applies to planned/custom only; replacements
+				// stay quota-free, so a full quota simply hides planned candidates.
+				const capacity = hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now));
+				const kinds = capacity
+					? "(introduction_kind = 'replacement' OR introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL)"
+					: "introduction_kind = 'replacement'";
+				due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND ${kinds} ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
+					.get(now.toISOString()) as ItemRow | undefined;
 				isReview = false;
 			}
 			if (!due) {
@@ -2123,8 +2120,49 @@ export default function piEnglishAnkiExtension(
 			let verdict = await critiqueLesson(llm, ctx, effectiveResolved, lesson, db ? replacementKnownList(db) : [], config, adaptive ?? undefined, batch);
 			if (sessionGeneration !== generation) return;
 			if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+			// Partial acceptance: lock in the items that individually passed every gate
+			// and regenerate only the shortfall with the rejection feedback. Runs before
+			// the revision loop so passing items can never be lost to a full-batch
+			// regeneration; a mostly-good batch must not be discarded.
+			let partialAccepted: GeneratedItem[] | null = null;
+			if (!verdict.pass) {
+				const failedTexts = new Set((verdict.itemVerdicts ?? []).filter(v => !v.pass).map(v => v.text));
+				const passing = failedTexts.size ? lesson.items.filter(it => !failedTexts.has(it.text.trim())) : [];
+				if (passing.length > 0) {
+					logGenStatus(`partial_accept: ${passing.length}/${lesson.items.length} 项通过，重生成缺口`);
+					partialAccepted = passing;
+					const acceptedWords = passing.filter(it => it.type === "word" || it.type === "phrase").length;
+					const acceptedCloze = passing.filter(it => it.type === "cloze").length;
+					const target = batch ?? { wordItems: LESSON_WORD_ITEMS, clozeItems: LESSON_CLOZE_ITEMS };
+					const shortfallWords = Math.max(0, target.wordItems - acceptedWords);
+					const shortfallCloze = Math.max(0, target.clozeItems - acceptedCloze);
+					if (shortfallWords > 0) {
+						try {
+							teachProgress(request, "revising");
+							const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, verdict.issues, adaptive ?? undefined, recentLog, { wordItems: shortfallWords, clozeItems: shortfallCloze }, false, isManual);
+							if (sessionGeneration !== generation) return;
+							if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+							if (revised.ready) {
+								teachProgress(request, "checking");
+								const revisedVerdict = await critiqueLesson(llm, ctx, effectiveResolved, revised, db ? replacementKnownList(db) : [], config, adaptive ?? undefined, null);
+								if (sessionGeneration !== generation) return;
+								if (!db || !ownsGeneration(getRuntimeState(db), generationToken)) return;
+								if (revisedVerdict.pass) {
+									partialAccepted = [...passing, ...revised.items];
+								} else {
+									const revisedFailed = new Set((revisedVerdict.itemVerdicts ?? []).filter(v => !v.pass).map(v => v.text));
+									const revisedPassing = revisedFailed.size ? revised.items.filter(it => !revisedFailed.has(it.text.trim())) : [];
+									if (revisedPassing.length > 0) partialAccepted = [...passing, ...revisedPassing];
+								}
+							}
+						} catch (err) {
+							logGenStatus(`partial_retry_error: ${(err as Error)?.message || err}`);
+						}
+					}
+				}
+			}
 			// Revision loop: address critic feedback before giving up.
-			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
+			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && partialAccepted == null && verdict.available && !verdict.pass; attempt++) {
 				teachProgress(request, "revising");
 				const revised = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, verdict.issues, adaptive ?? undefined, recentLog, batch, false, isManual);
 				if (sessionGeneration !== generation) return;
@@ -2140,7 +2178,7 @@ export default function piEnglishAnkiExtension(
 			// last batch of the easiest everyday words — already-known words are
 			// fine, the user can just skip them. Only on a genuine rejection; an
 			// unavailable critic stays fail-closed.
-			if (!verdict.pass && verdict.available) {
+			if (partialAccepted == null && !verdict.pass && verdict.available) {
 				try {
 					teachProgress(request, "revising");
 					const basic = await generateLesson(llm, ctx, effectiveResolved, conversation, db ? replacementKnownList(db) : [], config, undefined, adaptive ?? undefined, recentLog, batch, true, isManual);
@@ -2161,7 +2199,7 @@ export default function piEnglishAnkiExtension(
 					logGenStatus(`basic_fallback_error: ${(err as Error)?.message || err}`);
 				}
 			}
-			if (!verdict.pass) {
+			if (partialAccepted == null && !verdict.pass) {
 				failureCode = verdict.available ? "TEACH_QUALITY_REJECTED" : "TEACH_CHECK_UNAVAILABLE";
 				if (verdict.available) lastRejectedConversation = conversation;
 				if (!background || !activeItem(db)) updateWidget(ctx, FACES.idle, [
@@ -2172,6 +2210,9 @@ export default function piEnglishAnkiExtension(
 				if (!isManual && !background) deferPacing();
 				if (!request?.requestId && config.verbose) ctx.ui.notify(`备课被审查拒绝：${verdict.summary}`, "info");
 				return;
+			}
+			if (partialAccepted != null) {
+				lesson = { ...lesson, items: partialAccepted };
 			}
 			if (!conversationUnchanged()) return;
 			// The known list is advisory; when the generator still returns an

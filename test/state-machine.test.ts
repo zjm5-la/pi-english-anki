@@ -1998,19 +1998,17 @@ test("quality gate rejects lessons the critic flags and commits nothing", { conc
 	}
 });
 
-test("deterministic budget gate rejects an out-of-budget generated lesson with zero writes", { concurrency: false }, async () => {
+test("deterministic gate accepts passing items and drops only the failing ones", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-budget-gate" });
 	try {
-		// Cold-start DB -> B1 budget [12,18]. Each generated lesson has a 20-word
-		// cloze sentence (too long): the deterministic critic gate rejects it
-		// before any LLM critic call. The 4th response is the basic-vocabulary
-		// fallback batch, also out of budget and rejected the same way.
+		// Cold-start DB -> B1 budget [12,18]. The generated lesson has one 20-word
+		// cloze sentence (too long) plus ten in-budget words: the deterministic
+		// gate fails only the cloze, so the ten words are accepted immediately
+		// (no revision rounds, no LLM critic call) and the shortfall is left to
+		// the next tick.
 		registration.setResponses([
 			fauxAssistantMessage(longLessonResponse("too-long-1")),
-			fauxAssistantMessage(longLessonResponse("too-long-2")),
-			fauxAssistantMessage(longLessonResponse("too-long-3")),
-			fauxAssistantMessage(longLessonResponse("too-long-basic")),
 		]);
 		const { model, registry } = fauxModelRegistry(registration);
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
@@ -2019,17 +2017,16 @@ test("deterministic budget gate rejects an out-of-budget generated lesson with z
 		await fake.flush();
 		const db = openTestDb();
 		const count = Number((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n);
+		const clozeCount = Number((db.prepare("SELECT COUNT(*) AS n FROM items WHERE type='cloze'").get() as any).n);
 		const state = db.prepare("SELECT active_item_id, generation_token FROM runtime_state WHERE id=1").get() as any;
-		const status = String((db.prepare("SELECT value FROM stats WHERE key='last_gen_status'").get() as any).value);
+		const status = String((db.prepare("SELECT value FROM stats WHERE key='gen_log'").get() as any).value);
 		db.close();
-		assert.equal(count, 0, "out-of-budget lesson writes nothing");
-		assert.equal(state.active_item_id, null, "no active card after deterministic rejection");
+		assert.equal(count, 10, "the ten in-budget words are accepted");
+		assert.equal(clozeCount, 0, "the out-of-budget cloze is dropped");
+		assert.equal(state.active_item_id, 1, "the first accepted word is activated");
 		assert.equal(state.generation_token, null, "generation lease released");
-		assert.match(status, /critic_rejected/, "deterministic gate reject recorded as critic_rejected");
-		// 4 calls: 3 generation calls for the initial+revision batches, plus 1 basic
-		// fallback generation. The LLM critic was never consulted because the
-		// deterministic gate short-circuited every critiqueLesson.
-		assert.equal(registration.state.callCount, 4, "no LLM critic call for the deterministic gate");
+		assert.match(status, /partial_accept/, "partial acceptance is recorded");
+		assert.equal(registration.state.callCount, 1, "no revision round or LLM critic call was needed");
 	} finally {
 		registration.unregister();
 		fake.restore();
@@ -2626,6 +2623,30 @@ test("critic rejection prevents insertion", { concurrency: false }, async () => 
 		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
 	} finally {
 		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("new cards surface in due-time order regardless of kind", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 2 });
+		const s = await makeSession({ sessionId: "time-order" });
+		const today = new Date().toISOString();
+		const db = openTestDb();
+		// An older replacement outranks a newer planned batch; quota stays per-kind.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind) VALUES('word','older replacement','旧补卡',?,?,0,'replacement')")
+			.run(today, new Date(Date.now() - 3_600_000).toISOString());
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind) VALUES('word','newer planned','新计划卡',?,?,0,'planned')")
+			.run(today, new Date(Date.now() - 60_000).toISOString());
+		db.close();
+		await fake.fire();
+		const ck = openTestDb();
+		const active = ck.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		ck.close();
+		assert.equal(active.active_item_id, 1, "the earlier-due replacement surfaces first");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
 		fake.restore();
 	}
 });
@@ -4425,7 +4446,9 @@ test("RPC refill discards a late batch after another session uses today's quota"
 });
 function manualBadQualityResponse() {
 	const lesson = JSON.parse(manualLessonResponse());
-	lesson.items[0].meaning = "协调";
+	// Every item lacks a visible part-of-speech label, so the whole batch fails
+	// the deterministic gate and nothing may be partially accepted.
+	for (const item of lesson.items) item.meaning = "协调";
 	return JSON.stringify(lesson);
 }
 

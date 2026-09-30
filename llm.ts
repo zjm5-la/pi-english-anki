@@ -353,6 +353,11 @@ interface CritiqueVerdict {
 	pass: boolean;
 	issues: CritiqueIssue[];
 	summary: string;
+	/** Per-item attribution for partial acceptance: an item is accept-able when
+	 * its own entry passes. Present only when at least one item was attributed
+	 * a failure (deterministic gates always attribute; the model critic may add
+	 * more via the `items` array). Absent ⇒ whole-batch semantics. */
+	itemVerdicts?: { text: string; pass: boolean }[];
 }
 
 /**
@@ -378,6 +383,10 @@ export async function critiqueLesson(
 	// any LLM call so an out-of-budget or malformed item can never be approved,
 	// regardless of the model critic's verdict.
 	const budgetBlockers: CritiqueIssue[] = [];
+	// Per-item failure attribution for partial acceptance; a batch-level blocker
+	// (composition) cannot be attributed and disables partial acceptance.
+	const itemFailed = new Set<string>();
+	let batchLevel = false;
 	const phraseCount = lesson.items.filter((item) => item.type === "phrase").length;
 	// composition === null marks a user-customized batch: no fixed composition to
 	// enforce, per-item quality checks below still apply in full.
@@ -385,6 +394,7 @@ export async function critiqueLesson(
 	if (composition !== null &&
 		lesson.items.length === compositionBatch.wordItems + compositionBatch.clozeItems &&
 		phraseCount > phraseCapFor(compositionBatch.wordItems)) {
+		batchLevel = true;
 		budgetBlockers.push({
 			severity: "blocker",
 			category: "composition",
@@ -394,6 +404,7 @@ export async function critiqueLesson(
 	for (const item of lesson.items) {
 		if (item.type === "cloze") {
 			if (!validClozeItem(item)) {
+				itemFailed.add(item.text);
 				budgetBlockers.push({
 					severity: "blocker",
 					category: "structure",
@@ -405,6 +416,7 @@ export async function critiqueLesson(
 			const words = base.trim().split(/\s+/).filter(Boolean).length;
 			const [clozeMin, clozeMax] = budget.wordRange;
 			if (words < clozeMin || words > clozeMax) {
+				itemFailed.add(item.text);
 				budgetBlockers.push({
 					severity: "blocker",
 					category: "budget",
@@ -416,6 +428,7 @@ export async function critiqueLesson(
 		const words = item.text.trim().split(/\s+/).filter(Boolean).length;
 		const [minWords, maxWords] = budget.wordRange;
 		if (words < minWords || words > maxWords) {
+			itemFailed.add(item.text);
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "budget",
@@ -423,6 +436,7 @@ export async function critiqueLesson(
 			});
 		}
 		if (item.keyWords && item.keyWords.length > budget.maxKeyWords) {
+			itemFailed.add(item.text);
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "budget",
@@ -438,12 +452,14 @@ export async function critiqueLesson(
 		// Require a visible Chinese part-of-speech label independently of the model.
 		// Keep the general parser compatible with existing stored cards.
 		if (!meaningHasVisiblePos(item.meaning)) {
+			itemFailed.add(item.text);
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "sense",
 				description: `「${item.text}」的中文题面缺少明确词性，请在 meaning 的括号中标注当前义项的名词、动词、形容词或动词短语等中文词性，并保留必要消歧线索；不能仅在例句或判分反馈中解释`,
 			});
 		} else if (!meaningHasForwardSenseClue(item.meaning)) {
+			itemFailed.add(item.text);
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "sense",
@@ -452,9 +468,11 @@ export async function critiqueLesson(
 		}
 		const alternatives = knownForwardAlternatives(item);
 		if (hasSpellingHint(item.meaning)) {
+			itemFailed.add(item.text);
 			budgetBlockers.push({ severity: "blocker", category: "sense", description: `「${item.text}」的默认题面包含首字母、词长或字母数提示。禁止用拼写提示替代语义消歧；请改用真实场景，仍可互换则换学习项或练习，无法安全修订则解释原因` });
 		}
 		if (alternatives.length) {
+			itemFailed.add(item.text);
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "sense",
@@ -464,6 +482,7 @@ export async function critiqueLesson(
 		const key = normalizeMeaning(item.meaning);
 		const firstText = seenMeanings.get(key);
 		if (firstText != null) {
+			itemFailed.add(item.text);
 			budgetBlockers.push({
 				severity: "blocker",
 				category: "dup",
@@ -479,6 +498,10 @@ export async function critiqueLesson(
 			pass: false,
 			issues: budgetBlockers,
 			summary: "确定性质量检查未通过（难度预算、批次重复或题面消歧）",
+			// Batch-level problems cannot be attributed, so no partial acceptance.
+			...(batchLevel || itemFailed.size === 0 ? {} : {
+				itemVerdicts: lesson.items.map(item => ({ text: item.text.trim(), pass: !itemFailed.has(item.text) })),
+			}),
 		};
 	}
 
@@ -494,8 +517,9 @@ export async function critiqueLesson(
 
 	const prompt = [
 		"你是「英语小宠物」的内容审查员。审查下面备课是否适合当前学习者水平，只输出 JSON。",
-		'{"pass": true/false, "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression|budget","description":"..."}], "summary":"一句话"}',
+		'{"pass": true/false, "items": [{"text": "学习项 text", "pass": true/false}], "issues": [{"severity":"blocker|minor","category":"fact|sense|dup|translation|natural|progression|budget","description":"..."}], "summary":"一句话"}',
 		"审查标准：",
+		"- items 逐项结论：必须列出 lesson 中每一个学习项的 text 与 pass；凡被任何 blocker 影响的学习项 pass:false，未受影响的 pass:true；无法归因到具体学习项的批次级问题把全部学习项标 pass:false 并在 description 说明",
 		"- 英语单词/词组/句子必须正确、自然",
 		"- 词汇难度须符合画像「词汇层次」：雅思来源的词必须是入门/基础段常用核心词，生僻学术词、低频难词记 blocker；但会话来源的词（工作场景立即能用/能理解的）不受词汇层次限制，不得因偏难而拒收",
 		...(composition === null
@@ -536,12 +560,28 @@ export async function critiqueLesson(
 	const json = extractJsonObjectText(text);
 	if (!json) return failClosed("critic bad json");
 	try {
-		const parsed = JSON.parse(json) as { pass?: unknown; issues?: unknown; summary?: unknown };
+		const parsed = JSON.parse(json) as { pass?: unknown; issues?: unknown; summary?: unknown; items?: unknown };
+		// Per-item attribution for partial acceptance; a missing or malformed items
+		// array keeps whole-batch semantics (no item is dropped without evidence).
+		let itemVerdicts: { text: string; pass: boolean }[] | undefined;
+		if (Array.isArray(parsed.items)) {
+			const llmFails = new Set<string>();
+			for (const entry of parsed.items as unknown[]) {
+				if (entry == null || typeof entry !== "object") continue;
+				const text = (entry as { text?: unknown }).text;
+				const pass = (entry as { pass?: unknown }).pass;
+				if (typeof text === "string" && text.trim() && pass === false) llmFails.add(text.trim());
+			}
+			if (llmFails.size > 0) {
+				itemVerdicts = lesson.items.map(item => ({ text: item.text.trim(), pass: !llmFails.has(item.text.trim()) }));
+			}
+		}
 		return {
 			available: true,
 			pass: parsed.pass === true,
 			issues: Array.isArray(parsed.issues) ? (parsed.issues as CritiqueIssue[]).slice(0, 20) : [],
 			summary: typeof parsed.summary === "string" ? parsed.summary : "",
+			...(itemVerdicts ? { itemVerdicts } : {}),
 		};
 	} catch {
 		return failClosed("critic unparseable");
