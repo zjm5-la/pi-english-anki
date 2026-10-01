@@ -690,6 +690,53 @@ test("consecutive skips preserve FIFO replacement obligations", { concurrency: f
 	}
 });
 
+test("free work-timer delays are capped by an upcoming review due", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const s = await makeSession({ sessionId: "due-cap" });
+		const db = openTestDb();
+		// Quota is consumed so no lesson generation runs; nothing is due now.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind,introduced_at) VALUES('word','alpha','阿尔法（名词）',?,?,0,'planned',?)")
+			.run(new Date().toISOString(), new Date(0).toISOString(), new Date().toISOString());
+		// Another review becomes due in ~30s.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔（名词）',?,?,1)")
+			.run(new Date().toISOString(), new Date(Date.now() + 30_000).toISOString());
+		db.close();
+		await fake.fire();   // petTick: nothing claimable, quota out, no FIFO
+		const timers = fake.active();
+		assert.ok(timers.length >= 1, "a work timer is armed");
+		assert.ok(timers[0].delay <= 30_500, `armed delay ${timers[0].delay} respects the imminent due`);
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("replacement worker wake claims a due card before generation backoff", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1 });
+		const s = await makeSession({ sessionId: "worker-claim" });
+		const db = openTestDb();
+		// A pending replacement FIFO plus a due review: the worker wake must claim
+		// the review even though this loop only owns generation.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔（名词）',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.prepare("INSERT INTO stats(key,value) VALUES('pending_replacements','[\"word\"]')").run();
+		db.close();
+		await fake.firePoll();   // arms the replacement worker
+		await fake.fire(fake.replacements()[0]);
+		const ck = openTestDb();
+		const active = ck.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		ck.close();
+		assert.equal(active.active_item_id, 1, "the due review is claimed on the worker wake");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test("a due review is activated before any replacement LLM call", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-replacement-priority" });
@@ -4113,7 +4160,9 @@ test("background replacement rejection retries empty RPC context after cooldown 
 		const harness = await makeSession({ model, modelRegistry: registry, branch: [] });
 		const db = openTestDb();
 		const now = new Date().toISOString();
-		db.prepare("INSERT INTO items(type,text,meaning,status,learned_at,due_at,shown) VALUES('word','known','已会','mastered',?,?,1)").run(now, now);
+		// The filler card is deliberately not yet due: any worker wake claims pure-DB
+		// before generation, so a claimable filler would derail the retry semantics.
+		db.prepare("INSERT INTO items(type,text,meaning,status,learned_at,due_at,shown) VALUES('word','known','已会','mastered',?,?,1)").run(now, new Date(Date.now() + 86_400_000).toISOString());
 		db.prepare("INSERT INTO stats(key,value) VALUES('pending_replacements','[\"word\"]')").run();
 		db.close();
 		await fake.firePoll();

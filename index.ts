@@ -308,6 +308,16 @@ export default function piEnglishAnkiExtension(
 			publishForecast();
 			const ctx = latestCtx;
 			if (generation !== sessionGeneration || !db || !ctx || isCtxStale(ctx)) return;
+			// Claims are pure DB work: any wake claims before generation backoff,
+			// so a due card never waits for the work timer just because this loop
+			// owns replacement generation.
+			if (activeItem(db) == null) {
+				const due = claimDueItem(new Date());
+				if (due) {
+					if (!showItem(ctx, due)) renderGlobalCard(ctx);
+					return;
+				}
+			}
 			if (Date.now() < replacementRetryAt) { scheduleReplacementWork(); return; }
 			if ((pendingLLMCall && !resetHungLlmCall()) || answerJudging) {
 				replacementRetryAt = Date.now() + REPLACEMENT_RETRY_MS;
@@ -390,7 +400,10 @@ export default function piEnglishAnkiExtension(
 		const pacingDelay = state.next_check_at
 			? new Date(state.next_check_at).getTime() - Date.now()
 			: 0;
-		const effectiveDelay = pacingDelay > 0 ? pacingDelay : delay;
+		// A free (unpaced) delay never sleeps past an upcoming review due time:
+		// waking early is harmless, waking late hides a due card for a full
+		// interval. Paced delays were already capped at write time.
+		const effectiveDelay = pacingDelay > 0 ? pacingDelay : Math.min(delay, earliestDueDelay());
 		workCheckAt = new Date(Date.now() + Math.max(0, effectiveDelay)).toISOString();
 		timer = setTimeout(() => {
 			timer = undefined;
@@ -1565,7 +1578,8 @@ export default function piEnglishAnkiExtension(
 				active_direction: "forward",
 				active_version: cur.active_version + 1,
 				...EMPTY_SENTENCE_CYCLE,
-				next_check_at: new Date(now.getTime() + REPLACEMENT_GRACE_MS).toISOString(),
+				// Reviews always win: the grace never outruns an imminent due card.
+				next_check_at: new Date(now.getTime() + Math.min(REPLACEMENT_GRACE_MS, earliestDueDelay())).toISOString(),
 				coordinator: myId,
 				coordinator_until: new Date(now.getTime() + leaseMs()).toISOString(),
 				last_activity: now.toISOString(),
@@ -2021,7 +2035,18 @@ export default function piEnglishAnkiExtension(
 		if (!status.startsWith("model:")) appendGenLog(db, status);
 	}
 	function deferPacing() {
-		if (db) setRuntimeState(db, { next_check_at: new Date(Date.now() + Math.max(1, config.intervalMinutes) * 60_000).toISOString() });
+		// Generation backoff must not gate claims past an imminent review due.
+		if (db) setRuntimeState(db, { next_check_at: new Date(Date.now() + Math.min(Math.max(1, config.intervalMinutes) * 60_000, earliestDueDelay())).toISOString() });
+	}
+
+	/** Milliseconds until the earliest strictly-future review due time, or
+	 * Infinity. Reviews are never quota-blocked, so every pacing write and free
+	 * timer delay is capped by it: unblocking later than a due card hides it
+	 * behind a full interval. */
+	function earliestDueDelay(): number {
+		if (!db) return Number.POSITIVE_INFINITY;
+		const due = earliestUpcomingReviewDue(db, new Date());
+		return due ? Math.max(0, Date.parse(due) - Date.now()) : Number.POSITIVE_INFINITY;
 	}
 
 	async function generateAndInsert(ctx: ExtensionContext, _now: Date, batch?: LessonBatch, background = false, strategy: AutoRefillStrategy = "reserve") {
