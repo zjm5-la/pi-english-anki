@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "anki-chat-test-"));
 const { openDb, insertItem } = await import("../db.ts");
-const { runChat, parseChatRequest, allowedChatAction, createChatDispatcher } = await import("../chat.ts");
+const { runChat, parseChatRequest, allowedChatAction, createChatDispatcher, CHAT_FORMAT_RETRIES } = await import("../chat.ts");
 const { critiqueLesson } = await import("../llm.ts");
 const db = openDb();
 let seq = 0;
@@ -301,6 +301,24 @@ test("chat preparation carries the referenced list through to the custom generat
  assert.deepEqual(db.prepare("SELECT COUNT(*) AS n FROM attempts").get(), attempts);
 });
 
+test("chat tolerates prose-wrapped or fenced JSON decisions", async () => {
+ const { request, deps } = fixture(); request.message = "解释这个词";
+ deps.complete = async () => '好的。\n```json\n{"reply":"这是动词。","action":{"kind":"none"}}\n```';
+ const result = await runChat(request, deps);
+ assert.equal(result.success, true); assert.equal(result.reply, "这是动词。");
+});
+test("plain-prose answer retries once with a corrective note before failing closed", async () => {
+ const { request, deps } = fixture(); request.message = "解释这个词";
+ const prompts: string[] = [];
+ deps.complete = async prompt => { prompts.push(prompt); return prompt.includes("上一次输出不是合法 JSON") ? JSON.stringify({ reply: "这次是合法 JSON。", action: { kind: "none" } }) : "对，\"recipe\" 和 receipt 发音确实有点像。"; };
+ const result = await runChat(request, deps);
+ assert.equal(result.success, true); assert.equal(result.reply, "这次是合法 JSON。");
+ assert.equal(prompts.length, 2); assert.ok(prompts[0].startsWith("{")); assert.match(prompts[1], /上一次输出不是合法 JSON/);
+ const persist = fixture(); persist.request.message = "解释这个词";
+ let calls = 0; persist.deps.complete = async () => { calls++; return "对，确实有点像。"; };
+ const failed = await runChat(persist.request, persist.deps);
+ assert.equal(failed.success, false); assert.equal(calls, 1 + CHAT_FORMAT_RETRIES); assert.match(failed.reply, /助教回复格式无效/);
+});
 test("historical preparation requests cannot authorize new cards", async () => {
  const { request, deps } = fixture();
  let calls = 0;

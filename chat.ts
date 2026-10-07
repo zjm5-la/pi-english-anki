@@ -1,6 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { contentFingerprint, ensureLexicalSense, type ItemRow } from "./db.ts";
-import { FORWARD_PROMPT_QUALITY, type GeneratedItem } from "./llm.ts";
+import { extractJsonObjectText, FORWARD_PROMPT_QUALITY, type GeneratedItem } from "./llm.ts";
+
+/** Model format violations retry once with a corrective note, like lesson generation. */
+export const CHAT_FORMAT_RETRIES = 1;
 
 export interface ChatRequest { requestId: string; message: string; itemId: number | null; history: { role: "user" | "assistant"; content: string }[]; readOnly?: boolean }
 export interface ChatResult { requestId: string; success: boolean; reply: string; action: "none" | "edited" | "added"; itemId: number | null }
@@ -76,10 +79,17 @@ export async function runChat(request: ChatRequest, deps: ChatDependencies): Pro
   const allowedAction = request.readOnly ? "none" : allowedChatAction(request.message);
   if (card && allowedAction !== "add" && deps.db.prepare("SELECT 1 FROM attempts WHERE item_id=? AND status='evaluating'").get(card.id)) throw new Error("此卡正在判题，请稍后再提问或修改");
   if (card && allowedAction !== "add" && !request.readOnly) { markChatAssistance(deps.db, card.id); deps.refresh(); }
-  const raw = await deps.complete(JSON.stringify({ message: request.message, history: request.history, card: card ? { id: card.id, type: card.type, text: card.text, meaning: card.meaning, phonetic: card.phonetic, example: card.example, example_cn: card.example_cn } : null, attempt, allowedAction }));
-  if (!deps.valid()) throw new Error("会话已失效，请重新发送");
-  const decision = JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""));
-  if (typeof decision.reply !== "string" || !decision.reply.trim() || decision.reply.length > 12000 || !["none", "edit", "add"].includes(decision.action?.kind)) throw new Error("助教回复格式无效，请重试");
+  const chatPrompt = JSON.stringify({ message: request.message, history: request.history, card: card ? { id: card.id, type: card.type, text: card.text, meaning: card.meaning, phonetic: card.phonetic, example: card.example, example_cn: card.example_cn } : null, attempt, allowedAction });
+  let decision: any;
+  for (let formatRetry = 0; formatRetry <= CHAT_FORMAT_RETRIES; formatRetry++) {
+   const raw = await deps.complete(formatRetry === 0 ? chatPrompt : `${chatPrompt}\n\n⚠ 上一次输出不是合法 JSON，无法解析。请重新回答，只输出一个 JSON 对象（如 {"reply":"...","action":{"kind":"none"}}），不要任何解释、markdown 代码围栏或多余文字。`);
+   if (!deps.valid()) throw new Error("会话已失效，请重新发送");
+   const json = extractJsonObjectText(raw);
+   if (!json) continue;
+   try { decision = JSON.parse(json); } catch { /* one corrective retry above */ }
+   if (decision) break;
+  }
+  if (!decision || typeof decision.reply !== "string" || !decision.reply.trim() || decision.reply.length > 12000 || !["none", "edit", "add"].includes(decision.action?.kind)) throw new Error("助教回复格式无效，请重试");
   if (decision.action.kind === "none") return { ...base, success: true, reply: decision.reply };
   if (request.readOnly) throw new Error("此入口只提供词义讲解，未修改卡片或学习记录");
   if (decision.action.kind !== allowedAction) throw new Error("请在最新消息中明确提出修卡或加卡要求");

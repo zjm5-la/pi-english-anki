@@ -85,7 +85,7 @@ function clozeTextAppendsAnswer(text: string, answer: string): boolean {
 }
 
 /** Extract the first JSON object, tolerating an optional Markdown fence. */
-function extractJsonObjectText(text: string): string | undefined {
+export function extractJsonObjectText(text: string): string | undefined {
 	const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
 	const start = cleaned.indexOf("{");
 	const end = cleaned.lastIndexOf("}");
