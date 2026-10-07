@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { restoreCard } from "./fsrs.ts";
+import { restoreCard, shiftNightDue } from "./fsrs.ts";
 import type { GeneratedItem } from "./llm.ts";
 
 // -- SQLite storage -------------------------------------------------------
@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 14;
+const SCHEMA_TARGET_VERSION = 15;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -457,6 +457,11 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 			updateItemDue.run(row.id, row.id);
 		}
 	},
+	// v15: due times scheduled into the dead of night slide to the next morning,
+	// matching the runtime waking-hours scheduling policy.
+	(db: DatabaseSync) => {
+		migrateNightDueTimes(db);
+	},
 ];
 
 /** Recreate items with a CHECK that also admits 'cloze' (SQLite cannot ALTER a CHECK). */
@@ -539,6 +544,46 @@ export function migrateDirectionState(db: DatabaseSync): void {
 			 WHERE type IN ('word','phrase') AND fsrs_state <> ''`,
 		).run(dir, ts);
 	}
+}
+
+/** One-time v15 repair: existing due times inside the night window (see
+ * shiftNightDue) slide to the morning slot. Direction rows shift first and
+ * items.due_at is recomputed as the MIN over directions, preserving the
+ * advanceReviewDirectional invariant. Idempotent. */
+export function migrateNightDueTimes(db: DatabaseSync): void {
+	const shift = (value: string): string | null => {
+		const due = new Date(value);
+		if (Number.isNaN(due.getTime())) return null;
+		const shifted = shiftNightDue(due);
+		return shifted.getTime() === due.getTime() ? null : shifted.toISOString();
+	};
+	const touchedItems = new Set<number>();
+	const updateDirection = db.prepare(
+		"UPDATE direction_state SET due_at = ? WHERE item_id = ? AND direction = ?",
+	);
+	for (const row of db.prepare("SELECT item_id, direction, due_at FROM direction_state").all() as {
+		item_id: number;
+		direction: string;
+		due_at: string;
+	}[]) {
+		const shifted = shift(row.due_at);
+		if (shifted) {
+			updateDirection.run(shifted, row.item_id, row.direction);
+			touchedItems.add(row.item_id);
+		}
+	}
+	const updateItem = db.prepare("UPDATE items SET due_at = ? WHERE id = ?");
+	for (const row of db.prepare("SELECT id, due_at FROM items").all() as {
+		id: number;
+		due_at: string;
+	}[]) {
+		const shifted = shift(row.due_at);
+		if (shifted) updateItem.run(shifted, row.id);
+	}
+	const recomputeMin = db.prepare(
+		"UPDATE items SET due_at = (SELECT MIN(due_at) FROM direction_state WHERE item_id = items.id) WHERE id = ?",
+	);
+	for (const id of touchedItems) recomputeMin.run(id);
 }
 
 function runMigrations(db: DatabaseSync): void {
@@ -946,7 +991,7 @@ export function recognitionDueFloorAfterProduction(
 	const nearProduction = Number.isFinite(productionDueMs)
 		? productionDueMs - RECOGNITION_LEAD_MS
 		: minimum;
-	return new Date(Math.max(minimum, nearProduction)).toISOString();
+	return shiftNightDue(new Date(Math.max(minimum, nearProduction))).toISOString();
 }
 
 export function advanceReviewDirectional(
@@ -963,10 +1008,10 @@ export function advanceReviewDirectional(
 	const sibling = direction === "forward" ? "reverse" : "forward";
 	const defaultSiblingFloor = now.getTime() + DIRECTION_MIN_SEPARATION_MS;
 	const requestedSiblingFloor = Date.parse(options?.siblingDueFloor ?? "");
-	const siblingMinDue = new Date(Math.max(
+	const siblingMinDue = shiftNightDue(new Date(Math.max(
 		defaultSiblingFloor,
 		Number.isFinite(requestedSiblingFloor) ? requestedSiblingFloor : defaultSiblingFloor,
-	)).toISOString();
+	))).toISOString();
 	db.prepare(
 		"INSERT OR IGNORE INTO direction_state (item_id, direction, fsrs_state, due_at, updated_at) VALUES (?, ?, '', ?, ?)",
 	).run(id, sibling, siblingMinDue, ts);

@@ -88,12 +88,26 @@ export function restoreCard(stateJson: string): { card: Card } | { corrupt: true
 	return { card };
 }
 
+/** Waking-hours policy: a due time landing between midnight and 06:00 local
+ * slides to 08:00 of the same calendar day, so nothing comes due while the
+ * learner is asleep. Reviewing a few hours late is harmless to FSRS. */
+export const NIGHT_DUE_END_HOUR = 6;
+export const MORNING_DUE_HOUR = 8;
+
+export function shiftNightDue(due: Date): Date {
+	if (due.getHours() >= NIGHT_DUE_END_HOUR) return due;
+	const shifted = new Date(due);
+	shifted.setHours(MORNING_DUE_HOUR, 0, 0, 0);
+	return shifted;
+}
+
 /** Advance a card only after an explicit user rating.
  * Passing null state creates the first schedule for a brand-new item.
  * Returns corrupt when the stored FSRS blob is malformed; callers must quarantine. */
 export function scheduleNext(stateJson: string | null, now: Date, rating: Rating = Rating.Good): { state: string; due: string } | { corrupt: true; error: string } {
 	if (!stateJson) {
 		const info = scheduler.repeat(new Card(), now)[rating];
+		info.card.due = shiftNightDue(info.card.due);
 		return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
 	}
 	const restored = restoreCard(stateJson);
@@ -106,6 +120,7 @@ export function scheduleNext(stateJson: string | null, now: Date, rating: Rating
 		for (const value of [info.card.stability, info.card.difficulty, info.card.elapsed_days, info.card.scheduled_days, info.card.reps, info.card.lapses]) {
 			if (!Number.isFinite(value)) return { corrupt: true, error: "scheduler_invalid_field" };
 		}
+		info.card.due = shiftNightDue(info.card.due);
 		return { state: JSON.stringify(info.card), due: info.card.due.toISOString() };
 	} catch (err) {
 		return { corrupt: true, error: `scheduler_error:${(err as Error).message}` };
