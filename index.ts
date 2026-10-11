@@ -818,7 +818,11 @@ export default function piEnglishAnkiExtension(
 				return undefined;
 			}
 			const undo = beginUndoContinuation(db);
-			let due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
+			// Review cards take priority over queued-new cards. Within due reviews
+			// the order is shuffled: FSRS preserves the clock time of each review,
+			// so a deterministic order would echo the same batch sequence day after
+			// day (A→B→C reviewed tonight resurfaces A→B→C in that order forever).
+			let due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} ORDER BY RANDOM() LIMIT 1`)
 				.get(now.toISOString()) as ItemRow | undefined;
 			let isReview = true;
 			if (!due && reviewsOnly) {

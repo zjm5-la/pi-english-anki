@@ -3144,12 +3144,18 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','alpha','阿尔法',?,?,1)").run(now, new Date(0).toISOString());
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔',?,?,1)").run(now, new Date(0).toISOString());
 		db.close();
-		await fake.fire(); // A claims alpha.
-		await fake.fire(); // B renders alpha.
+		await fake.fire(); // A claims one due card.
+		await fake.fire(); // B renders it.
+		const pre = openTestDb();
+		const ratedId = Number((pre.prepare("SELECT active_item_id FROM runtime_state WHERE id = 1").get() as { active_item_id: number }).active_item_id);
+		const ratedText = (pre.prepare("SELECT text FROM items WHERE id = ?").get(ratedId) as { text: string }).text;
+		const otherId = ratedId === 1 ? 2 : 1;
+		const otherText = ratedText === "alpha" ? "贝塔" : "阿尔法";
+		pre.close();
 		const inFlight = a.commands["anki:answer"].handler("alph", a.ctx);
 		await started;
-		await b.commands["anki:good"].handler("", b.ctx); // B rates alpha.
-		assert.match(b.widget().join(" "), /贝塔/, "B immediately advances the global slot before the old evaluation returns");
+		await b.commands["anki:good"].handler("", b.ctx); // B rates the active card.
+		assert.match(b.widget().join(" "), new RegExp(otherText), "B immediately advances the global slot before the old evaluation returns");
 		releaseResponse();
 		await inFlight;
 		const check = openTestDb();
@@ -3157,11 +3163,9 @@ test("stale async answer cannot record or rate the next global card", { concurre
 		const attemptCount = (check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE status = 'evaluated'").get() as any).n;
 		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id = 1").get() as any;
 		check.close();
-		assert.deepEqual(items.map((row) => ({ ...row })), [
-			{ text: "alpha", reviews: 1 },
-			{ text: "beta", reviews: 0 },
-		]);
-		assert.equal(active.active_item_id, 2, "beta remains the authoritative next card");
+		assert.equal(items.find((row) => row.text === ratedText)?.reviews, 1);
+		assert.equal(items.find((row) => row.text !== ratedText)?.reviews, 0);
+		assert.equal(active.active_item_id, otherId, "the unrated card remains the authoritative next card");
 		assert.equal(attemptCount, 0, "stale LLM result writes no evaluated attempt (B's manual self-report is recorded separately)");
 		await a.handlers.session_shutdown({ reason: "quit" }, a.ctx);
 		await b.handlers.session_shutdown({ reason: "quit" }, b.ctx);
@@ -3272,12 +3276,16 @@ test("manual Again immediately advances to the next due card without a feedback 
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','beta','贝塔',?,?,1)").run(now, new Date(0).toISOString());
 		db.close();
 		await fake.fire();
+		const pre = openTestDb();
+		const ratedId = Number((pre.prepare("SELECT active_item_id FROM runtime_state").get() as { active_item_id: number }).active_item_id);
+		const ratedText = (pre.prepare("SELECT text FROM items WHERE id = ?").get(ratedId) as { text: string }).text;
+		pre.close();
 		await harness.commands["anki:again"].handler("", harness.ctx);
-		assert.match(harness.widget().join(" "), /贝塔/, "the next due card is immediately usable");
+		assert.match(harness.widget().join(" "), ratedText === "alpha" ? /贝塔/ : /阿尔法/, "the next due card is immediately usable");
 		const check = openTestDb();
-		assert.equal(check.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
-		assert.ok(Date.parse(String(check.prepare("SELECT due_at FROM direction_state WHERE item_id=1 AND direction='forward'").get()?.due_at)) > Date.now(), "Again still schedules the failed direction for a future review");
-		assert.equal(check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id=1 AND explicit_rating='again'").get()?.n, 1);
+		assert.notEqual((check.prepare("SELECT active_item_id FROM runtime_state").get() as { active_item_id: number }).active_item_id, ratedId);
+		assert.ok(Date.parse(String(check.prepare("SELECT due_at FROM direction_state WHERE item_id=? AND direction='forward'").get(ratedId)?.due_at)) > Date.now(), "Again still schedules the failed direction for a future review");
+		assert.equal(Number((check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id=? AND explicit_rating='again'").get(ratedId) as { n: number }).n), 1);
 		check.close();
 		assert.equal(fake.active().length, 0, "no timer locks the next stored card");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
@@ -3617,19 +3625,29 @@ test("meaning-colliding forward reviews show target cues and matching audit snap
 		db.close();
 
 		await fake.fire();
+		const activeCard = () => {
+			const probe = openTestDb();
+			const id = Number((probe.prepare("SELECT active_item_id FROM runtime_state").get() as { active_item_id: number }).active_item_id);
+			const text = (probe.prepare("SELECT text FROM items WHERE id = ?").get(id) as { text: string }).text;
+			probe.close();
+			return { id, text };
+		};
 		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（例：I want to ____ a table for two\.）/);
+		const first = activeCard();
 		await harness.commands["anki:answer"].handler("", harness.ctx);
 		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（例：/);
-		await harness.commands["anki:answer"].handler("book", harness.ctx);
+		await harness.commands["anki:answer"].handler(first.text, harness.ctx);
 		let check = openTestDb();
-		let attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 1 ORDER BY id DESC LIMIT 1").get() as any;
+		let attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = ? ORDER BY id DESC LIMIT 1").get(first.id) as any;
 		check.close();
 		assert.equal(attempt.question_text, "默写单词「预订」的英文（例：I want to ____ a table for two.）");
 
+		const second = activeCard();
+		assert.notEqual(second.id, first.id, "rating advances to the colliding sibling card");
 		assert.match(harness.widget().join(" "), /默写单词「预订」的英文（例：I want to ____ a table for two\.）/);
-		await harness.commands["anki:answer"].handler("reserve", harness.ctx);
+		await harness.commands["anki:answer"].handler(second.text, harness.ctx);
 		check = openTestDb();
-		attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = 2 ORDER BY id DESC LIMIT 1").get() as any;
+		attempt = check.prepare("SELECT question_text FROM attempts WHERE item_id = ? ORDER BY id DESC LIMIT 1").get(second.id) as any;
 		check.close();
 		assert.equal(attempt.question_text, "默写单词「预订」的英文（例：I want to ____ a table for two.）");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
