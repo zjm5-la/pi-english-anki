@@ -13,6 +13,7 @@ import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, lo
 import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
+import { recordWeeklyChallengeDelivery, WEEKLY_CHALLENGE_MAX_PER_RUN, weeklyChallengeOwed, weeklyChallengePrompt, weeklyChallengeState } from "./weekly-challenge.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
 import { FACES, TYPE_LABELS, formatStatusLine, forwardCue, parseJsonCol, recallQuestionText, renderCard, sentenceExercise, sentenceQuestionText, spellingComparisonLines, type ForwardCue, type SentenceExerciseView } from "./render.ts";
@@ -94,6 +95,7 @@ export default function piEnglishAnkiExtension(
 	let autoRefillTimer: ReturnType<typeof setTimeout> | undefined;
 	let autoRefillRunning = false;
 	let autoRefillRetryAt = 0;
+	let weeklyChallengeRetryAt = 0;
 	let sessionGeneration = 0;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let workCheckAt: string | null = null;
@@ -816,7 +818,6 @@ export default function piEnglishAnkiExtension(
 				return undefined;
 			}
 			const undo = beginUndoContinuation(db);
-			// Review cards take priority over queued-new cards.
 			let due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 1 ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 				.get(now.toISOString()) as ItemRow | undefined;
 			let isReview = true;
@@ -1998,6 +1999,10 @@ export default function piEnglishAnkiExtension(
 		// ahead of fresh lesson generation (pure DB work, no LLM).
 		if (releaseCustomQueue(ctx, now)) return;
 
+		// 2.5 Weekly challenge words (one per week since the learner started,
+		// backfilled) generate into the custom queue during idle ticks.
+		if (await deliverWeeklyChallenge(ctx)) return;
+
 		// 3. Otherwise teach new items (LLM), using today's automatic or fixed quota.
 		const plan = loadPlan(db, now);
 		const introduced = countTodayNew(db, now);
@@ -2427,10 +2432,7 @@ export default function piEnglishAnkiExtension(
 		}
 		// Same adaptive snapshot semantics as generateAndInsert: taken after the
 		// generation claim, before any LLM await, and shared by every call below.
-		const adaptive: AdaptiveContext = (() => {
-			const profile = computeLearnerProfile(db!, new Date());
-			return { profile, budget: smoothBudget(db!, deriveBudget(profile)) };
-		})();
+		const adaptive: AdaptiveContext = adaptiveSnapshot();
 		const known = [
 			...knownList(db),
 			...listCustomQueue(db).flatMap((row) => {
@@ -2544,6 +2546,111 @@ export default function piEnglishAnkiExtension(
 			lastError = String((err as Error & { code?: string }).code || msg).slice(0, 80);
 			ctx.ui.notify(`制卡失败：${lastError}`, "error");
 			logGenStatus(`custom_error: ${lastError}`);
+		} finally {
+			if (db) releaseGeneration(generationToken);
+			if (sessionGeneration === generation) {
+				pendingLLMCall = false;
+				pendingLLMCallAt = 0;
+				drainTeachQueue();
+			}
+		}
+	}
+
+	/** Adaptive snapshot taken once per generation run, after the token claim. */
+	function adaptiveSnapshot(): AdaptiveContext {
+		const profile = computeLearnerProfile(db!, new Date());
+		return { profile, budget: smoothBudget(db!, deriveBudget(profile)) };
+	}
+
+	/** Weekly challenge delivery: one common-but-above-frontier word/phrase per
+	 * week since the learner started (backfilled). Cards go through the custom
+	 * queue, so critic review, dedup, and quota pacing all apply. Returns true
+	 * when a batch was generated (the caller re-runs the tick loop). */
+	async function deliverWeeklyChallenge(ctx: ExtensionContext): Promise<boolean> {
+		if (!db || config.intervalMinutes <= 0) return false;
+		if (weeklyChallengeRetryAt > Date.now()) return false;
+		if (weeklyChallengeOwed(weeklyChallengeState(db)) <= 0) return false;
+		if (pendingLLMCall || answerJudging || teachQueue.length > 0 || pendingReplacementTypes(db).length > 0) return false;
+		const preState = getRuntimeState(db);
+		if (preState.generation_token && Date.parse(preState.generation_until ?? "") > Date.now()) return false;
+		const generationToken = claimGeneration();
+		if (!generationToken) return false;
+		const owed = weeklyChallengeOwed(weeklyChallengeState(db));
+		const count = Math.min(owed, WEEKLY_CHALLENGE_MAX_PER_RUN);
+		const userPrompt = weeklyChallengePrompt(count);
+		const adaptive = adaptiveSnapshot();
+		const known = [
+			...knownList(db),
+			...listCustomQueue(db).flatMap((row) => {
+				try { return [(JSON.parse(row.payload) as GeneratedItem).text]; } catch { return []; }
+			}),
+		];
+		const generation = sessionGeneration;
+		pendingLLMCall = true;
+		pendingLLMCallAt = Date.now();
+		try {
+			const resolved = resolveModel(ctx);
+			if (!resolved) throw new Error("NO_MODEL");
+			let items: GeneratedItem[] | undefined;
+			const decision = await generateCustomCards(llm, ctx, resolved, userPrompt, known, config, adaptive);
+			if (sessionGeneration !== generation || !db) return false;
+			if (!decision.ready) throw new Error(decision.reason || "NOT_READY");
+			items = decision.items;
+			let verdict = await critiqueLesson(llm, ctx, resolved, { topic: "每周挑战词", items }, known, config, adaptive, null);
+			for (let attempt = 0; attempt < MAX_LESSON_REVISIONS && verdict.available && !verdict.pass; attempt++) {
+				if (sessionGeneration !== generation || !db || !ownsGeneration(getRuntimeState(db), generationToken)) break;
+				const revised = await generateCustomCards(llm, ctx, resolved, userPrompt, known, config, adaptive, verdict.issues);
+				if (sessionGeneration !== generation || !db) return false;
+				if (!revised.ready) break;
+				items = revised.items;
+				verdict = await critiqueLesson(llm, ctx, resolved, { topic: "每周挑战词", items }, known, config, adaptive, null);
+			}
+			if (sessionGeneration !== generation || !db) return false;
+			if (!verdict.pass) throw new Error(verdict.available ? "CRITIC_REJECTED" : "CRITIC_UNAVAILABLE");
+			const queueFingerprints = new Set(listCustomQueue(db).map((row) => row.fingerprint));
+			const kept: GeneratedItem[] = [];
+			let dropped = 0;
+			for (const item of items) {
+				const fingerprint = contentFingerprint(item.type, item.text, item.meaning);
+				if (db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fingerprint) || queueFingerprints.has(fingerprint)) { dropped++; continue; }
+				queueFingerprints.add(fingerprint);
+				kept.push(item);
+			}
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				const state = getRuntimeState(db);
+				if (!ownsGeneration(state, generationToken)) {
+					db.exec("ROLLBACK");
+				logGenStatus("weekly_challenge_deferred");
+					return false;
+				}
+				// Re-read under the write lock: another process may have delivered
+				// the same owed weeks while this generation was in flight.
+				const fresh = weeklyChallengeState(db);
+				if (weeklyChallengeOwed(fresh) <= 0) {
+					db.exec("ROLLBACK");
+				return false;
+				}
+				for (const item of kept) enqueueCustomCard(db, userPrompt, item);
+				// Weeks are consumed by the attempt, not by kept count: duplicates
+				// dropped above must not re-owe the same weeks forever.
+				recordWeeklyChallengeDelivery(db, fresh, count);
+				db.exec("COMMIT");
+			} catch (err) {
+				try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+				throw err;
+			}
+			const total = customQueueCount(db);
+			ctx.ui.notify(`本周挑战词已入队：${kept.length} 张（队列共 ${total} 张，${queueEta(db, total)}）`, "info");
+			if (dropped) ctx.ui.notify(`其中 ${dropped} 张与已有卡片/队列重复，已丢弃`, "info");
+			logGenStatus(`weekly_challenge_ok: ${kept.length} 张（丢弃 ${dropped}）`);
+			releaseCustomQueue(ctx, new Date());
+			return true;
+		} catch (err) {
+			if (sessionGeneration === generation) logGenStatus(`weekly_challenge_error: ${String((err as Error)?.message || err).slice(0, 120)}`);
+			// Retry on a later tick, gently spaced.
+			weeklyChallengeRetryAt = Date.now() + 5 * 60_000;
+			return false;
 		} finally {
 			if (db) releaseGeneration(generationToken);
 			if (sessionGeneration === generation) {
