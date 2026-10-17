@@ -807,6 +807,17 @@ export default function piEnglishAnkiExtension(
 		return Boolean(db.prepare(`SELECT 1 FROM items WHERE due_at <= ? AND shown = 0 AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) ${SCHEDULABLE} LIMIT 1`).get(now.toISOString()));
 	}
 
+	/** Whether a queued /anki:add or weekly-challenge card is releasable right
+	 * now: the daily quota still has room and no replacement obligation
+	 * outranks the FIFO queue. Only meaningful when hasReadyStoredCard already
+	 * ruled out every stored card. */
+	function hasReleasableQueueCard(now: Date): boolean {
+		if (!db) return false;
+		if (customQueueCount(db) === 0) return false;
+		if (pendingReplacementTypes(db).length > 0) return false;
+		return hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now));
+	}
+
 	/** Atomically select, mark, and activate the next due card. */
 	function claimDueItem(now: Date, reviewsOnly = false): ItemRow | undefined {
 		if (!db) return undefined;
@@ -1431,7 +1442,9 @@ export default function piEnglishAnkiExtension(
 				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
-				hasImmediateNext = hasReadyStoredCard(now);
+				// A queued weekly-challenge / /anki:add card counts as the immediate next
+				// card too: otherwise active study starves the FIFO queue behind the pacing interval.
+				hasImmediateNext = hasReadyStoredCard(now) || hasReleasableQueueCard(now);
 				// A review due seconds from now must not wait a full pacing interval:
 				// cap the fallback check at the earliest upcoming review due time,
 				// excluding this card's own deliberate automatic-interval re-test.
@@ -1507,8 +1520,15 @@ export default function piEnglishAnkiExtension(
 		} else if (hasImmediateNext && activeItem(db)) {
 			// Another runtime won the next-card claim after our rating committed.
 			renderGlobalCard(ctx);
+		} else if (hasImmediateNext) {
+			// No stored card claimable: the custom queue (weekly challenge or
+			// /anki:add cards) is the immediate next card. Release it now instead
+			// of starving it behind the pacing interval; a lost race falls back to
+			// an immediate tick so the normal petTick ordering still applies.
+			stopTimer();
+			if (!releaseCustomQueue(ctx, new Date())) scheduleTimer(0);
 		} else {
-			scheduleTimer(hasImmediateNext ? 0 : intervalMs());
+			scheduleTimer(intervalMs());
 		}
 		return true;
 	}

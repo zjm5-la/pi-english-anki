@@ -22,6 +22,7 @@ const sdkRuntimeFactory = async (ctx: any) => ({
 	},
 }) as any;
 const { default: extension, contentFingerprint } = await import("../index.ts");
+const { enqueueCustomCard } = await import("../db.ts");
 const { undoStudyAction } = await import("../study-undo.ts");
 let sessionSeq = 0;
 
@@ -186,6 +187,56 @@ test("time-only lifecycle pauses for pending cards and restarts after rating", {
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 		assert.equal(fake.active().length, 0);
 		assert.equal(fake.poll().length, 0);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("rating with no stored card releases the queued custom card immediately", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		// Fixed 3/day quota, no LLM anywhere: one planned card plus two queued cards.
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 3, adaptiveNewCards: false });
+		const harness = await makeSession();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','alpha','阿尔法',?,?)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		enqueueCustomCard(db, "test", { type: "word", text: "queue word one", meaning: "队列词一", phonetic: "/x/", example: "One.", example_cn: "一。" });
+		enqueueCustomCard(db, "test", { type: "word", text: "queue word two", meaning: "队列词二", phonetic: "/x/", example: "Two.", example_cn: "二。" });
+		db.close();
+		await fake.fire();
+		assert.match(harness.widget().join(" "), /阿尔法/, "planned card is active");
+
+		// No stored card is claimable after rating alpha (no due review, empty
+		// inventory): the first queued card must surface immediately instead of
+		// waiting out the pacing interval.
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /队列词一/, "queued card becomes the immediate next card");
+		let check = openTestDb();
+		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM custom_card_queue").get() as any).n, 0, "queue drained FIFO");
+		const kinds = check.prepare("SELECT introduction_kind, introduced_at IS NOT NULL AS introduced, shown FROM items WHERE text LIKE 'queue word%' ORDER BY id").all() as any[];
+		check.close();
+		assert.equal(kinds[0].introduction_kind, "custom");
+		assert.equal(kinds[0].introduced, 1);
+		assert.equal(kinds[0].shown, 1);
+		assert.equal(kinds[1].introduction_kind, "custom");
+		assert.equal(kinds[1].shown, 0, "second queued card waits as first-display inventory");
+
+		// The staged inventory card claims normally on the next rating.
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /队列词二/, "second queued card claims from inventory");
+
+		// Quota full (3/3): rating the last card releases nothing new.
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		const face = harness.widget().join(" ");
+		assert.doesNotMatch(face, /队列词/, "no new card face after the quota is exhausted");
+		check = openTestDb();
+		const active = check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
+		const introduced = check.prepare("SELECT COUNT(*) AS n FROM items WHERE introduction_kind IN ('planned','custom') AND introduced_at IS NOT NULL").get() as any;
+		check.close();
+		assert.equal(active.active_item_id, null);
+		assert.equal(introduced.n, 3, "quota consumed exactly by the three surfaced cards");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
 	}
