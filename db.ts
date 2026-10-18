@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 15;
+const SCHEMA_TARGET_VERSION = 16;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -462,6 +462,12 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	(db: DatabaseSync) => {
 		migrateNightDueTimes(db);
 	},
+	// v16: the study day ends at 22:00 — dues landing in [22:00, 24:00) move to
+	// the next day's 05:00 slot (and pre-dawn dues join the same 05:00 slot),
+	// so a late-evening session never leaves "unfinished today" pressure.
+	(db: DatabaseSync) => {
+		migrateNightDueTimes(db);
+	},
 ];
 
 /** Recreate items with a CHECK that also admits 'cloze' (SQLite cannot ALTER a CHECK). */
@@ -546,8 +552,8 @@ export function migrateDirectionState(db: DatabaseSync): void {
 	}
 }
 
-/** One-time v15 repair: existing due times inside the night window (see
- * shiftNightDue) slide to the morning slot. Direction rows shift first and
+/** Shared v15/v16 repair: existing due times outside the study-day window
+ * (see shiftNightDue) slide into it. Direction rows shift first and
  * items.due_at is recomputed as the MIN over directions, preserving the
  * advanceReviewDirectional invariant. Idempotent. */
 export function migrateNightDueTimes(db: DatabaseSync): void {

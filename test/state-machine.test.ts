@@ -1475,8 +1475,8 @@ test("schema migration is idempotent and registers adaptive protocol 1", { concu
 			const attemptCols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((r) => r.name);
 			const idxNames = (db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as any[]).map((r) => r.name);
 			db.close();
-			assert.deepEqual({ ...meta }, { schema_version: 15, adaptive_protocol: 1, migration_state: "complete" });
-			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+			assert.deepEqual({ ...meta }, { schema_version: 16, adaptive_protocol: 1, migration_state: "complete" });
+			assert.deepEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
 			for (const t of ["lessons","lexical_senses","lexical_surface_versions","exercises","exercise_senses","supporting_materials","content_catalog_state","attempts","mastery_state","content_reports","fsrs_corruptions","tutor_jobs","tutor_job_artifacts","replacement_requests","runtime_clients","custom_card_queue","schema_meta","schema_migrations"]) {
 				assert.ok(tableNames.includes(t), `table ${t} exists`);
 			}
@@ -1550,7 +1550,7 @@ test("v13 quarantines same-surface lexical duplicates without deleting history",
 		assert.equal(active.active_item_id, null, "an active duplicate is released");
 		assert.equal(queueCount, 0, "same-surface queued duplicate is removed");
 		assert.equal(introduced, 0, "quarantined planned duplicate does not consume quota");
-		assert.equal(meta.schema_version, 15);
+		assert.equal(meta.schema_version, 16);
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
 		fake.restore();
@@ -1588,7 +1588,7 @@ test("v14 defers recognition after proven unassisted production", { concurrency:
 		const expected = new Date(Date.parse(productionDue) - 60_000).toISOString();
 		assert.deepEqual({ ...reverse }, { fsrs_state: "reverse-state", due_at: expected });
 		assert.equal(item.due_at, expected);
-		assert.equal(meta.schema_version, 15);
+		assert.equal(meta.schema_version, 16);
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
 		fake.restore();
@@ -1615,7 +1615,7 @@ test("v5 upgrades an existing v4 database without losing cards", { concurrency: 
 		const cols = (db.prepare("PRAGMA table_info(runtime_state)").all() as any[]).map((row) => row.name);
 		const card = db.prepare("SELECT text,meaning FROM items WHERE text='preserved'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 15);
+		assert.equal(meta.schema_version, 16);
 		for (const column of ["active_review_cycle_id", "active_exercise_id", "active_cycle_outcome", "active_retry_count", "active_assistance_level"]) {
 			assert.ok(cols.includes(column), `${column} migrated`);
 		}
@@ -1657,7 +1657,7 @@ test("v7 restores fractional elapsed_days false-positive quarantines without los
 		const corruption = db.prepare("SELECT resolution FROM fsrs_corruptions WHERE item_id=1").get() as any;
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 15);
+		assert.equal(meta.schema_version, 16);
 		assert.deepEqual({ ...item }, { reviews: 5, fsrs_state: state, fsrs_status: "ok", fsrs_error: null, fsrs_corrupt_at: null });
 		assert.equal(corruption.resolution, "restored:v7_fractional_elapsed_days_false_positive");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
@@ -1687,7 +1687,7 @@ test("v8 upgrades an existing v7 database and preserves directionless attempts",
 		const cols = (db.prepare("PRAGMA table_info(attempts)").all() as any[]).map((row) => row.name);
 		const attempt = db.prepare("SELECT verdict, direction FROM attempts WHERE id = 'legacy-attempt'").get() as any;
 		db.close();
-		assert.equal(meta.schema_version, 15);
+		assert.equal(meta.schema_version, 16);
 		assert.ok(cols.includes("direction"), "direction migrated");
 		assert.deepEqual({ ...attempt }, { verdict: "correct", direction: null });
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
@@ -1733,7 +1733,7 @@ test("v11 upgrades an existing v10 database and admits cloze items", { concurren
 			new Date(0).toISOString(),
 		);
 		db.close();
-		assert.equal(meta.schema_version, 15, "v11 migration and later steps applied");
+		assert.equal(meta.schema_version, 16, "v11 migration and later steps applied");
 		assert.deepEqual({ ...card }, { text: "preserved", meaning: "保留" }, "existing cards survive the rebuild");
 		await upgraded.handlers.session_shutdown({ reason: "quit" }, upgraded.ctx);
 	} finally {
@@ -2362,7 +2362,10 @@ test("unassisted forward recall defers the easier reverse direction", { concurre
 		const forwardDue = Date.parse(directions[0].due_at);
 		const reverseDue = Date.parse(directions[1].due_at);
 		assert.ok(forwardDue - now.getTime() > 24 * 3600 * 1000, "mature production interval should exceed one day");
-		assert.equal(forwardDue - reverseDue, 60_000, "recognition is checked near, not one day after, production");
+		assert.ok(
+			reverseDue <= forwardDue && forwardDue - reverseDue <= 60_000,
+			"recognition is checked at or just before production (both collapse to the same 05:00 slot outside the study-day window)",
+		);
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();
@@ -2552,7 +2555,7 @@ test("schema_meta records completed migration version", { concurrency: false }, 
 	const db = openTestDb();
 	const meta = db.prepare("SELECT schema_version, migration_state FROM schema_meta WHERE id=1").get() as any;
 	db.close();
-	assert.equal(meta.schema_version, 15, "schema migrated to v15");
+	assert.equal(meta.schema_version, 16, "schema migrated to v16");
 	assert.equal(meta.migration_state, "complete");
 	await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 });

@@ -88,15 +88,18 @@ export function restoreCard(stateJson: string): { card: Card } | { corrupt: true
 	return { card };
 }
 
-/** Waking-hours policy: a due time landing between midnight and 06:00 local
- * slides to 08:00 of the same calendar day, so nothing comes due while the
- * learner is asleep. Reviewing a few hours late is harmless to FSRS. */
-export const NIGHT_DUE_END_HOUR = 6;
-export const MORNING_DUE_HOUR = 8;
+/** Study-day window policy: due times must land inside [05:00, 22:00) local.
+ * A due after the 22:00 cutoff belongs to the next morning's 05:00 slot, so
+ * a late-evening session never leaves "unfinished today" pressure; pre-dawn
+ * dues slide to the same 05:00 slot of their calendar day. */
+export const MORNING_DUE_HOUR = 5;
+export const EVENING_CUTOFF_HOUR = 22;
 
 export function shiftNightDue(due: Date): Date {
-	if (due.getHours() >= NIGHT_DUE_END_HOUR) return due;
+	const hour = due.getHours();
+	if (hour >= MORNING_DUE_HOUR && hour < EVENING_CUTOFF_HOUR) return due;
 	const shifted = new Date(due);
+	if (hour >= EVENING_CUTOFF_HOUR) shifted.setDate(shifted.getDate() + 1);
 	shifted.setHours(MORNING_DUE_HOUR, 0, 0, 0);
 	return shifted;
 }

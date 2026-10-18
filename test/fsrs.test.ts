@@ -5,28 +5,35 @@ import { join } from "node:path";
 import test from "node:test";
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "anki-fsrs-test-"));
 const { insertItem, migrateNightDueTimes, openDb } = await import("../db.ts");
-const { MORNING_DUE_HOUR, NIGHT_DUE_END_HOUR, scheduleNext, shiftNightDue } = await import("../fsrs.ts");
+const { MORNING_DUE_HOUR, EVENING_CUTOFF_HOUR, scheduleNext, shiftNightDue } = await import("../fsrs.ts");
 const { Rating } = await import("fsrs.js");
 
-test("shiftNightDue slides dead-of-night dues to the morning slot", () => {
+test("shiftNightDue keeps dues inside the 05:00–22:00 study-day window", () => {
 	const night = new Date(2026, 9, 8, 0, 5, 30);
 	const shifted = shiftNightDue(night);
 	assert.equal(shifted.getHours(), MORNING_DUE_HOUR);
 	assert.equal(shifted.getMinutes(), 0);
-	assert.equal(shifted.getDate(), night.getDate(), "stays on the same calendar day");
-	assert.equal(shiftNightDue(new Date(2026, 9, 8, 5, 59)).getHours(), MORNING_DUE_HOUR);
-	const boundary = new Date(2026, 9, 8, NIGHT_DUE_END_HOUR, 0);
-	assert.equal(shiftNightDue(boundary).getTime(), boundary.getTime(), "06:00 boundary stays unchanged");
-	const evening = new Date(2026, 9, 8, 23, 30);
-	assert.equal(shiftNightDue(evening).getTime(), evening.getTime(), "evening dues stay unchanged");
+	assert.equal(shifted.getDate(), night.getDate(), "pre-dawn stays on the same calendar day");
+	assert.equal(shiftNightDue(new Date(2026, 9, 8, 4, 59)).getHours(), MORNING_DUE_HOUR);
+	const openBoundary = new Date(2026, 9, 8, MORNING_DUE_HOUR, 0);
+	assert.equal(shiftNightDue(openBoundary).getTime(), openBoundary.getTime(), "05:00 boundary stays unchanged");
+	const lastSlot = new Date(2026, 9, 8, EVENING_CUTOFF_HOUR - 1, 59);
+	assert.equal(shiftNightDue(lastSlot).getTime(), lastSlot.getTime(), "21:59 stays unchanged");
+	const lateEvening = new Date(2026, 9, 8, 23, 30);
+	const nextMorning = shiftNightDue(lateEvening);
+	assert.equal(nextMorning.getHours(), MORNING_DUE_HOUR);
+	assert.equal(nextMorning.getDate(), lateEvening.getDate() + 1, "post-cutoff dues belong to tomorrow");
+	const cutoff = new Date(2026, 9, 8, EVENING_CUTOFF_HOUR, 0);
+	const afterCutoff = shiftNightDue(cutoff);
+	assert.equal(afterCutoff.getDate(), cutoff.getDate() + 1, "the 22:00 cutoff itself rolls to tomorrow");
 });
 
-test("scheduleNext never leaves a due inside the night window", () => {
+test("scheduleNext never leaves a due outside the study-day window", () => {
 	for (const now of [new Date(2026, 9, 7, 23, 58, 30), new Date(2026, 9, 8, 0, 10), new Date(2026, 9, 8, 14, 0)]) {
 		const result = scheduleNext(null, now, Rating.Good);
 		assert.ok(!("corrupt" in result));
 		const hour = new Date(result.due).getHours();
-		assert.ok(hour >= NIGHT_DUE_END_HOUR, `due hour ${hour} from ${now.toISOString()}`);
+		assert.ok(hour >= MORNING_DUE_HOUR && hour < EVENING_CUTOFF_HOUR, `due hour ${hour} from ${now.toISOString()}`);
 	}
 });
 
@@ -46,7 +53,7 @@ test("night migration shifts stored dues, keeps the direction MIN invariant, and
 	const item = db.prepare("SELECT due_at FROM items WHERE id = ?").get(id)!;
 	assert.equal((forward as { due_at: string }).due_at, expectForward);
 	assert.equal((reverse as { due_at: string }).due_at, morning.toISOString(), "daytime dues stay unchanged");
-	assert.equal((item as { due_at: string }).due_at, morning.toISOString(), "items.due_at recomputed as MIN over directions");
+	assert.equal((item as { due_at: string }).due_at, expectForward, "items.due_at recomputed as MIN over directions");
 	migrateNightDueTimes(db);
 	assert.deepEqual(db.prepare("SELECT due_at FROM items WHERE id = ?").get(id), item, "second run is a no-op");
 });
