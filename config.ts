@@ -17,6 +17,10 @@ export interface PetConfig {
 	dailyNewLimit: number;
 	/** Let recent recall quality and due-review load choose today's limit. */
 	adaptiveNewCards: boolean;
+	/** When false the tutor never generates cards itself (auto lessons, skip
+	 * replacements, weekly challenge, /anki:teach, /anki:add): new cards come
+	 * only from explicit /anki:insert by the terminal pi session. */
+	autoTeach: boolean;
 	showWidget: boolean;
 	verbose: boolean;
 }
@@ -36,6 +40,7 @@ export const DEFAULTS: PetConfig = {
 	intervalMinutes: 10,
 	dailyNewLimit: ADAPTIVE_MAX_NEW_ITEMS,
 	adaptiveNewCards: true,
+	autoTeach: true,
 	showWidget: true,
 	verbose: false,
 };
@@ -72,5 +77,6 @@ export function loadConfig(cwd: string): PetConfig {
 	} else {
 		config.dailyNewLimit = Math.floor(config.dailyNewLimit);
 	}
+	if (typeof config.autoTeach !== "boolean") config.autoTeach = DEFAULTS.autoTeach;
 	return config;
 }

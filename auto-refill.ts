@@ -32,12 +32,12 @@ export function autoRefillPlan(db: DatabaseSync, config: PetConfig, now = new Da
 	const target = daily
 		? unlimitedDaily ? Math.max(0, ADAPTIVE_MAX_NEW_ITEMS - introduced) : remainingNewCardSlots(plan, introduced, 0)
 		: Math.min(5, remainingNewCardSlots(plan, introduced, 5));
-	const paused = config.intervalMinutes <= 0 || plan.paused;
+	const paused = config.intervalMinutes <= 0 || !config.autoTeach || plan.paused;
 	const phase: AutoRefillStatus["phase"] = paused ? "paused" : target === 0 ? "quota_reached" : (daily || inventory + queued <= 1) && inventory + queued < target ? "checking" : "ready";
 	const unlimitedNote = unlimitedDaily ? `（学习不限量，每日自动备课最多 ${ADAPTIVE_MAX_NEW_ITEMS} 张）` : "";
 	const status: AutoRefillStatus = {
 		version: 1, strategy, phase, inventory, queued, target, retryAt: null,
-		reason: (config.intervalMinutes <= 0 ? "自动检查已关闭" : plan.paused ? plan.reason : target === 0 ? unlimitedDaily ? "今日自动备课目标已完成" : "今日新卡额度已用完" : phase === "checking" ? daily ? "正在准备今天剩余的新卡" : "准备自动补充新卡" : daily ? "今天剩余新卡已备齐，复习优先" : queued > 0 ? "已有待放出的卡片，复习优先" : "已备好新卡，复习优先") + unlimitedNote,
+		reason: (config.intervalMinutes <= 0 ? "自动检查已关闭" : !config.autoTeach ? "终端出卡模式：新卡由终端 pi 用 /anki:insert 入队，本库只负责调度" : plan.paused ? plan.reason : target === 0 ? unlimitedDaily ? "今日自动备课目标已完成" : "今日新卡额度已用完" : phase === "checking" ? daily ? "正在准备今天剩余的新卡" : "准备自动补充新卡" : daily ? "今天剩余新卡已备齐，复习优先" : queued > 0 ? "已有待放出的卡片，复习优先" : "已备好新卡，复习优先") + unlimitedNote,
 		updatedAt: now.toISOString(),
 	};
 	const slots = paused ? 0 : Math.max(0, target - inventory - queued);

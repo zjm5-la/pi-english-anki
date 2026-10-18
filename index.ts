@@ -9,7 +9,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { dailyLoadPlan, formatDailyLoadPlan, hasNewCardCapacity, nextAdaptiveLessonBatch, remainingNewCardSlots } from "./adaptive-load.ts";
-import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, type PetConfig, type ThinkingLevel } from "./config.ts";
+import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, MAX_CUSTOM_PER_ADD, type PetConfig, type ThinkingLevel } from "./config.ts";
 import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
@@ -302,7 +302,7 @@ export default function piEnglishAnkiExtension(
 
 	/** Refill stored inventory independently of the currently displayed card. */
 	function scheduleReplacementWork() {
-		if (replacementTimer || replacementRunning || !db || !latestCtx || pendingReplacementTypes(db).length === 0) return;
+		if (!config.autoTeach || replacementTimer || replacementRunning || !db || !latestCtx || pendingReplacementTypes(db).length === 0) return;
 		const generation = sessionGeneration;
 		const delay = Math.max(0, replacementRetryAt - Date.now());
 		replacementCheckAt = new Date(Date.now() + delay).toISOString();
@@ -1596,7 +1596,9 @@ export default function piEnglishAnkiExtension(
 				);
 			}
 			bumpStat(db, "total_skipped", 1);
-			enqueueReplacement(db, item.type);
+			// Terminal-teach mode: a mastered skip generates no replacement card;
+			// new cards come only from explicit /anki:insert.
+			if (config.autoTeach) enqueueReplacement(db, item.type);
 			// Give this instance a short grace to generate the replacement without
 			// another session surfacing a card in between.
 			setRuntimeState(db, {
@@ -2027,12 +2029,12 @@ export default function piEnglishAnkiExtension(
 
 		// 2.5 Weekly challenge words (one per week since the learner started,
 		// backfilled) generate into the custom queue during idle ticks.
-		if (await deliverWeeklyChallenge(ctx)) return;
+		if (config.autoTeach && await deliverWeeklyChallenge(ctx)) return;
 
 		// 3. Otherwise teach new items (LLM), using today's automatic or fixed quota.
 		const plan = loadPlan(db, now);
 		const introduced = countTodayNew(db, now);
-		if (hasNewCardCapacity(plan, introduced)) {
+		if (config.autoTeach && hasNewCardCapacity(plan, introduced)) {
 			if (pendingLLMCall && !resetHungLlmCall()) return;
 			// Queued manual topics take priority over a fresh automatic lesson.
 			if (teachQueue.length > 0) {
@@ -3009,6 +3011,29 @@ export default function piEnglishAnkiExtension(
 			try { request = parseTeachRequest(String(args ?? "")); }
 			catch { ctx.ui.notify("用法：/anki:teach [--request-id UUID] <话题>", "error"); return; }
 			if (!db) { ctx.ui.notify("数据库不可用", "error"); return; }
+			if (!config.autoTeach) {
+				// Terminal-teach mode: resolve any tracked request as an explicit
+				// failure so the app's teach panel does not wait for a receipt.
+				if (request.requestId) {
+					db.exec("BEGIN IMMEDIATE");
+					try {
+						writeTeachReceipt(db, {
+							requestId: request.requestId,
+							topic: request.topic,
+							phase: "failed",
+							itemsAdded: 0,
+							errorCode: "AUTO_TEACH_DISABLED",
+								updatedAt: new Date().toISOString(),
+							});
+						db.exec("COMMIT");
+						} catch (err) {
+							try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+							throw err;
+						}
+				}
+				ctx.ui.notify("已切换终端出卡模式：备课由终端 pi 对话完成，用 /anki:insert 直接入队", "warning");
+				return;
+			}
 			if (request.requestId) {
 				db.exec("BEGIN IMMEDIATE");
 				try {
@@ -3039,6 +3064,10 @@ export default function piEnglishAnkiExtension(
 				ctx.ui.notify("数据库不可用", "error");
 				return;
 			}
+			if (!config.autoTeach) {
+				ctx.ui.notify("已切换终端出卡模式：请在终端 pi 对话中出卡，或用 /anki:insert 直接入队", "warning");
+				return;
+			}
 			if (pendingLLMCall) {
 				ctx.ui.notify("上一轮备课还在进行中，请稍候", "info");
 				return;
@@ -3047,6 +3076,56 @@ export default function piEnglishAnkiExtension(
 			void runAddCustomCards(ctx, userPrompt)
 				.catch((err) => console.error(`[pi-english-anki] add failed: ${err}`))
 				.finally(() => scheduleTimer());
+		},
+	});
+
+	pi.registerCommand("anki:insert", {
+		description: "终端出卡入口：直接入队 JSON 卡片数组（绕过本体 LLM 生成，仍走去重与每日额度）",
+		handler: async (args, ctx) => {
+			if (!db) { ctx.ui.notify("数据库不可用", "error"); return; }
+			const raw = String(args ?? "").trim();
+			if (!raw) {
+				ctx.ui.notify("用法：/anki:insert '[{\"type\":\"word\",\"text\":\"kettle\",\"meaning\":\"…\"}]'", "info");
+				return;
+			}
+			let parsed: unknown;
+			try { parsed = JSON.parse(raw); } catch (err) { ctx.ui.notify(`JSON 解析失败：${err}`, "error"); return; }
+			const list = Array.isArray(parsed) ? parsed : [parsed];
+			if (list.length === 0) { ctx.ui.notify("空数组", "error"); return; }
+			if (list.length > MAX_CUSTOM_PER_ADD) { ctx.ui.notify(`一次最多 ${MAX_CUSTOM_PER_ADD} 张`, "error"); return; }
+			const kept: GeneratedItem[] = [];
+			const dropped: string[] = [];
+			const batchFingerprints = new Set<string>();
+			for (const entry of list) {
+				const item = (() => { try { return parseGeneratedItem(entry); } catch { return undefined; } })();
+				if (!item) { dropped.push("(格式无效)"); continue; }
+				const fingerprint = contentFingerprint(item.type, item.text, item.meaning);
+				if (batchFingerprints.has(fingerprint)) { dropped.push(`${item.text}(批内重复)`); continue; }
+				const dupe = db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(fingerprint)
+					?? db.prepare("SELECT 1 FROM custom_card_queue WHERE fingerprint = ?").get(fingerprint);
+				if (dupe) { dropped.push(item.text); continue; }
+				batchFingerprints.add(fingerprint);
+				kept.push(item);
+			}
+			if (kept.length === 0) {
+				ctx.ui.notify(`没有可入队的卡（重复/无效 ${dropped.length} 张）${dropped.length ? `：${dropped.join("、").slice(0, 200)}` : ""}`, "warning");
+				return;
+			}
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				for (const item of kept) enqueueCustomCard(db, "terminal", item);
+				db.exec("COMMIT");
+			} catch (err) {
+				try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+				ctx.ui.notify(`入队失败：${err}`, "error");
+				return;
+			}
+			const total = customQueueCount(db);
+			ctx.ui.notify(`终端出卡：入队 ${kept.length} 张（丢弃重复/无效 ${dropped.length} 张），队列共 ${total} 张`, "info");
+			if (dropped.length) ctx.ui.notify(`丢弃：${dropped.join("、").slice(0, 200)}`, "info");
+			// Try to surface the first queued card right away; pacing, an active
+			// card, or quota otherwise defer it to the next tick.
+			releaseCustomQueue(ctx, new Date());
 		},
 	});
 

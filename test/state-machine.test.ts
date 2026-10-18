@@ -5394,3 +5394,47 @@ test("undo newer rating keeps its pacing and receipt when an older skip fails la
 		assert.equal(db.prepare("SELECT active_item_id FROM runtime_state").get()?.active_item_id, 2);
 	} finally { release(); if (s) await s.handlers.session_shutdown({ reason: "quit" }, s.ctx); db?.close(); registration.unregister(); fake.restore(); }
 });
+
+test("terminal-teach mode: no auto generation, teach resolves as failed, insert enqueues directly", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 5, adaptiveNewCards: false, autoTeach: false });
+		const harness = await makeSession();
+		const requestId = "0f0e0d0c-1a2b-3c4d-5e6f-7a8b9c0d1e2f";
+		await harness.commands["anki:teach"].handler(`--request-id ${requestId} airport`, harness.ctx);
+		let db = openTestDb();
+		const receipt = JSON.parse((db.prepare("SELECT value FROM stats WHERE key = ?").get(`teach_request:${requestId}`) as any).value);
+		const pendingReplacements = JSON.parse((db.prepare("SELECT value FROM stats WHERE key='pending_replacements'").get() as any)?.value ?? "[]");
+		db.close();
+		assert.equal(receipt.phase, "failed");
+		assert.equal(receipt.errorCode, "AUTO_TEACH_DISABLED");
+		assert.deepEqual(pendingReplacements, []);
+
+		// Idle tick with quota available must not generate anything.
+		await fake.fire();
+		db = openTestDb();
+		assert.equal((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n, 0, "no LLM lesson generated");
+		db.close();
+
+		// /anki:insert enqueues explicit terminal cards with dedup.
+		const cards = JSON.stringify([
+			{ type: "word", text: "boarding pass", meaning: "登机牌（可数名词，登机时出示的凭证；不指护照 passport）", phonetic: "/ˈbɔːdɪŋ pɑːs/", example: "Please have your boarding pass ready at the gate.", example_cn: "请在登机口准备好登机牌。" },
+			{ type: "word", text: "boarding pass", meaning: "登机牌（可数名词，登机时出示的凭证；不指护照 passport）", phonetic: "/x/", example: "dup", example_cn: "重复" },
+		]);
+		await harness.commands["anki:insert"].handler(cards, harness.ctx);
+		db = openTestDb();
+		// The first card releases immediately (no active card, pacing ready);
+		// the duplicate is dropped, so exactly one item exists and is active.
+		assert.equal((db.prepare("SELECT COUNT(*) AS n FROM custom_card_queue").get() as any).n, 0, "queue drained by immediate release");
+		assert.equal((db.prepare("SELECT COUNT(*) AS n FROM items").get() as any).n, 1, "duplicate dropped, survivor released");
+		const released = db.prepare("SELECT text, introduction_kind FROM items LIMIT 1").get() as any;
+		assert.equal(released.text, "boarding pass");
+		assert.equal(released.introduction_kind, "custom");
+		db.close();
+		assert.ok(harness.notifications().some((line) => line.includes("入队 1 张")));
+		assert.ok(harness.notifications().some((line) => line.includes("终端出卡模式")));
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
