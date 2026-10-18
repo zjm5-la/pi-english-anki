@@ -13,6 +13,7 @@ import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, lo
 import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
+import { formatVocabReport, vocabularyReport } from "./lexical-band.ts";
 import { recordWeeklyChallengeDelivery, WEEKLY_CHALLENGE_MAX_PER_RUN, weeklyChallengeOwed, weeklyChallengePrompt, weeklyChallengeState } from "./weekly-challenge.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
@@ -3088,6 +3089,18 @@ export default function piEnglishAnkiExtension(
 				};
 				ctx.ui.notify(`最近备课决策：${genEvents.map((e) => `${fmt(e.t)} ${e.s}`).join("；")}`, "info");
 			}
+		},
+	});
+
+	pi.registerCommand("anki:vocab", {
+		description: "Estimate vocabulary size stratified by CEFR/frequency band (word lists under dictionaries/)",
+		handler: async (_args, ctx) => {
+			if (!db) return;
+			let vocabBand: string | undefined;
+			try {
+				vocabBand = JSON.parse(getStat(db, "adaptive_budget_smooth") ?? "{}")?.vocabBand;
+			} catch { /* frontier falls back to B1 */ }
+			for (const line of formatVocabReport(vocabularyReport(db, vocabBand))) ctx.ui.notify(line, "info");
 		},
 	});
 
