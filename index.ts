@@ -14,6 +14,7 @@ import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, comput
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { formatVocabReport, vocabularyReport } from "./lexical-band.ts";
+import { backfillCardImages } from "./card-image.ts";
 import { recordWeeklyChallengeDelivery, WEEKLY_CHALLENGE_MAX_PER_RUN, weeklyChallengeOwed, weeklyChallengePrompt, weeklyChallengeState } from "./weekly-challenge.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateCustomCards, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CustomCardsDecision, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
@@ -2054,8 +2055,13 @@ export default function piEnglishAnkiExtension(
 			return;
 		}
 
-		// 4. Nothing to do: the pet dozes off
-		if (db) updateWidget(ctx, FACES.idle, [statsLine(db)]);
+			// 4. Nothing to do: the pet dozes off
+		if (db) {
+			updateWidget(ctx, FACES.idle, [statsLine(db)]);
+			// Idle trickle: resolve one unchecked card image per tick so new cards
+			// pick up concept pictures without any per-insert wiring.
+			await backfillCardImages(db, { limit: 1 });
+		}
 	}
 
 	function logGenStatus(status: string) {
@@ -3101,6 +3107,17 @@ export default function piEnglishAnkiExtension(
 				vocabBand = JSON.parse(getStat(db, "adaptive_budget_smooth") ?? "{}")?.vocabBand;
 			} catch { /* frontier falls back to B1 */ }
 			for (const line of formatVocabReport(vocabularyReport(db, vocabBand))) ctx.ui.notify(line, "info");
+		},
+	});
+
+	pi.registerCommand("anki:images", {
+		description: "为缺图的词/词组卡补配概念图（有道图解词典，仅存在线链接，不落图片文件）",
+		handler: async (args, ctx) => {
+			if (!db) return;
+			const limit = Math.min(200, Math.max(1, Number(args.trim()) || 50));
+			ctx.ui.notify(`正在查询配图（最多 ${limit} 张）…`, "info");
+			const summary = await backfillCardImages(db, { limit, delayMs: 150 });
+			ctx.ui.notify(`配图完成：检查 ${summary.checked} 张，新增图片 ${summary.resolved} 张，无图 ${summary.noImage} 张`, "info");
 		},
 	});
 

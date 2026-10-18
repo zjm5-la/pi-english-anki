@@ -74,9 +74,9 @@ test("latest migration keeps custom_card_queue and registers schema version 16",
 		const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='custom_card_queue'").get() as { name: string } | undefined;
 		assert.ok(table, "custom_card_queue exists");
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as { schema_version: number };
-		assert.equal(meta.schema_version, 16);
+		assert.equal(meta.schema_version, 17);
 		const migrations = (db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[]).map((r) => r.version);
-		assert.equal(migrations[migrations.length - 1], 16);
+		assert.equal(migrations[migrations.length - 1], 17);
 	} finally {
 		db.close();
 	}

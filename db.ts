@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 16;
+const SCHEMA_TARGET_VERSION = 17;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -467,6 +467,12 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// so a late-evening session never leaves "unfinished today" pressure.
 	(db: DatabaseSync) => {
 		migrateNightDueTimes(db);
+	},
+	// v17: concept-gap images — items.image_url stores an online image link
+	// (youdao illustrated dictionary). NULL = unchecked, '' = checked, the
+	// source has no picture; no image bytes are ever stored locally.
+	(db: DatabaseSync) => {
+		db.exec("ALTER TABLE items ADD COLUMN image_url TEXT");
 	},
 ];
 
