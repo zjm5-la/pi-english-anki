@@ -1925,6 +1925,7 @@ export default function piEnglishAnkiExtension(
 					levels_cn: item.levels_cn,
 					chunks: item.chunks,
 					keyWords: item.keyWords,
+					animation: item.animation,
 					introductionKind: "custom",
 				});
 				if (firstId == null) {

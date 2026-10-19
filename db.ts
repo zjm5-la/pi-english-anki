@@ -70,7 +70,7 @@ export function touchClient(db: DatabaseSync, clientId: string): void {
  * transaction and is recorded in `schema_migrations`, so completion no longer
  * depends on swallowing ALTER errors.
  */
-const SCHEMA_TARGET_VERSION = 17;
+const SCHEMA_TARGET_VERSION = 18;
 const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// v1: adaptive tutor compatibility schema (protocol 1).
 	// All structures are empty and unused at runtime; existing behavior is unchanged.
@@ -473,6 +473,12 @@ const SCHEMA_MIGRATIONS: ((db: DatabaseSync) => void)[] = [
 	// source has no picture; no image bytes are ever stored locally.
 	(db: DatabaseSync) => {
 		db.exec("ALTER TABLE items ADD COLUMN image_url TEXT");
+	},
+	// v18: verb sense animations — items.animation stores the inline SVG source
+	// of a tiny SMIL animation authored at card-creation time. Rendered via
+	// <img data:> so it never executes as markup.
+	(db: DatabaseSync) => {
+		db.exec("ALTER TABLE items ADD COLUMN animation TEXT");
 	},
 ];
 
@@ -898,6 +904,7 @@ export function insertItem(
 		levels_cn?: string[];
 		chunks?: string[];
 		keyWords?: GeneratedItem["keyWords"];
+		animation?: string;
 		introductionKind?: "planned" | "replacement" | "custom";
 	},
 ): number {
@@ -910,7 +917,7 @@ export function insertItem(
 	const introductionKind = extra?.introductionKind ?? "planned";
 	const result = db
 		.prepare(
-			"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id, introduction_kind, introduced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+			"INSERT INTO items (type, text, phonetic, meaning, example, example_cn, learned_at, due_at, levels, levels_cn, chunks, key_words, content_fingerprint, lexical_sense_id, introduction_kind, introduced_at, animation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
 		)
 		.run(
 			type,
@@ -928,6 +935,7 @@ export function insertItem(
 			fingerprint,
 			senseId,
 			introductionKind,
+			extra?.animation ?? null,
 		);
 	return Number(result.lastInsertRowid);
 }

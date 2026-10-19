@@ -37,6 +37,10 @@ export interface GeneratedItem {
 	chunks?: string[];
 	/** Sentence only: likely-new words inside the sentence, with meanings. */
 	keyWords?: { text: string; phonetic?: string; meaning: string }[];
+	/** word/phrase only: inline SVG source of a tiny SMIL animation that
+	 * depicts the card's sense (verbs whose sense is a concrete action).
+	 * Rendered via <img data:>, never executed as markup. */
+	animation?: string;
 }
 
 /** A narrow regression guard for a known interchangeable sense family.
@@ -92,6 +96,15 @@ export function extractJsonObjectText(text: string): string | undefined {
 	return start >= 0 && end > start ? cleaned.slice(start, end + 1) : undefined;
 }
 
+/** Inline SVG animation contract: small, self-contained, inert when rendered
+ * as an <img> source. Rejects scripts, event handlers, and external refs. */
+export function validAnimation(svg: string): boolean {
+	if (svg.length > 2048) return false;
+	if (!/^<svg[\s>]/i.test(svg) || !/<\/svg>\s*$/i.test(svg)) return false;
+	if (/<script|javascript:|\son[a-z]+\s*=|xlink:href\s*=|\bhref\s*=|<foreignObject/i.test(svg)) return false;
+	return true;
+}
+
 /** Parse and structurally validate one generated item; undefined when malformed. */
 export function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["type"]): GeneratedItem | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
@@ -112,6 +125,12 @@ export function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["t
 	for (const key of ["phonetic", "example", "example_cn"] as const) {
 		if (record[key] != null && typeof record[key] !== "string") return undefined;
 	}
+	let animation: string | undefined;
+	if (record.animation != null) {
+		if (typeof record.animation !== "string") return undefined;
+		if (!validAnimation(record.animation)) return undefined;
+		animation = record.animation;
+	}
 	const item: GeneratedItem = {
 		type,
 		text: record.text,
@@ -120,6 +139,7 @@ export function parseGeneratedItem(raw: unknown, expectedType?: GeneratedItem["t
 		example: record.example as string | undefined,
 		example_cn: record.example_cn as string | undefined,
 		...(clozeChunks ? { chunks: clozeChunks } : {}),
+		...(animation ? { animation } : {}),
 	};
 	if (type === "sentence") {
 		if (record.levels != null && !(item.levels = stringArray(record.levels))) return undefined;

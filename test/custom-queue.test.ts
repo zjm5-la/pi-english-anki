@@ -29,6 +29,8 @@ const {
 const {
 	critiqueLesson,
 	generateLesson,
+	parseGeneratedItem,
+	validAnimation,
 } = await import("../llm.ts");
 const { formatStatusLine } = await import("../render.ts");
 
@@ -73,9 +75,9 @@ test("latest migration keeps custom_card_queue and registers schema version 16",
 		const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='custom_card_queue'").get() as { name: string } | undefined;
 		assert.ok(table, "custom_card_queue exists");
 		const meta = db.prepare("SELECT schema_version FROM schema_meta WHERE id=1").get() as { schema_version: number };
-		assert.equal(meta.schema_version, 17);
+		assert.equal(meta.schema_version, 18);
 		const migrations = (db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as { version: number }[]).map((r) => r.version);
-		assert.equal(migrations[migrations.length - 1], 17);
+		assert.equal(migrations[migrations.length - 1], 18);
 	} finally {
 		db.close();
 	}
@@ -243,6 +245,42 @@ test("formatStatusLine appends the queue badge only when cards are queued", () =
 		const line = formatStatusLine(db, FIXED_DAILY_PLAN);
 		assert.match(line, /排队 2/);
 		assert.doesNotMatch(line, /今日剩余卡片/);
+	} finally {
+		db.close();
+	}
+});
+
+// -- verb sense animation ---------------------------------------------------------
+
+const GOOD_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 90"><circle cx="30" cy="60" r="10" fill="#4a7ebb"><animate attributeName="cy" values="60;30;60" dur="1.4s" repeatCount="indefinite"/></circle></svg>';
+
+test("validAnimation accepts small SMIL svg and rejects unsafe or malformed input", () => {
+	assert.equal(validAnimation(GOOD_SVG), true);
+	assert.equal(validAnimation(GOOD_SVG.replace("</svg>", "") ), false);
+	assert.equal(validAnimation("hello"), false);
+	assert.equal(validAnimation('<svg onload="x()"></svg>'), false);
+	assert.equal(validAnimation('<svg><script>1</script></svg>'), false);
+	assert.equal(validAnimation('<svg><a href="http://x"></a></svg>'), false);
+	assert.equal(validAnimation(`<svg>${"x".repeat(2100)}</svg>`), false);
+});
+
+test("parseGeneratedItem carries a valid animation and drops an invalid one", () => {
+	const base = { type: "word", text: "jump", meaning: "v. 跳，跳跃" };
+	const kept = parseGeneratedItem({ ...base, animation: GOOD_SVG });
+	assert.equal(kept?.animation, GOOD_SVG);
+	assert.equal(parseGeneratedItem({ ...base, animation: "<svg><script>x</script></svg>" }), undefined);
+	assert.equal(parseGeneratedItem({ ...base, animation: 42 }), undefined);
+	assert.equal(parseGeneratedItem(base)?.animation, undefined);
+});
+
+test("insertItem persists the animation column", () => {
+	const db = openDb(join(mkdtempSync(join(tmpdir(), "anki-anim-")), "t.db"));
+	try {
+		const id = insertItem(db, "word", "jump", null, "v. 跳，跳跃", null, null, new Date(), { animation: GOOD_SVG, introductionKind: "custom" });
+		const row = db.prepare("SELECT animation FROM items WHERE id = ?").get(id) as { animation: string };
+		assert.equal(row.animation, GOOD_SVG);
+		insertItem(db, "word", "sigh", null, "v. 叹气", null, null, new Date(), {});
+		assert.equal((db.prepare("SELECT animation FROM items WHERE text = 'sigh'").get() as { animation: string | null }).animation, null);
 	} finally {
 		db.close();
 	}
