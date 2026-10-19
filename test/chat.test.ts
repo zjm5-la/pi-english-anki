@@ -265,42 +265,6 @@ test("preparation requests authorize adding the referenced cards, not discussion
  }
 });
 
-test("chat preparation carries the referenced list through to the custom generator", async () => {
- const { id, request, deps } = fixture();
- const { generateCustomCards } = await import("../llm.ts");
- const phrases = ["get along with", "run out of", "look forward to", "turn down", "break down", "make up", "carry on"];
- const history = [
-  { role: "user" as const, content: "有哪些常见的动词词组？" },
-  { role: "assistant" as const, content: phrases.map(text => `- ${text}`).join("\n") },
- ];
- db.prepare("UPDATE runtime_state SET active_item_id=?,active_assistance_level='none' WHERE id=1").run(id);
- const runtime = db.prepare("SELECT * FROM runtime_state WHERE id=1").get();
- const card = db.prepare("SELECT * FROM items WHERE id=?").get(id);
- const attempts = db.prepare("SELECT COUNT(*) AS n FROM attempts").get();
- const message = "备课这些卡，加入到之后的卡片生成";
- deps.complete = async () => JSON.stringify({ reply: "准备上述词组", action: { kind: "add" } });
- let calls = 0;
- const result = await runChat({ ...request, message, history }, { ...deps, add: async prompt => {
-  calls++;
-  const decision = await generateCustomCards({ complete: async (_ctx: unknown, _resolved: unknown, input: { prompt: string }) => {
-   const payload = JSON.parse(input.prompt.split("<user_request>\n")[1].split("\n</user_request>")[0]);
-   assert.deepEqual(payload, { message, history });
-   assert.ok(!input.prompt.includes(`communicate${seq}`), "unrelated active card is not generation material");
-   return JSON.stringify({ ready: true, items: phrases.map(text => ({ type: "phrase", text, meaning: "继续（动词短语）", example: `We ${text}.`, example_cn: "例句" })) });
-  } } as any, {} as any, { provider: "test", model: "test", fromSession: false }, prompt, [], {} as any);
-  assert.ok(decision.ready);
-  assert.deepEqual(decision.items.map(item => item.text), phrases);
-  return { success: true, reply: `已做好 ${decision.items.length} 张卡并入队` };
- } });
- assert.equal(result.success, true, result.reply);
- assert.equal(result.action, "added");
- assert.equal(calls, 1);
- assert.match(result.reply, /7 张卡/);
- assert.deepEqual(db.prepare("SELECT * FROM runtime_state WHERE id=1").get(), runtime);
- assert.deepEqual(db.prepare("SELECT * FROM items WHERE id=?").get(id), card);
- assert.deepEqual(db.prepare("SELECT COUNT(*) AS n FROM attempts").get(), attempts);
-});
-
 test("chat tolerates prose-wrapped or fenced JSON decisions", async () => {
  const { request, deps } = fixture(); request.message = "解释这个词";
  deps.complete = async () => '好的。\n```json\n{"reply":"这是动词。","action":{"kind":"none"}}\n```';

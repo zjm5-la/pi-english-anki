@@ -4,7 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PetConfig } from "../config.ts";
 import type { ItemRow } from "../db.ts";
 import type { PiSdkLlmClient } from "../pi-sdk-llm.ts";
-import { critiqueLesson, evaluateAttempt, generateCustomCards, generateLesson, generateReplacement } from "../llm.ts";
+import { critiqueLesson, evaluateAttempt, generateLesson, generateReplacement } from "../llm.ts";
 import { CHAT_SYSTEM_PROMPT } from "../chat.ts";
 
 const ctx = {} as ExtensionContext;
@@ -20,42 +20,6 @@ function capture(response: unknown = { ready: false, reason: "test" }) {
 	} } as unknown as PiSdkLlmClient;
 	return { llm, prompts };
 }
-
-test("every vocabulary generation path disambiguates before answering, including both basic fallbacks", async () => {
-	const { llm, prompts } = capture();
-	await generateLesson(llm, ctx, resolved, "", [], config);
-	await generateLesson(llm, ctx, resolved, "", [], config, undefined, undefined, undefined, undefined, true);
-	await generateReplacement(llm, ctx, resolved, "", [], config, skipped);
-	await generateReplacement(llm, ctx, resolved, "", [], config, skipped, undefined, undefined, true);
-	await generateCustomCards(llm, ctx, resolved, "information", [], config);
-	await generateLesson(llm, ctx, resolved, "", [], config, [{ severity: "blocker", category: "sense", description: "同词性替换后仍可作答" }]);
-	assert.equal(prompts.length, 6);
-	for (const prompt of [...prompts, CHAT_SYSTEM_PROMPT]) {
-		assert.match(prompt, /必须在作答前就给足线索/);
-		assert.match(prompt, /每张 word\/phrase 的 meaning 都必须明确标注当前所考义项的中文词性/);
-		assert.match(prompt, /词组标注动词短语、名词短语/);
-		assert.match(prompt, /communicate 应写「交流（动词/);
-		assert.match(prompt, /communication 应写「交流（名词/);
-		assert.match(prompt, /词性只解决词类歧义，同词性的近义词仍须补必要的义项或搭配线索/);
-		assert.match(prompt, /学生只看到 meaning，不能假设例句挖空已经显示/);
-		assert.match(prompt, /隐藏 text 和 example 后/);
-		assert.match(prompt, /即使其它近义词未入库、中文写法不同/);
-		assert.match(prompt, /词性、可数\/不可数、义项范围或自然搭配/);
-		assert.match(prompt, /information 不可只提示「信息\/消息」/);
-		assert.match(prompt, /信息（不可数名词，泛指事实或资料）/);
-		assert.match(prompt, /performance 不可只提示「表演」/);
-		assert.match(prompt, /一场具体的演出（可数名词，常与 give 搭配/);
-		assert.match(prompt, /不能虚构近义词之间并不存在的区别/);
-		assert.match(prompt, /仍有多个同样自然且满足线索的常见答案，必须将必要限定写进 meaning/);
-		assert.doesNotMatch(prompt, /只写最小中文释义（直接翻译）/);
-		assert.match(prompt, /逐张做同词性替换检验/);
-		assert.match(prompt, /goal \/ target \/ aim/);
-		assert.match(prompt, /释义复述.*不是区分同义词的证据/);
-		assert.match(prompt, /必要部分必须前置到 meaning/);
-		assert.match(prompt, /禁止用首字母、词长、字母数或按字符数挖空来替代语义消歧/);
-		assert.match(prompt, /无法安全生成则解释原因/);
-	}
-});
 
 test("known goal target aim paraphrases are rejected locally even if the model would approve", async () => {
 	for (const target of ["goal", "target", "aim"]) {

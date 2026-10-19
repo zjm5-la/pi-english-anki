@@ -17,7 +17,6 @@ import {
 import {
 	critiqueLesson,
 	evaluateAttempt,
-	generateCustomCards,
 	generateLesson,
 	generateReplacement,
 	type GeneratedItem,
@@ -484,111 +483,6 @@ test("critic deterministically rejects a batch with two identical normalized mea
 	);
 	assert.equal(ok.pass, true);
 });
-
-test("generation and critic prompts carry the example-must-contain-text and sense-specific meaning rules", async () => {
-	const prompts: Record<string, string> = {};
-	const capture = (key: string) =>
-		({
-			complete: async (
-				_ctx: unknown,
-				_r: unknown,
-				request: { prompt: string },
-			) => {
-				prompts[key] = request.prompt;
-				return JSON.stringify({ ready: false, reason: "test" });
-			},
-			dispose: async () => {},
-		}) as unknown as PiSdkLlmClient;
-	await generateLesson(
-		capture("lesson"),
-		FAKE_CTX,
-		RESOLVED,
-		"a real conversation with english",
-		[],
-		FAKE_CONFIG,
-		undefined,
-		ADAPTIVE,
-	);
-	const skipped = {
-		type: "word",
-		text: "reload",
-		meaning: "重新加载",
-	} as unknown as ItemRow;
-	await generateReplacement(
-		capture("replacement"),
-		FAKE_CTX,
-		RESOLVED,
-		"conversation",
-		[],
-		FAKE_CONFIG,
-		skipped,
-		ADAPTIVE,
-	);
-	await generateCustomCards(
-		capture("custom"),
-		FAKE_CTX,
-		RESOLVED,
-		"5 张点餐词汇",
-		[],
-		FAKE_CONFIG,
-		ADAPTIVE,
-	);
-	for (const [key, prompt] of Object.entries(prompts)) {
-		assert.match(
-			prompt,
-			/example 必须原样包含所教.*text（大小写不限）/,
-			`${key} requires examples to contain the taught text`,
-		);
-		assert.match(
-			prompt,
-			/book 与 reserve 都表示「预订」/,
-			`${key} names the collision example`,
-		);
-		assert.match(
-			prompt,
-			/可区分的义项或场景/,
-			`${key} requires sense-specific meanings`,
-		);
-	}
-	// The critic (LLM path) carries the same contract.
-	const criticCapture = {
-		complete: async (_ctx: unknown, _r: unknown, request: { prompt: string }) => {
-			prompts.critic = request.prompt;
-			return JSON.stringify({ pass: true, issues: [], summary: "ok" });
-		},
-		dispose: async () => {},
-	} as unknown as PiSdkLlmClient;
-	const word: GeneratedItem = {
-		type: "word",
-		text: "reload",
-		meaning: "重新加载（动词，把最新内容再载入一次）",
-		example: "Reload the extension.",
-		example_cn: "重新加载扩展。",
-	};
-	await critiqueLesson(
-		criticCapture,
-		FAKE_CTX,
-		RESOLVED,
-		{ topic: "t", items: [word] },
-		["book（预订）"],
-		FAKE_CONFIG,
-		ADAPTIVE,
-	);
-	assert.match(
-		prompts.critic,
-		/example 必须原样包含所教 text（大小写不限）；违反记 blocker/,
-	);
-	assert.match(
-		prompts.critic,
-		/中文释义与批内其它学习项或已学内容完全相同时.*book 与 reserve 都是「预订」/,
-	);
-	assert.match(
-		prompts.critic,
-		/book（预订）/,
-		"critic sees prior collisions via the known list",
-	);
-});
-
 
 test("replacement prompt includes all canonical cards beyond the most recent fifty", async () => {
 	const handle = freshDb();

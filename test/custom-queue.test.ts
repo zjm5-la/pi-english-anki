@@ -28,7 +28,6 @@ const {
 } = await import("../db.ts");
 const {
 	critiqueLesson,
-	generateCustomCards,
 	generateLesson,
 } = await import("../llm.ts");
 const { formatStatusLine } = await import("../render.ts");
@@ -193,61 +192,6 @@ test("generateLesson partial batch enforces the scaled phrase cap and word floor
 		{ wordItems: 2, clozeItems: 0 },
 	);
 	assert.ok(decision.ready);
-});
-
-// -- llm: generateCustomCards ------------------------------------------------------
-
-test("generateCustomCards parses valid items and passes the prompt through", async () => {
-	const captured: { prompt?: string } = {};
-	const response = JSON.stringify({ ready: true, items: [wordJson("menu"), wordJson("order"), wordJson("bill")] });
-	const decision = await generateCustomCards(
-		mockLlm(() => response, captured), FAKE_CTX, { provider: "p", model: "m", fromSession: false },
-		"3 张餐厅点餐词汇", [], FAKE_CONFIG, ADAPTIVE,
-	);
-	assert.ok(decision.ready);
-	assert.equal(decision.items.length, 3);
-	assert.match(captured.prompt!, /<user_request>\n3 张餐厅点餐词汇\n<\/user_request>/);
-	assert.match(captured.prompt!, new RegExp(String(MAX_CUSTOM_PER_ADD)));
-	assert.match(captured.prompt!, /learner_profile/);
-});
-
-test("generateCustomCards clamps oversized batches to MAX_CUSTOM_PER_ADD", async () => {
-	const items = Array.from({ length: MAX_CUSTOM_PER_ADD + 5 }, (_, i) => wordJson(`word${i}`));
-	const decision = await generateCustomCards(
-		mockLlm(() => JSON.stringify({ ready: true, items })), FAKE_CTX, { provider: "p", model: "m", fromSession: false },
-		"25 张旅行词汇", [], FAKE_CONFIG, ADAPTIVE,
-	);
-	assert.ok(decision.ready);
-	assert.equal(decision.items.length, MAX_CUSTOM_PER_ADD);
-});
-
-test("generateCustomCards rejects sentence items and in-batch duplicates", async () => {
-	const sentence = {
-		type: "sentence", text: "The menu is long today.", meaning: "句",
-		levels: ["a", "b", "c"], levels_cn: ["x", "y", "z"], chunks: ["a", "b"],
-	};
-	await assert.rejects(
-		generateCustomCards(
-			mockLlm(() => JSON.stringify({ ready: true, items: [wordJson("menu"), sentence] })),
-			FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "x", [], FAKE_CONFIG, ADAPTIVE,
-		),
-		/INVALID_CUSTOM_ITEM/,
-	);
-	await assert.rejects(
-		generateCustomCards(
-			mockLlm(() => JSON.stringify({ ready: true, items: [wordJson("menu", "菜单"), wordJson("Menu", "菜单；选项")]})),
-			FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "x", [], FAKE_CONFIG, ADAPTIVE,
-		),
-		/INVALID_CUSTOM_ITEM/,
-	);
-});
-
-test("generateCustomCards surfaces an LLM refusal with its reason", async () => {
-	const decision = await generateCustomCards(
-		mockLlm(() => JSON.stringify({ ready: false, reason: "提示词太空泛" })),
-		FAKE_CTX, { provider: "p", model: "m", fromSession: false }, "嗯", [], FAKE_CONFIG, ADAPTIVE,
-	);
-	assert.deepEqual(decision, { ready: false, reason: "提示词太空泛" });
 });
 
 // -- llm: critic composition -------------------------------------------------------

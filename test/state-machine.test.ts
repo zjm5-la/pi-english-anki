@@ -4126,57 +4126,6 @@ test("after a custom release, the remaining quota triggers a partial lesson batc
 	}
 });
 
-test("/anki:add enqueues critic-approved cards and releases the first one immediately", { concurrency: false }, async () => {
-	const fake = installFakeTimers();
-	const registration = registerFauxProvider({ provider: "kaomoji-add-cmd" });
-	try {
-		registration.setResponses([
-			fauxAssistantMessage(JSON.stringify({
-				ready: true,
-				items: [
-					{ type: "word", text: "napkin", phonetic: "/ˈnæpkɪn/", meaning: "餐巾（名词，义项线索）", example: "Please hand me a napkin.", example_cn: "请递给我一张餐巾。" },
-					{ type: "word", text: "receipt", phonetic: "/rɪˈsiːt/", meaning: "收据（名词，义项线索）", example: "Keep the receipt for returns.", example_cn: "退货要保留收据。" },
-				],
-			})),
-			fauxAssistantMessage(JSON.stringify({ pass: true, issues: [], summary: "ok" })),
-		]);
-		const { model, registry } = fauxModelRegistry(registration);
-		writeConfig({ intervalMinutes: 10, dailyNewLimit: 5 });
-		const harness = await makeSession({ model, modelRegistry: registry, sessionId: "add-immediate" });
-		const db = openTestDb();
-		clearGlobalSlot(db);
-		db.close();
-
-		await harness.commands["anki:add"].handler("2 张餐厅常用词", harness.ctx);
-		await until(fake, () => {
-			const check = openTestDb();
-			const active = (check.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any).active_item_id;
-			check.close();
-			return active != null;
-		}, "the first enqueued card is released right after /anki:add");
-
-		const check = openTestDb();
-		const items = (check.prepare("SELECT text, shown, introduction_kind FROM items ORDER BY id").all() as any[]).map((row) => ({ ...row }));
-		const queued = queueLength(check);
-		const state = check.prepare("SELECT active_item_id, active_kind FROM runtime_state WHERE id=1").get() as any;
-		check.close();
-		assert.deepEqual(items, [
-			{ text: "napkin", shown: 1, introduction_kind: "custom" },
-			{ text: "receipt", shown: 0, introduction_kind: "custom" },
-		]);
-		assert.equal(queued, 0, "both cards moved into items within the quota");
-		assert.equal(state.active_item_id, 1);
-		assert.equal(state.active_kind, "teach");
-		assert.match(harness.widget().join(" "), /餐巾/);
-		assert.doesNotMatch(harness.widget().join(" "), /napkin/);
-		assert.ok(harness.notifications().some((message) => message.includes("已做好 2 张卡并入队")));
-		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
-	} finally {
-		registration.unregister();
-		fake.restore();
-	}
-});
-
 test("background replacements drain FIFO with an active card and do not change its version", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	const registration = registerFauxProvider({ provider: "kaomoji-background-replacement" });
