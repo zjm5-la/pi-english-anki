@@ -2822,8 +2822,9 @@ export default function piEnglishAnkiExtension(
 
 	pi.registerCommand("anki:screening", {
 		description: "切换筛查扫荡模式：新卡首答答对=已会（不排复习）且不限每日张数（答题节奏即限速），答错照常学",
-		handler: async (_args, ctx) => {
-			// Stateless toggle: the config FILE is the single source of truth
+		handler: async (args, ctx) => {
+			// Explicit on/off beats toggling: concurrent sessions make toggle
+			// direction unreliable. The config FILE stays the source of truth.
 			// (concurrent sessions hold stale in-memory copies).
 			const path = join(getAgentDir(), "kaomoji-english-tutor.json");
 			let fileValue = config.screeningMode;
@@ -2833,7 +2834,8 @@ export default function piEnglishAnkiExtension(
 					if (typeof parsed.screeningMode === "boolean") fileValue = parsed.screeningMode;
 				}
 			} catch { /* fall back to memory */ }
-			const next = !fileValue;
+			const arg = String(args ?? "").trim().toLowerCase();
+			const next = arg === "on" ? true : arg === "off" ? false : !fileValue;
 			config.screeningMode = next;
 			try {
 				const current = existsSync(path) ? JSON.parse(readFileSync(path, "utf-8")) : {};
