@@ -1930,11 +1930,16 @@ export default function piEnglishAnkiExtension(
 			}
 			const plan = loadPlan(db, now);
 			const introduced = countTodayNew(db, now);
-			if (!hasNewCardCapacity(plan, introduced)) {
+			// Screening sweep: the daily limit does not apply — each trigger
+			// releases exactly one queued card so the learner's answering pace
+			// IS the throttle. Perfect for burning down a big imported backlog.
+			if (!config.screeningMode && !hasNewCardCapacity(plan, introduced)) {
 				db.exec("ROLLBACK");
 				return false;
 			}
-			const remaining = remainingNewCardSlots(plan, introduced, customQueueCount(db));
+			const remaining = config.screeningMode
+				? Math.min(1, customQueueCount(db))
+				: remainingNewCardSlots(plan, introduced, customQueueCount(db));
 			const rows = peekCustomQueue(db, remaining);
 			if (rows.length === 0) {
 				db.exec("ROLLBACK");
@@ -2797,7 +2802,7 @@ export default function piEnglishAnkiExtension(
 	});
 
 	pi.registerCommand("anki:screening", {
-		description: "切换筛查模式：批量入库的新卡首答答对=已会（不排复习），答错照常学",
+		description: "切换筛查扫荡模式：新卡首答答对=已会（不排复习）且不限每日张数（答题节奏即限速），答错照常学",
 		handler: async (_args, ctx) => {
 			config.screeningMode = !config.screeningMode;
 			try {
@@ -2809,7 +2814,7 @@ export default function piEnglishAnkiExtension(
 				ctx.ui.notify(`已在本会话${config.screeningMode ? "开启" : "关闭"}筛查模式，但写入配置失败：${(err as Error).message}`, "warning");
 				return;
 			}
-			ctx.ui.notify(`筛查模式：${config.screeningMode ? "已开启——批量新卡首答答对即判已会，答错照常学" : "已关闭"}`, "info");
+			ctx.ui.notify(`筛查扫荡模式：${config.screeningMode ? "已开启——不限每日张数，答对即已会，答错照常学；筛完记得关" : "已关闭，恢复每日配额"}`, "info");
 		},
 	});
 

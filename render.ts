@@ -55,7 +55,7 @@ export function formatStatusLine(db: DatabaseSync, plan: DailyLoadPlan, screenin
 			? `（复习 ${remaining.reviews} · 新卡 ${remaining.newCards}）`
 			: `（复习 ${remaining.reviews}）`}`);
 	}
-	if (queued > 0) parts.push(`排队 ${queued}${screening ? "（筛查中：答对即已会）" : ""}`);
+	if (queued > 0) parts.push(`排队 ${queued}${screening ? "（筛查扫荡中：不限量·答对即已会）" : ""}`);
 	return `🔥 连续学习 ${streak} 天 · ${parts.join(" · ")}`;
 }
 
