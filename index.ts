@@ -1888,8 +1888,7 @@ export default function piEnglishAnkiExtension(
 			if (
 				state.active_item_id != null ||
 				!pacingReady(state, now) ||
-				pendingReplacementTypes(db).length > 0 ||
-				getDueItem(db, now)
+				pendingReplacementTypes(db).length > 0
 			) {
 				db.exec("ROLLBACK");
 				return false;
