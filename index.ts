@@ -10,7 +10,7 @@ import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { dailyLoadPlan, formatDailyLoadPlan, hasNewCardCapacity, nextAdaptiveLessonBatch, remainingNewCardSlots } from "./adaptive-load.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, MAX_CUSTOM_PER_ADD, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type CustomQueueRow, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, getStat, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type CustomQueueRow, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { formatVocabReport, vocabularyReport } from "./lexical-band.ts";
@@ -35,6 +35,8 @@ export { contentFingerprint };
 // stale in-memory copies, so behaviour gates re-read the flag through this
 // tiny 5s cache instead of trusting `config`.
 let screeningCache: { value: boolean; at: number } | undefined;
+const SCREENING_CARD_STAT = "screening_card";
+interface ScreeningCard { itemId: number; wasShown: boolean; queueRow?: CustomQueueRow }
 function screeningActive(): boolean {
 	const now = Date.now();
 	if (!screeningCache || now - screeningCache.at > 5_000) {
@@ -146,11 +148,9 @@ export default function piEnglishAnkiExtension(
 	let pendingIsReview = false;
 	let pendingDirection: RecallDirection = "forward";
 	let pendingAssistance: AssistanceLevel = "none";
-	/** Screening sweep round (process-local, reset on every toggle): items and
-	 * queue rows already offered, plus how to undo the current presentation. */
+	/** Screening sweep round (process-local, reset on every toggle): items and queue rows already offered. */
 	const screeningSwept = new Set<number>();
 	const screeningSweptQueue = new Set<number>();
-	let screeningCard: { itemId: number; wasShown: boolean; queueRow?: CustomQueueRow } | undefined;
 
 	function isCtxStale(ctx: ExtensionContext): boolean {
 		try {
@@ -654,6 +654,7 @@ export default function piEnglishAnkiExtension(
 	 */
 	function renderGlobalCard(ctx: ExtensionContext): boolean {
 		if (!db) return false;
+		releaseStaleScreeningCard();
 		let state = getRuntimeState(db);
 		const item = activeItem(db);
 		if (item?.type === "sentence") state = withUndoContinuation(db, () => ensureSentenceCycle(db!, item!, state));
@@ -848,12 +849,12 @@ export default function piEnglishAnkiExtension(
 	}
 
 	/**
-	 * Screening sweep claim: a random not-yet-offered card from every unmastered
-	 * word/phrase/cloze item (due or not) plus the custom queue, shown as a quiz
-	 * right away — no pacing, quota, or due gate. Nothing about the card's
-	 * schedule changes here; a queue row is materialized and an unshown item is
-	 * marked shown only so the normal answer path works, and both are reverted
-	 * on a miss (see revertScreeningPresentation).
+	 * Screening sweep claim: a random not-yet-offered card that normal study
+	 * has never shown — unshown word/phrase/cloze inventory plus the custom
+	 * queue — quizzed right away with no pacing, quota, or due gate. Cards
+	 * already in normal study never enter the sweep. A queue row is
+	 * materialized and an unshown item marked shown only so the normal answer
+	 * path works; both are reverted on a miss (see revertScreeningPresentation).
 	 */
 	function claimScreeningItem(now: Date): ItemRow | undefined {
 		if (!db) return undefined;
@@ -864,17 +865,17 @@ export default function piEnglishAnkiExtension(
 				db.exec("ROLLBACK");
 				return undefined;
 			}
-			const pool = `status = 'learning' AND type IN ('word', 'phrase', 'cloze') AND id NOT IN (SELECT value FROM json_each(?)) ${SCHEDULABLE}`;
+			const pool = `status = 'learning' AND shown = 0 AND type IN ('word', 'phrase', 'cloze') AND id NOT IN (SELECT value FROM json_each(?)) ${SCHEDULABLE}`;
 			const sweptItems = JSON.stringify([...screeningSwept]);
 			const sweptQueue = JSON.stringify([...screeningSweptQueue]);
-			let card: typeof screeningCard;
+			let card: ScreeningCard | undefined;
 			for (let tries = 0; !card && tries < 20; tries++) {
 				const itemCount = Number((db.prepare(`SELECT COUNT(*) AS n FROM items WHERE ${pool}`).get(sweptItems) as { n: number }).n);
 				const queueCount = Number((db.prepare("SELECT COUNT(*) AS n FROM custom_card_queue WHERE id NOT IN (SELECT value FROM json_each(?))").get(sweptQueue) as { n: number }).n);
 				if (itemCount + queueCount === 0) break;
 				if (Math.random() * (itemCount + queueCount) < itemCount) {
-					const row = db.prepare(`SELECT id, shown FROM items WHERE ${pool} ORDER BY RANDOM() LIMIT 1`).get(sweptItems) as { id: number; shown: number };
-					card = { itemId: row.id, wasShown: row.shown === 1 };
+					const row = db.prepare(`SELECT id FROM items WHERE ${pool} ORDER BY RANDOM() LIMIT 1`).get(sweptItems) as { id: number };
+					card = { itemId: row.id, wasShown: false };
 					break;
 				}
 				const raw = db.prepare("SELECT * FROM custom_card_queue WHERE id NOT IN (SELECT value FROM json_each(?)) ORDER BY RANDOM() LIMIT 1").get(sweptQueue) as Record<string, unknown>;
@@ -904,6 +905,7 @@ export default function piEnglishAnkiExtension(
 				return undefined;
 			}
 			if (!card.wasShown) markShown(db, card.itemId);
+			writeScreeningCard(card);
 			setRuntimeState(db, {
 				active_item_id: card.itemId,
 				active_kind: "review",
@@ -914,7 +916,6 @@ export default function piEnglishAnkiExtension(
 			});
 			db.exec("COMMIT");
 			screeningSwept.add(card.itemId);
-			screeningCard = card;
 			return db.prepare("SELECT * FROM items WHERE id = ?").get(card.itemId) as unknown as ItemRow | undefined;
 		} catch (err) {
 			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
@@ -923,11 +924,22 @@ export default function piEnglishAnkiExtension(
 		}
 	}
 
+	/** How to undo the sweep card on screen. Stored in the DB so any session
+	 * (or this one after a restart) can put it back once screening is off. */
+	function readScreeningCard(): ScreeningCard | undefined {
+		const raw = db ? getStat(db, SCREENING_CARD_STAT) : null;
+		try { return raw ? JSON.parse(raw) as ScreeningCard : undefined; } catch { return undefined; }
+	}
+	function writeScreeningCard(card?: ScreeningCard) {
+		if (db) setStat(db, SCREENING_CARD_STAT, card ? JSON.stringify(card) : "");
+	}
+
 	/** Inside a transaction: undo what claimScreeningItem did to `itemId` (queue row back in place, shown flag restored). */
 	function revertScreeningPresentation(itemId: number) {
-		if (!db || screeningCard?.itemId !== itemId) return;
-		const { wasShown, queueRow } = screeningCard;
-		screeningCard = undefined;
+		const card = readScreeningCard();
+		if (!db || card?.itemId !== itemId) return;
+		const { wasShown, queueRow } = card;
+		writeScreeningCard();
 		if (queueRow) {
 			for (const table of ["exercises", "direction_state", "mastery_state"]) {
 				db.prepare(`DELETE FROM ${table} WHERE item_id = ?`).run(itemId);
@@ -938,6 +950,40 @@ export default function piEnglishAnkiExtension(
 		} else if (!wasShown) {
 			db.prepare("UPDATE items SET shown = 0 WHERE id = ?").run(itemId);
 		}
+	}
+
+	/** Outside screening, put back a sweep card still on screen (or forget a
+	 * record whose card was already rated elsewhere). Returns true when the
+	 * active card was released. */
+	function releaseStaleScreeningCard(): boolean {
+		if (!db || db.isTransaction || screeningActive()) return false;
+		const card = readScreeningCard();
+		if (!card) return false;
+		let released = false;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const cur = getRuntimeState(db);
+			if (cur.active_item_id === card.itemId) {
+				revertScreeningPresentation(card.itemId);
+				setRuntimeState(db, {
+					active_item_id: null,
+					active_kind: null,
+					active_direction: "forward",
+					active_version: cur.active_version + 1,
+					...EMPTY_SENTENCE_CYCLE,
+					next_check_at: new Date().toISOString(),
+				});
+				released = true;
+			} else {
+				writeScreeningCard();
+			}
+			db.exec("COMMIT");
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[pi-english-anki] Screening release failed: ${err}`);
+		}
+		if (released) clearPendingLocals();
+		return released;
 	}
 
 	/** Atomically select, mark, and activate the next due card. */
@@ -1712,7 +1758,7 @@ export default function piEnglishAnkiExtension(
 						db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
 					}
 					bumpStat(db, "total_screened", 1);
-					if (screeningCard?.itemId === item.id) screeningCard = undefined;
+					if (readScreeningCard()?.itemId === item.id) writeScreeningCard();
 				} else {
 					revertScreeningPresentation(item.id);
 				}
@@ -1751,7 +1797,7 @@ export default function piEnglishAnkiExtension(
 		} else if (activeItem(db)) {
 			renderGlobalCard(ctx);
 		} else {
-			ctx.ui.notify("本轮筛查已扫完所有未掌握的卡", "info");
+			ctx.ui.notify("本轮筛查已扫完所有未学过的卡", "info");
 			scheduleTimer();
 		}
 		return true;
@@ -2192,6 +2238,7 @@ export default function piEnglishAnkiExtension(
 		const generation = sessionGeneration;
 		if (isCtxStale(ctx)) return;
 		if (!db) return;
+		releaseStaleScreeningCard();
 		const now = new Date();
 		const state0 = getRuntimeState(db);
 		// A global card is active: render it and never swap it for another.
@@ -2991,7 +3038,7 @@ export default function piEnglishAnkiExtension(
 	});
 
 	pi.registerCommand("anki:screening", {
-		description: "切换筛查扫荡模式：连续随机出所有未掌握的卡（含排队卡），答对=已会（一年后再见），答错不改动任何安排",
+		description: "切换筛查扫荡模式：连续随机出还没学过的卡（排队卡和未出过的新卡，不含正常学习中的卡），答对=已会（一年后再见），答错不改动任何安排",
 		handler: async (args, ctx) => {
 			// Explicit on/off beats toggling: concurrent sessions make toggle
 			// direction unreliable. The config FILE stays the source of truth.
@@ -3016,35 +3063,12 @@ export default function piEnglishAnkiExtension(
 				return;
 			}
 			screeningCache = { value: next, at: Date.now() };
-			ctx.ui.notify(`筛查扫荡模式：${next ? "已开启——自由刷所有未掌握的卡，答对即已会（一年后再见），答错不改动" : "已关闭，恢复正常学习"}`, "info");
+			ctx.ui.notify(`筛查扫荡模式：${next ? "已开启——自由刷还没学过的卡（排队卡和未出过的新卡），答对即已会（一年后再见），答错不改动" : "已关闭，恢复正常学习"}`, "info");
 			screeningSwept.clear();
 			screeningSweptQueue.clear();
 			if (!db) return;
-			if (!next && screeningCard) {
-				// The sweep card on screen was never rated: put it back untouched.
-				const itemId = screeningCard.itemId;
-				try {
-					db.exec("BEGIN IMMEDIATE");
-					const cur = getRuntimeState(db);
-					if (cur.active_item_id === itemId) {
-						revertScreeningPresentation(itemId);
-						setRuntimeState(db, {
-							active_item_id: null,
-							active_kind: null,
-							active_direction: "forward",
-							active_version: cur.active_version + 1,
-							...EMPTY_SENTENCE_CYCLE,
-							next_check_at: new Date().toISOString(),
-						});
-					}
-					db.exec("COMMIT");
-				} catch (err) {
-					try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
-					console.error(`[pi-english-anki] Screening exit failed: ${err}`);
-				}
-				screeningCard = undefined;
-				clearPendingLocals();
-			}
+			// A sweep card on screen was never rated: put it back untouched.
+			if (!next) releaseStaleScreeningCard();
 			if (activeItem(db)) {
 				renderGlobalCard(ctx);
 				return;
