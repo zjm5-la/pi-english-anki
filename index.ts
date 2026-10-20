@@ -67,7 +67,7 @@ export default function piEnglishAnkiExtension(
 	// -- State ------------------------------------------------------------
 	let config: PetConfig = { ...DEFAULTS };
 	const loadPlan = (database: DatabaseSync, now = new Date()) => dailyLoadPlan(database, now, config);
-	const statsLine = (database: DatabaseSync) => formatStatusLine(database, loadPlan(database));
+	const statsLine = (database: DatabaseSync) => formatStatusLine(database, loadPlan(database), config.screeningMode);
 	const queueEta = (database: DatabaseSync, total: number) => {
 		const plan = loadPlan(database);
 		if (!plan.adaptive && plan.limit === 0) return "不限速，将尽快放出";
