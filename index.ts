@@ -1758,6 +1758,8 @@ export default function piEnglishAnkiExtension(
 						db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
 					}
 					bumpStat(db, "total_screened", 1);
+					bumpStat(db, "total_learned", 1);
+					bumpStat(db, "total_skipped", 1);
 					if (readScreeningCard()?.itemId === item.id) writeScreeningCard();
 				} else {
 					revertScreeningPresentation(item.id);

@@ -5419,6 +5419,9 @@ test("screening sweep serves every unmastered card at once: pass = known, miss =
 		await harness.commands["anki:good"].handler("", harness.ctx);
 		let check = openTestDb();
 		const passed = check.prepare("SELECT status, due_at FROM items WHERE id = ?").get(first.id) as any;
+		const statOf = (c: any, key: string) => Number((c.prepare("SELECT value FROM stats WHERE key = ?").get(key) as any)?.value ?? 0);
+		assert.equal(statOf(check, "total_learned"), 1, "a screened-known card counts as studied");
+		assert.equal(statOf(check, "total_skipped"), 1, "and as skipped-as-mastered");
 		check.close();
 		assert.equal(passed.status, "mastered");
 		assert.ok(Date.parse(passed.due_at) - Date.now() >= 364 * 24 * 3600 * 1000, "known card is pushed a year out");
@@ -5435,6 +5438,9 @@ test("screening sweep serves every unmastered card at once: pass = known, miss =
 		assert.deepEqual({ ...missed }, { status: "learning", due_at: future, reviews: 0, fsrs_state: "" });
 		assert.equal(missedShown, 0, "a missed new card stays unseen for normal study");
 		assert.equal(attempts, 0, "a miss records nothing");
+		check = openTestDb();
+		assert.deepEqual([statOf(check, "total_learned"), statOf(check, "total_skipped")], [1, 1], "a miss counts nothing");
+		check.close();
 
 		// Queued cards join the sweep; a miss puts the row back in its queue slot.
 		const third = active();
