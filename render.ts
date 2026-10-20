@@ -48,14 +48,15 @@ export function formatStatusLine(db: DatabaseSync, plan: DailyLoadPlan, screenin
 	const streak = Number(getStat(db, "streak_days") ?? 0);
 	const remaining = countTodayRemainingCards(db, new Date(), plan);
 	const queued = customQueueCount(db);
-	if (remaining.total === 0 && queued === 0) return "";
+	if (remaining.total === 0 && queued === 0 && !screening) return "";
 	const parts: string[] = [];
 	if (remaining.total > 0) {
 		parts.push(`今日剩余卡片${remaining.newCards > 0
 			? `（复习 ${remaining.reviews} · 新卡 ${remaining.newCards}）`
 			: `（复习 ${remaining.reviews}）`}`);
 	}
-	if (queued > 0) parts.push(`排队 ${queued}${screening ? "（筛查扫荡中：不限量·答对即已会）" : ""}`);
+	if (queued > 0) parts.push(`排队 ${queued}`);
+	if (screening) parts.push("筛查中：答对即已会，答错不变");
 	return `🔥 连续学习 ${streak} 天 · ${parts.join(" · ")}`;
 }
 

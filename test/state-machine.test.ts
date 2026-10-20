@@ -5387,3 +5387,72 @@ test("terminal-teach mode: no auto generation, teach resolves as failed, insert 
 		fake.restore();
 	}
 });
+
+test("screening sweep serves every unmastered card at once: pass = known, miss = untouched", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1, adaptiveNewCards: false });
+		const harness = await makeSession();
+		const future = "2030-01-01T00:00:00.000Z";
+		const db = openTestDb();
+		for (const [text, meaning] of [["alpha", "阿尔法"], ["beta", "贝塔"]]) {
+			db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,reviews,fsrs_state) VALUES('word',?,?,?,?,1,2,'')")
+				.run(text, meaning, new Date().toISOString(), future);
+		}
+		enqueueCustomCard(db, "test", { type: "word", text: "gamma", meaning: "伽马", phonetic: "/x/", example: "G.", example_cn: "伽。" });
+		const queueId = (db.prepare("SELECT id FROM custom_card_queue").get() as any).id;
+		db.close();
+		const active = () => {
+			const check = openTestDb();
+			const row = check.prepare("SELECT i.* FROM runtime_state r LEFT JOIN items i ON i.id = r.active_item_id WHERE r.id = 1").get() as any;
+			check.close();
+			return row;
+		};
+
+		// Entering screening shows a not-yet-due card right away: no pacing, no due gate.
+		await harness.commands["anki:screening"].handler("on", harness.ctx);
+		const first = active();
+		assert.ok(first?.text === "alpha" || first?.text === "beta", "a future-dated card is served immediately");
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		let check = openTestDb();
+		const passed = check.prepare("SELECT status, due_at FROM items WHERE id = ?").get(first.id) as any;
+		check.close();
+		assert.equal(passed.status, "mastered");
+		assert.ok(Date.parse(passed.due_at) - Date.now() >= 364 * 24 * 3600 * 1000, "known card is pushed a year out");
+
+		// The next card is already up; a miss leaves it exactly as it was.
+		const second = active();
+		assert.ok(second && second.id !== first.id && second.text !== "gamma");
+		await harness.commands["anki:again"].handler("", harness.ctx);
+		check = openTestDb();
+		const missed = check.prepare("SELECT status, due_at, reviews, fsrs_state FROM items WHERE id = ?").get(second.id) as any;
+		const attempts = (check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id = ?").get(second.id) as any).n;
+		check.close();
+		assert.deepEqual({ ...missed }, { status: "learning", due_at: future, reviews: 2, fsrs_state: "" });
+		assert.equal(attempts, 0, "a miss records nothing");
+
+		// Queued cards join the sweep; a miss puts the row back in its queue slot.
+		const third = active();
+		assert.equal(third?.text, "gamma");
+		await harness.commands["anki:again"].handler("", harness.ctx);
+		check = openTestDb();
+		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM items WHERE text = 'gamma'").get() as any).n, 0);
+		assert.equal((check.prepare("SELECT id FROM custom_card_queue").get() as any).id, queueId);
+		check.close();
+		assert.equal(active()?.id ?? null, null, "each card is offered once per round");
+
+		// A new round re-offers misses; leaving mid-card reverts the sweep presentation.
+		await harness.commands["anki:screening"].handler("on", harness.ctx);
+		assert.ok(active()?.text === "beta" || active()?.text === "alpha" || active()?.text === "gamma");
+		while (active()?.text !== "gamma") await harness.commands["anki:again"].handler("", harness.ctx);
+		await harness.commands["anki:screening"].handler("off", harness.ctx);
+		check = openTestDb();
+		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM custom_card_queue WHERE id = ?").get(queueId) as any).n, 1);
+		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM items WHERE text = 'gamma'").get() as any).n, 0);
+		check.close();
+		assert.equal(active()?.id ?? null, null, "normal study resumes with its usual due/pacing rules");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});

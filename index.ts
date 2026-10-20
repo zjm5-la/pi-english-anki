@@ -10,7 +10,7 @@ import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { dailyLoadPlan, formatDailyLoadPlan, hasNewCardCapacity, nextAdaptiveLessonBatch, remainingNewCardSlots } from "./adaptive-load.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, MAX_CUSTOM_PER_ADD, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type CustomQueueRow, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
 import { formatVocabReport, vocabularyReport } from "./lexical-band.ts";
@@ -25,7 +25,7 @@ import { computeLearnerProfile, deriveBudget, formatAttemptLogBlock, formatProfi
 import { interruptOrphanedTeachRequests, parseTeachRequest, readTeachReceipt, writeTeachReceipt, type TeachPhase, type TeachRequest } from "./teach-request.ts";
 
 import { autoRefillPlan, autoRefillStrategy, writeAutoRefillStatus, type AutoRefillStrategy } from "./auto-refill.ts";
-import { buildNextCardForecast, writeNextCardForecast } from "./next-card-forecast.ts";
+import { buildNextCardForecast, writeNextCardForecast, type NextCardForecast } from "./next-card-forecast.ts";
 import { beginStudyUndo, finishStudyUndo, beginUndoContinuation, finishUndoContinuation, withUndoContinuation, continueStudyUndoAction, initializeStudyUndo, invalidateStudyUndo, refreshStudyUndo, readStudyUndo, bindUndoReplacement, undoStudyAction } from "./study-undo.ts";
 
 export { contentFingerprint };
@@ -146,6 +146,11 @@ export default function piEnglishAnkiExtension(
 	let pendingIsReview = false;
 	let pendingDirection: RecallDirection = "forward";
 	let pendingAssistance: AssistanceLevel = "none";
+	/** Screening sweep round (process-local, reset on every toggle): items and
+	 * queue rows already offered, plus how to undo the current presentation. */
+	const screeningSwept = new Set<number>();
+	const screeningSweptQueue = new Set<number>();
+	let screeningCard: { itemId: number; wasShown: boolean; queueRow?: CustomQueueRow } | undefined;
 
 	function isCtxStale(ctx: ExtensionContext): boolean {
 		try {
@@ -172,16 +177,21 @@ export default function piEnglishAnkiExtension(
 				version: 1, status: state.active_item_id == null ? "waiting_check" : "current_card",
 				activeItemId: state.active_item_id, hasReadyAfterCurrent: false, source: null,
 				availableAt: null, scheduledAt: null, checkAt: null, updatedAt: now.toISOString(),
-			} : buildNextCardForecast(db, config, {
+			} : withScreeningForecast(buildNextCardForecast(db, config, {
 				workCheckAt: ownTimers ? workCheckAt : null,
 				replacementCheckAt: ownTimers ? replacementCheckAt : null,
 				localGenerationBusy: ownTimers && pendingLLMCall,
-			}, now));
+			}, now)));
 			db.exec("COMMIT");
 		} catch (err) {
 			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
 			console.error(`[pi-english-anki] Forecast update failed: ${err}`);
 		}
+	}
+
+	/** A sweep serves its next card the moment the current one is rated. */
+	function withScreeningForecast(forecast: NextCardForecast): NextCardForecast {
+		return screeningActive() && forecast.status === "current_card" ? { ...forecast, hasReadyAfterCurrent: true } : forecast;
 	}
 
 	function teachProgress(request: TeachRequest | undefined, phase: TeachPhase, errorCode?: string, itemIds?: number[]) {
@@ -837,9 +847,103 @@ export default function piEnglishAnkiExtension(
 		return hasNewCardCapacity(loadPlan(db, now), countTodayNew(db, now));
 	}
 
+	/**
+	 * Screening sweep claim: a random not-yet-offered card from every unmastered
+	 * word/phrase/cloze item (due or not) plus the custom queue, shown as a quiz
+	 * right away — no pacing, quota, or due gate. Nothing about the card's
+	 * schedule changes here; a queue row is materialized and an unshown item is
+	 * marked shown only so the normal answer path works, and both are reverted
+	 * on a miss (see revertScreeningPresentation).
+	 */
+	function claimScreeningItem(now: Date): ItemRow | undefined {
+		if (!db) return undefined;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const state = getRuntimeState(db);
+			if (state.active_item_id != null) {
+				db.exec("ROLLBACK");
+				return undefined;
+			}
+			const pool = `status = 'learning' AND type IN ('word', 'phrase', 'cloze') AND id NOT IN (SELECT value FROM json_each(?)) ${SCHEDULABLE}`;
+			const sweptItems = JSON.stringify([...screeningSwept]);
+			const sweptQueue = JSON.stringify([...screeningSweptQueue]);
+			let card: typeof screeningCard;
+			for (let tries = 0; !card && tries < 20; tries++) {
+				const itemCount = Number((db.prepare(`SELECT COUNT(*) AS n FROM items WHERE ${pool}`).get(sweptItems) as { n: number }).n);
+				const queueCount = Number((db.prepare("SELECT COUNT(*) AS n FROM custom_card_queue WHERE id NOT IN (SELECT value FROM json_each(?))").get(sweptQueue) as { n: number }).n);
+				if (itemCount + queueCount === 0) break;
+				if (Math.random() * (itemCount + queueCount) < itemCount) {
+					const row = db.prepare(`SELECT id, shown FROM items WHERE ${pool} ORDER BY RANDOM() LIMIT 1`).get(sweptItems) as { id: number; shown: number };
+					card = { itemId: row.id, wasShown: row.shown === 1 };
+					break;
+				}
+				const raw = db.prepare("SELECT * FROM custom_card_queue WHERE id NOT IN (SELECT value FROM json_each(?)) ORDER BY RANDOM() LIMIT 1").get(sweptQueue) as Record<string, unknown>;
+				const queueRow: CustomQueueRow = {
+					id: Number(raw.id), created_at: String(raw.created_at), prompt: String(raw.prompt),
+					fingerprint: String(raw.fingerprint), payload: String(raw.payload),
+				};
+				screeningSweptQueue.add(queueRow.id);
+				const item = (() => {
+					try { return parseGeneratedItem(JSON.parse(queueRow.payload)); } catch { return undefined; }
+				})();
+				// Duplicate or malformed rows stay queued untouched for the normal release path.
+				if (!item || item.type === "sentence" || db.prepare("SELECT 1 FROM items WHERE content_fingerprint = ?").get(queueRow.fingerprint)) continue;
+				const id = insertItem(db, item.type, item.text, item.phonetic || null, item.meaning, item.example || null, item.example_cn || null, now, {
+					levels: item.levels,
+					levels_cn: item.levels_cn,
+					chunks: item.chunks,
+					keyWords: item.keyWords,
+					animation: item.animation,
+					introductionKind: "custom",
+				});
+				removeCustomQueueRows(db, [queueRow.id]);
+				card = { itemId: id, wasShown: false, queueRow };
+			}
+			if (!card) {
+				db.exec("ROLLBACK");
+				return undefined;
+			}
+			if (!card.wasShown) markShown(db, card.itemId);
+			setRuntimeState(db, {
+				active_item_id: card.itemId,
+				active_kind: "review",
+				active_direction: "forward",
+				active_version: state.active_version + 1,
+				...EMPTY_SENTENCE_CYCLE,
+				next_check_at: now.toISOString(),
+			});
+			db.exec("COMMIT");
+			screeningSwept.add(card.itemId);
+			screeningCard = card;
+			return db.prepare("SELECT * FROM items WHERE id = ?").get(card.itemId) as unknown as ItemRow | undefined;
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[pi-english-anki] Screening claim failed: ${err}`);
+			return undefined;
+		}
+	}
+
+	/** Inside a transaction: undo what claimScreeningItem did to `itemId` (queue row back in place, shown flag restored). */
+	function revertScreeningPresentation(itemId: number) {
+		if (!db || screeningCard?.itemId !== itemId) return;
+		const { wasShown, queueRow } = screeningCard;
+		screeningCard = undefined;
+		if (queueRow) {
+			for (const table of ["exercises", "direction_state", "mastery_state"]) {
+				db.prepare(`DELETE FROM ${table} WHERE item_id = ?`).run(itemId);
+			}
+			db.prepare("DELETE FROM items WHERE id = ?").run(itemId);
+			db.prepare("INSERT INTO custom_card_queue (id, created_at, prompt, fingerprint, payload) VALUES (?, ?, ?, ?, ?)")
+				.run(queueRow.id, queueRow.created_at, queueRow.prompt, queueRow.fingerprint, queueRow.payload);
+		} else if (!wasShown) {
+			db.prepare("UPDATE items SET shown = 0 WHERE id = ?").run(itemId);
+		}
+	}
+
 	/** Atomically select, mark, and activate the next due card. */
 	function claimDueItem(now: Date, reviewsOnly = false): ItemRow | undefined {
 		if (!db) return undefined;
+		if (screeningActive()) return claimScreeningItem(now);
 		try {
 			db.exec("BEGIN IMMEDIATE");
 			const state = getRuntimeState(db);
@@ -1274,6 +1378,10 @@ export default function piEnglishAnkiExtension(
 			return true;
 		}
 
+		if (screeningActive() && item.type !== "sentence") {
+			return rateScreening(ctx, item, rating, assistanceLevel, expectedVersion, expectedDirection, recallNote, attempt);
+		}
+
 		// A sentence Good must come from an evaluated written answer; manual Again remains an escape hatch.
 		if (item.type === "sentence" && rating === Rating.Good && !attempt) {
 			ctx.ui.notify("句子卡请先用 /anki:answer <英文> 完成输出；也可以用 /anki:again 结束本轮", "info");
@@ -1360,7 +1468,6 @@ export default function piEnglishAnkiExtension(
 			return true;
 		}
 		let applied = false;
-		let screenedNotice: string | undefined;
 		let hasImmediateNext = false;
 		try {
 			db.exec("BEGIN IMMEDIATE");
@@ -1411,38 +1518,7 @@ export default function piEnglishAnkiExtension(
 					);
 				}
 				const objectiveCorrect = attempt != null && attempt.verdict === "correct";
-				// Screening mode: a genuine first-answer pass on a queued custom
-				// card classifies the word as already-known — same treatment as a
-				// skip (both directions pushed a year out, mastered, no reviews).
-				// A miss keeps the normal teach flow, so big imported batches are
-				// classified in one pass without flooding tomorrow's review queue.
-				const screenPass =
-					screeningActive() &&
-					item.introduction_kind === "custom" &&
-					item.reviews === 0 &&
-					isRecall &&
-					effective !== Rating.Again &&
-					assistanceLevel === "none" &&
-					(attempt == null || attempt.verdict === "correct");
-				if (screenPass) {
-					const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
-					let screened = true;
-					if (usesDirection) {
-						for (const dir of ["forward", "reverse"] as const) {
-							const raw = directionFsrsState(db, item.id, dir) ?? (item.fsrs_state || null);
-							const st = scheduleNext(raw, now, Rating.Easy);
-							if ("corrupt" in st) { screened = false; continue; }
-							advanceReviewDirectional(db, item.id, dir, st.state, st.due < minDue ? minDue : st.due, item.reviews + 1, now);
-						}
-						if (screened) db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
-					} else {
-						db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(next.state, next.due < minDue ? minDue : next.due, item.id);
-					}
-					if (screened) {
-						bumpStat(db, "total_screened", 1);
-						screenedNotice = item.text;
-					}
-				} else if (isRecall) {
+				if (isRecall) {
 					if (usesDirection) {
 						const recognitionCovered = expectedDirection === "forward" &&
 							objectiveCorrect && assistanceLevel === "none" && effective === Rating.Good;
@@ -1493,7 +1569,6 @@ export default function piEnglishAnkiExtension(
 				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
-				if (screenedNotice) ctx.ui.notify(`筛查通过：${screenedNotice} 已会，不再安排复习`, "info");
 				// A queued weekly-challenge / /anki:add card counts as the immediate next
 				// card too: otherwise active study starves the FIFO queue behind the pacing interval.
 				hasImmediateNext = hasReadyStoredCard(now) || hasReleasableQueueCard(now);
@@ -1583,6 +1658,101 @@ export default function piEnglishAnkiExtension(
 			if (!releaseCustomQueue(ctx, new Date())) scheduleTimer(0);
 		} else {
 			scheduleTimer(intervalMs());
+		}
+		return true;
+	}
+
+	/**
+	 * Screening sweep rating: a clean unassisted pass marks the card known
+	 * (both directions a year out, mastered); anything else changes nothing —
+	 * no attempt, no FSRS step, the card keeps its old schedule. Either way the
+	 * next sweep card shows immediately.
+	 */
+	function rateScreening(
+		ctx: ExtensionContext,
+		item: ItemRow,
+		rating: Rating,
+		assistanceLevel: AssistanceLevel,
+		expectedVersion: number,
+		expectedDirection: RecallDirection,
+		recallNote: string,
+		attempt?: PendingAttempt,
+	): boolean {
+		if (!db) return false;
+		screeningSwept.add(item.id);
+		const now = new Date();
+		const effective = effectiveRecallRating({ rating, assistance: assistanceLevel, manual: !attempt });
+		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
+		let known: { direction: RecallDirection; state: string; due: string }[] | undefined;
+		if (effective !== Rating.Again && assistanceLevel === "none" && (attempt == null || attempt.verdict === "correct")) {
+			const directions = item.type === "cloze" ? ["forward"] as const : ["forward", "reverse"] as const;
+			known = [];
+			for (const direction of directions) {
+				const raw = item.type === "cloze" ? item.fsrs_state : directionFsrsState(db, item.id, direction) ?? (item.fsrs_state || null);
+				const st = scheduleNext(raw, now, Rating.Easy);
+				if ("corrupt" in st) { known = undefined; break; }
+				known.push({ direction, state: st.state, due: st.due < minDue ? minDue : st.due });
+			}
+		}
+		let applied = false;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const cur = getRuntimeState(db);
+			if (cur.active_item_id === item.id && cur.active_version === expectedVersion && cur.active_direction === expectedDirection) {
+				if (known) {
+					if (attempt) {
+						ensureRecallExercise(item);
+						insertEvaluatedAttempt(db, attempt, "good", now);
+					}
+					if (item.type === "cloze") {
+						db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ?, reviews = ? WHERE id = ?")
+							.run(known[0].state, known[0].due, item.reviews + 1, item.id);
+					} else {
+						for (const d of known) advanceReviewDirectional(db, item.id, d.direction, d.state, d.due, item.reviews + 1, now);
+						db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
+					}
+					bumpStat(db, "total_screened", 1);
+					if (screeningCard?.itemId === item.id) screeningCard = undefined;
+				} else {
+					revertScreeningPresentation(item.id);
+				}
+				setRuntimeState(db, {
+					active_item_id: null,
+					active_kind: null,
+					active_direction: "forward",
+					active_version: cur.active_version + 1,
+					...EMPTY_SENTENCE_CYCLE,
+					next_check_at: now.toISOString(),
+				});
+				applied = true;
+			}
+			db.exec("COMMIT");
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
+			console.error(`[pi-english-anki] Screening rate failed: ${err}`);
+		} finally {
+			clearPendingLocals();
+		}
+		if (!applied) {
+			renderGlobalCard(ctx);
+			return true;
+		}
+		recordRendered(getRuntimeState(db));
+		const lines = known
+			? [...(recallNote ? [recallNote] : []), `${FACES.party} 已会：${item.text}，一年后再见`]
+			: [...(recallNote ? [recallNote] : []), `${FACES.review} 没关系，${item.text} 保持原来的复习安排`];
+		lines.push(statsLine(db));
+		updateWidget(ctx, known ? FACES.party : FACES.review, lines);
+		if (known) ctx.ui.notify(`筛查通过：${item.text} 已会，一年后再见`, "info");
+		stopTimer();
+		const nextCard = claimDueItem(new Date());
+		if (nextCard) {
+			if (!showItem(ctx, nextCard)) renderGlobalCard(ctx);
+		} else if (activeItem(db)) {
+			renderGlobalCard(ctx);
+		} else {
+			ctx.ui.notify("本轮筛查已扫完所有未掌握的卡", "info");
+			scheduleTimer();
 		}
 		return true;
 	}
@@ -1949,16 +2119,11 @@ export default function piEnglishAnkiExtension(
 			}
 			const plan = loadPlan(db, now);
 			const introduced = countTodayNew(db, now);
-			// Screening sweep: the daily limit does not apply — each trigger
-			// releases exactly one queued card so the learner's answering pace
-			// IS the throttle. Perfect for burning down a big imported backlog.
-			if (!screeningActive() && !hasNewCardCapacity(plan, introduced)) {
+			if (!hasNewCardCapacity(plan, introduced)) {
 				db.exec("ROLLBACK");
 				return false;
 			}
-			const remaining = screeningActive()
-				? Math.min(1, customQueueCount(db))
-				: remainingNewCardSlots(plan, introduced, customQueueCount(db));
+			const remaining = remainingNewCardSlots(plan, introduced, customQueueCount(db));
 			const rows = peekCustomQueue(db, remaining);
 			if (rows.length === 0) {
 				db.exec("ROLLBACK");
@@ -2037,7 +2202,7 @@ export default function piEnglishAnkiExtension(
 
 		// Respect the global pacing window so one session's rating cannot let
 		// another session surface a different card ahead of the interval.
-		if (!pacingReady(state0, now)) {
+		if (!screeningActive() && !pacingReady(state0, now)) {
 			updateWidget(ctx, FACES.idle, [statsLine(db)]);
 			return;
 		}
@@ -2051,6 +2216,11 @@ export default function piEnglishAnkiExtension(
 		}
 		if (getRuntimeState(db).active_item_id != null) {
 			renderGlobalCard(ctx);
+			return;
+		}
+		// A finished sweep round waits for the learner to exit screening.
+		if (screeningActive()) {
+			updateWidget(ctx, FACES.idle, [statsLine(db)]);
 			return;
 		}
 
@@ -2821,7 +2991,7 @@ export default function piEnglishAnkiExtension(
 	});
 
 	pi.registerCommand("anki:screening", {
-		description: "切换筛查扫荡模式：新卡首答答对=已会（不排复习）且不限每日张数（答题节奏即限速），答错照常学",
+		description: "切换筛查扫荡模式：连续随机出所有未掌握的卡（含排队卡），答对=已会（一年后再见），答错不改动任何安排",
 		handler: async (args, ctx) => {
 			// Explicit on/off beats toggling: concurrent sessions make toggle
 			// direction unreliable. The config FILE stays the source of truth.
@@ -2846,7 +3016,47 @@ export default function piEnglishAnkiExtension(
 				return;
 			}
 			screeningCache = { value: next, at: Date.now() };
-			ctx.ui.notify(`筛查扫荡模式：${next ? "已开启——不限每日张数，答对即已会，答错照常学；筛完记得关" : "已关闭，恢复每日配额"}`, "info");
+			ctx.ui.notify(`筛查扫荡模式：${next ? "已开启——自由刷所有未掌握的卡，答对即已会（一年后再见），答错不改动" : "已关闭，恢复正常学习"}`, "info");
+			screeningSwept.clear();
+			screeningSweptQueue.clear();
+			if (!db) return;
+			if (!next && screeningCard) {
+				// The sweep card on screen was never rated: put it back untouched.
+				const itemId = screeningCard.itemId;
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					const cur = getRuntimeState(db);
+					if (cur.active_item_id === itemId) {
+						revertScreeningPresentation(itemId);
+						setRuntimeState(db, {
+							active_item_id: null,
+							active_kind: null,
+							active_direction: "forward",
+							active_version: cur.active_version + 1,
+							...EMPTY_SENTENCE_CYCLE,
+							next_check_at: new Date().toISOString(),
+						});
+					}
+					db.exec("COMMIT");
+				} catch (err) {
+					try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+					console.error(`[pi-english-anki] Screening exit failed: ${err}`);
+				}
+				screeningCard = undefined;
+				clearPendingLocals();
+			}
+			if (activeItem(db)) {
+				renderGlobalCard(ctx);
+				return;
+			}
+			const card = claimDueItem(new Date());
+			if (card) {
+				stopTimer();
+				if (!showItem(ctx, card)) renderGlobalCard(ctx);
+			} else {
+				renderGlobalCard(ctx);
+				scheduleTimer();
+			}
 		},
 	});
 
