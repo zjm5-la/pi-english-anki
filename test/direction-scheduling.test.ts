@@ -202,9 +202,10 @@ test("effectiveRecallRating: hint caps correct at Hard; revealed/flip collapses 
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "revealed", manual: false }), Rating.Again);
 });
 
-test("effectiveRecallRating: manual self-report is never unassisted evidence", () => {
-	// /anki:good without an objective answer is conservative: at most Hard.
-	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "none", manual: true }), Rating.Hard);
+test("effectiveRecallRating: clean manual self-report schedules like a correct answer", () => {
+	// Owner decision: a clean (unassisted) manual "remembered" schedules exactly
+	// like a correct typed answer; only assistance levels downgrade.
+	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "none", manual: true }), Rating.Good);
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "hint", manual: true }), Rating.Hard);
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "revealed", manual: true }), Rating.Again);
 });

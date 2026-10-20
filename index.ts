@@ -1341,6 +1341,7 @@ export default function piEnglishAnkiExtension(
 			return true;
 		}
 		let applied = false;
+		let screenedNotice: string | undefined;
 		let hasImmediateNext = false;
 		try {
 			db.exec("BEGIN IMMEDIATE");
@@ -1385,13 +1386,44 @@ export default function piEnglishAnkiExtension(
 					).run(
 						randomUUID(), item.id, randomUUID(), `recall_self_report:${item.id}:${expectedVersion}`,
 						expectedVersion, expectedVersion, expectedDirection, assistanceLevel,
-						effective === Rating.Again ? "again" : "hard",
+						effective === Rating.Again ? "again" : effective === Rating.Hard ? "hard" : "good",
 						now.toISOString(), now.toISOString(), now.toISOString(),
 						recallQuestionText(item, expectedDirection, activeForwardCue(item, expectedDirection)),
 					);
 				}
 				const objectiveCorrect = attempt != null && attempt.verdict === "correct";
-				if (isRecall) {
+				// Screening mode: a genuine first-answer pass on a queued custom
+				// card classifies the word as already-known — same treatment as a
+				// skip (both directions pushed a year out, mastered, no reviews).
+				// A miss keeps the normal teach flow, so big imported batches are
+				// classified in one pass without flooding tomorrow's review queue.
+				const screenPass =
+					config.screeningMode &&
+					item.introduction_kind === "custom" &&
+					item.reviews === 0 &&
+					isRecall &&
+					effective !== Rating.Again &&
+					assistanceLevel === "none" &&
+					(attempt == null || attempt.verdict === "correct");
+				if (screenPass) {
+					const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
+					let screened = true;
+					if (usesDirection) {
+						for (const dir of ["forward", "reverse"] as const) {
+							const raw = directionFsrsState(db, item.id, dir) ?? (item.fsrs_state || null);
+							const st = scheduleNext(raw, now, Rating.Easy);
+							if ("corrupt" in st) { screened = false; continue; }
+							advanceReviewDirectional(db, item.id, dir, st.state, st.due < minDue ? minDue : st.due, item.reviews + 1, now);
+						}
+						if (screened) db.prepare("UPDATE items SET status = 'mastered' WHERE id = ?").run(item.id);
+					} else {
+						db.prepare("UPDATE items SET status = 'mastered', fsrs_state = ?, due_at = ? WHERE id = ?").run(next.state, next.due < minDue ? minDue : next.due, item.id);
+					}
+					if (screened) {
+						bumpStat(db, "total_screened", 1);
+						screenedNotice = item.text;
+					}
+				} else if (isRecall) {
 					if (usesDirection) {
 						const recognitionCovered = expectedDirection === "forward" &&
 							objectiveCorrect && assistanceLevel === "none" && effective === Rating.Good;
@@ -1442,6 +1474,7 @@ export default function piEnglishAnkiExtension(
 				}
 				bumpStat(db, "total_reviews", 1);
 				touchStreak(db, now);
+				if (screenedNotice) ctx.ui.notify(`筛查通过：${screenedNotice} 已会，不再安排复习`, "info");
 				// A queued weekly-challenge / /anki:add card counts as the immediate next
 				// card too: otherwise active study starves the FIFO queue behind the pacing interval.
 				hasImmediateNext = hasReadyStoredCard(now) || hasReleasableQueueCard(now);
@@ -1485,11 +1518,13 @@ export default function piEnglishAnkiExtension(
 			return true;
 		}
 		recordRendered(getRuntimeState(db));
+		// Clean manual self-reports no longer downgrade (owner decision), so the
+		// only downgrade paths are revealed/hint assistance.
 		const downgradeNote = effective === rating
 			? ""
 			: assistanceLevel === "revealed" ? "（翻了答案，按忘记安排）"
 			: assistanceLevel === "hint" ? "（用了提示，按困难安排）"
-			: "（自评兜底，按困难保守安排）";
+			: "";
 		if (effective === Rating.Good) {
 			updateWidget(ctx, FACES.review, [
 				...(recallNote ? [recallNote] : []),
@@ -2758,6 +2793,23 @@ export default function piEnglishAnkiExtension(
 		handler: async (_args, ctx) => {
 			if (db) invalidateStudyUndo(db);
 			if (!hintPending(ctx)) ctx.ui.notify("当前没有可提示的词卡", "info");
+		},
+	});
+
+	pi.registerCommand("anki:screening", {
+		description: "切换筛查模式：批量入库的新卡首答答对=已会（不排复习），答错照常学",
+		handler: async (_args, ctx) => {
+			config.screeningMode = !config.screeningMode;
+			try {
+				const path = join(getAgentDir(), "kaomoji-english-tutor.json");
+				const current = existsSync(path) ? JSON.parse(readFileSync(path, "utf-8")) : {};
+				current.screeningMode = config.screeningMode;
+				writeFileSync(path, JSON.stringify(current, null, "\t") + "\n", "utf-8");
+			} catch (err) {
+				ctx.ui.notify(`已在本会话${config.screeningMode ? "开启" : "关闭"}筛查模式，但写入配置失败：${(err as Error).message}`, "warning");
+				return;
+			}
+			ctx.ui.notify(`筛查模式：${config.screeningMode ? "已开启——批量新卡首答答对即判已会，答错照常学" : "已关闭"}`, "info");
 		},
 	});
 

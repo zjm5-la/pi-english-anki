@@ -21,6 +21,10 @@ export interface PetConfig {
 	 * replacements, weekly challenge, /anki:teach, /anki:add): new cards come
 	 * only from explicit /anki:insert by the terminal pi session. */
 	autoTeach: boolean;
+	/** Screening mode: a first-answer pass on a queued custom card marks the
+	 * word already-known (mastered, no review schedule); only misses keep the
+	 * normal learning flow. Lets big imported batches be classified in one pass. */
+	screeningMode: boolean;
 	showWidget: boolean;
 	verbose: boolean;
 }
@@ -41,6 +45,7 @@ export const DEFAULTS: PetConfig = {
 	dailyNewLimit: ADAPTIVE_MAX_NEW_ITEMS,
 	adaptiveNewCards: true,
 	autoTeach: true,
+	screeningMode: false,
 	showWidget: true,
 	verbose: false,
 };
@@ -78,5 +83,6 @@ export function loadConfig(cwd: string): PetConfig {
 		config.dailyNewLimit = Math.floor(config.dailyNewLimit);
 	}
 	if (typeof config.autoTeach !== "boolean") config.autoTeach = DEFAULTS.autoTeach;
+	if (typeof config.screeningMode !== "boolean") config.screeningMode = DEFAULTS.screeningMode;
 	return config;
 }

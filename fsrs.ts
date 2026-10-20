@@ -25,7 +25,8 @@ export function effectiveRecallRating(args: {
 	if (rating !== Rating.Good) return rating;
 	if (assistance === "revealed") return Rating.Again;
 	if (assistance === "hint") return Rating.Hard;
-	if (manual) return Rating.Hard;
+	// A clean manual "remembered" self-report is treated like a correct typed
+	// answer (owner decision): only assistance downgrades remain.
 	return Rating.Good;
 }
 

@@ -1254,9 +1254,9 @@ test("session B auto-refreshes when session A rates the shared card", { concurre
 		// Let B's poll observe the active card once so it can later detect changes.
 		await fake.firePoll();
 
-		// A rates Good, clearing the global slot. (Manual self-report schedules Hard per P0-2.)
+		// A rates Good, clearing the global slot. (Clean manual self-report = correct answer.)
 		await a.commands["anki:good"].handler("", a.ctx);
-		assert.match(a.widget().join(" "), /记了个大概/);
+		assert.match(a.widget().join(" "), /记牢了/);
 
 		// B's poll notices the data_version change and drops the pending card.
 		await fake.firePoll();
@@ -3591,12 +3591,12 @@ test("manual /anki:good is recorded as a conservative self-report, not objective
 		db.close();
 		await fake.fire();
 		await harness.commands["anki:good"].handler("", harness.ctx);
-		assert.match(harness.widget().join(" "), /自评兜底，按困难保守安排/);
+		assert.match(harness.widget().join(" "), /记牢了！/);
 		const check = openTestDb();
 		const attempt = check.prepare("SELECT kind, status, explicit_rating, assistance_level, question_text FROM attempts WHERE item_id = 1").get() as any;
 		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
-		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "hard", assistance_level: "none", question_text: "默写单词「香蕉」的英文" });
+		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "good", assistance_level: "none", question_text: "默写单词「香蕉」的英文" });
 		assert.deepEqual({ ...mastery }, { stage: "exposure", unassisted_good: 0, assisted_good: 0 }, "self-report produces no objective evidence");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
