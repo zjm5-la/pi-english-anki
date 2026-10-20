@@ -30,6 +30,25 @@ import { beginStudyUndo, finishStudyUndo, beginUndoContinuation, finishUndoConti
 
 export { contentFingerprint };
 
+// -- Screening sweep --------------------------------------------------------
+// The config FILE is the source of truth for screening mode: sessions hold
+// stale in-memory copies, so behaviour gates re-read the flag through this
+// tiny 5s cache instead of trusting `config`.
+let screeningCache: { value: boolean; at: number } | undefined;
+function screeningActive(): boolean {
+	const now = Date.now();
+	if (!screeningCache || now - screeningCache.at > 5_000) {
+		let value = false;
+		try {
+			const raw = readFileSync(join(getAgentDir(), "kaomoji-english-tutor.json"), "utf-8");
+			const parsed = JSON.parse(raw);
+			if (typeof parsed.screeningMode === "boolean") value = parsed.screeningMode;
+		} catch { /* default off */ }
+		screeningCache = { value, at: now };
+	}
+	return screeningCache.value;
+}
+
 // -- Timing & pacing knobs (closure orchestration) ---------------------------
 
 /**
@@ -67,7 +86,7 @@ export default function piEnglishAnkiExtension(
 	// -- State ------------------------------------------------------------
 	let config: PetConfig = { ...DEFAULTS };
 	const loadPlan = (database: DatabaseSync, now = new Date()) => dailyLoadPlan(database, now, config);
-	const statsLine = (database: DatabaseSync) => formatStatusLine(database, loadPlan(database), config.screeningMode);
+	const statsLine = (database: DatabaseSync) => formatStatusLine(database, loadPlan(database), screeningActive());
 	const queueEta = (database: DatabaseSync, total: number) => {
 		const plan = loadPlan(database);
 		if (!plan.adaptive && plan.limit === 0) return "不限速，将尽快放出";
@@ -1398,7 +1417,7 @@ export default function piEnglishAnkiExtension(
 				// A miss keeps the normal teach flow, so big imported batches are
 				// classified in one pass without flooding tomorrow's review queue.
 				const screenPass =
-					config.screeningMode &&
+					screeningActive() &&
 					item.introduction_kind === "custom" &&
 					item.reviews === 0 &&
 					isRecall &&
@@ -1933,11 +1952,11 @@ export default function piEnglishAnkiExtension(
 			// Screening sweep: the daily limit does not apply — each trigger
 			// releases exactly one queued card so the learner's answering pace
 			// IS the throttle. Perfect for burning down a big imported backlog.
-			if (!config.screeningMode && !hasNewCardCapacity(plan, introduced)) {
+			if (!screeningActive() && !hasNewCardCapacity(plan, introduced)) {
 				db.exec("ROLLBACK");
 				return false;
 			}
-			const remaining = config.screeningMode
+			const remaining = screeningActive()
 				? Math.min(1, customQueueCount(db))
 				: remainingNewCardSlots(plan, introduced, customQueueCount(db));
 			const rows = peekCustomQueue(db, remaining);
@@ -2804,17 +2823,28 @@ export default function piEnglishAnkiExtension(
 	pi.registerCommand("anki:screening", {
 		description: "切换筛查扫荡模式：新卡首答答对=已会（不排复习）且不限每日张数（答题节奏即限速），答错照常学",
 		handler: async (_args, ctx) => {
-			config.screeningMode = !config.screeningMode;
+			// Stateless toggle: the config FILE is the single source of truth
+			// (concurrent sessions hold stale in-memory copies).
+			const path = join(getAgentDir(), "kaomoji-english-tutor.json");
+			let fileValue = config.screeningMode;
 			try {
-				const path = join(getAgentDir(), "kaomoji-english-tutor.json");
+				if (existsSync(path)) {
+					const parsed = JSON.parse(readFileSync(path, "utf-8"));
+					if (typeof parsed.screeningMode === "boolean") fileValue = parsed.screeningMode;
+				}
+			} catch { /* fall back to memory */ }
+			const next = !fileValue;
+			config.screeningMode = next;
+			try {
 				const current = existsSync(path) ? JSON.parse(readFileSync(path, "utf-8")) : {};
-				current.screeningMode = config.screeningMode;
+				current.screeningMode = next;
 				writeFileSync(path, JSON.stringify(current, null, "\t") + "\n", "utf-8");
 			} catch (err) {
-				ctx.ui.notify(`已在本会话${config.screeningMode ? "开启" : "关闭"}筛查模式，但写入配置失败：${(err as Error).message}`, "warning");
+				ctx.ui.notify(`已在本会话${next ? "开启" : "关闭"}筛查模式，但写入配置失败：${(err as Error).message}`, "warning");
 				return;
 			}
-			ctx.ui.notify(`筛查扫荡模式：${config.screeningMode ? "已开启——不限每日张数，答对即已会，答错照常学；筛完记得关" : "已关闭，恢复每日配额"}`, "info");
+			screeningCache = { value: next, at: Date.now() };
+			ctx.ui.notify(`筛查扫荡模式：${next ? "已开启——不限每日张数，答对即已会，答错照常学；筛完记得关" : "已关闭，恢复每日配额"}`, "info");
 		},
 	});
 
