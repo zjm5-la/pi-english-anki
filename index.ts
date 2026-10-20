@@ -1791,7 +1791,10 @@ export default function piEnglishAnkiExtension(
 			: [...(recallNote ? [recallNote] : []), `${FACES.review} 没关系，${item.text} 保持原来的复习安排`];
 		lines.push(statsLine(db));
 		updateWidget(ctx, known ? FACES.party : FACES.review, lines);
+		// The app settles an answer on a new attempt or a notify; a miss writes no
+		// attempt, so it must notify or the app waits out its answer timeout.
 		if (known) ctx.ui.notify(`筛查通过：${item.text} 已会，一年后再见`, "info");
+		else ctx.ui.notify(`筛查未通过：${item.text}${recallNote ? `（${recallNote}）` : ""}，保持原来的复习安排`, "info");
 		stopTimer();
 		const nextCard = claimDueItem(new Date());
 		if (nextCard) {

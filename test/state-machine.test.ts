@@ -5438,6 +5438,7 @@ test("screening sweep serves every unmastered card at once: pass = known, miss =
 		assert.deepEqual({ ...missed }, { status: "learning", due_at: future, reviews: 0, fsrs_state: "" });
 		assert.equal(missedShown, 0, "a missed new card stays unseen for normal study");
 		assert.equal(attempts, 0, "a miss records nothing");
+		assert.ok(harness.notifications().some((m) => m.startsWith(`筛查未通过：${second.text}`)), "a miss notifies so the app's answer settles");
 		check = openTestDb();
 		assert.deepEqual([statOf(check, "total_learned"), statOf(check, "total_skipped")], [1, 1], "a miss counts nothing");
 		check.close();
