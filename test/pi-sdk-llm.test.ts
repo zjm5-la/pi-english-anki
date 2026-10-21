@@ -194,7 +194,7 @@ type TransportStep = { status?: number; error?: string; text?: string };
 
 async function withTransportFixture(
 	steps: TransportStep[],
-	run: (fixture: { client: InstanceType<typeof PiSdkLlmClient>; complete: () => Promise<string>; calls: () => number }) => Promise<void>,
+	run: (fixture: { client: InstanceType<typeof PiSdkLlmClient>; complete: (extra?: { hedgeAfterMs?: number }) => Promise<string>; calls: () => number }) => Promise<void>,
 	options: { completeTimeoutMs?: number; abortTimeoutMs?: number } = {},
 ) {
 	const registration = registerFauxProvider({ provider: `kaomoji-sdk-http-${++transportFixtureId}` });
@@ -215,9 +215,9 @@ async function withTransportFixture(
 	};
 	const client = new PiSdkLlmClient(async () => runtime, options);
 	try {
-		await run({ client, calls: () => calls, complete: () => client.complete(ctx,
+		await run({ client, calls: () => calls, complete: (extra = {}) => client.complete(ctx,
 			{ provider: ctx.model.provider, model: ctx.model.id },
-			{ systemPrompt: "Reply briefly.", prompt: "test" }) });
+			{ systemPrompt: "Reply briefly.", prompt: "test", ...extra }) });
 	} finally {
 		await client.dispose();
 		registration.unregister();
@@ -397,6 +397,51 @@ test("the existing completion deadline also bounds HTTP retry backoff", async ()
 		assert.ok(Date.now() - started < 1000, "retry backoff must not escape the completion deadline");
 		assert.equal(fixture.calls(), 1);
 	}, { completeTimeoutMs: 40, abortTimeoutMs: 20 });
+});
+
+test("a hedged completion races a stalled request and aborts it once the second one lands", async () => {
+	const registration = registerFauxProvider({ provider: "kaomoji-sdk-hedge" });
+	const ctx = testContext(registration);
+	registration.setResponses([fauxAssistantMessage("hedged")]);
+	const runtime = fauxRuntime(ctx);
+	const originalStream = runtime.streamSimple;
+	let calls = 0;
+	let stalledAborted = false;
+	runtime.streamSimple = async (model: any, context: any, options: any) => {
+		if (++calls === 1) {
+			// The first request stalls before its first byte until it is aborted.
+			await new Promise<void>(resolve => options.signal.addEventListener("abort", () => resolve(), { once: true }));
+			stalledAborted = true;
+			throw new Error("aborted");
+		}
+		return originalStream(model, context, options);
+	};
+	const client = new PiSdkLlmClient(async () => runtime);
+	try {
+		const started = Date.now();
+		assert.equal(await client.complete(ctx, { provider: ctx.model.provider, model: ctx.model.id },
+			{ systemPrompt: "test", prompt: "test", hedgeAfterMs: 20 }), "hedged");
+		assert.ok(Date.now() - started < 1000, "the second request must not wait for the stalled one");
+		assert.equal(calls, 2);
+		for (let i = 0; i < 100 && !stalledAborted; i++) await new Promise(resolve => setTimeout(resolve, 10));
+		assert.ok(stalledAborted, "the losing request must be aborted, not left running");
+	} finally {
+		await client.dispose();
+		registration.unregister();
+	}
+});
+
+test("hedging duplicates only a request still running at the hedge delay", async () => {
+	await withTransportFixture([{ status: 200, text: "fast" }], async fixture => {
+		assert.equal(await fixture.complete({ hedgeAfterMs: 50 }), "fast");
+		await new Promise(resolve => setTimeout(resolve, 80));
+		assert.equal(fixture.calls(), 1, "a fast answer must not trigger a second request");
+	});
+	await withTransportFixture([{ status: 401, error: "denied" }], async fixture => {
+		await assert.rejects(fixture.complete({ hedgeAfterMs: 50 }), (error: any) => error.code === "SDK_LLM_HTTP_401");
+		await new Promise(resolve => setTimeout(resolve, 80));
+		assert.equal(fixture.calls(), 1, "a terminal failure must not be repeated by the hedge");
+	});
 });
 
 test.after(() => rmSync(agentDir, { recursive: true, force: true }));

@@ -18,6 +18,9 @@ export interface SdkCompletionRequest {
 	systemPrompt: string;
 	prompt: string;
 	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	/** Interactive callers: start an identical second request when the first is
+	 * still running after this many ms; the first success wins. */
+	hedgeAfterMs?: number;
 }
 
 export type PiSdkRuntimeFactory = (ctx: ExtensionContext, provider: string) => Promise<ModelRuntime>;
@@ -216,6 +219,18 @@ export class PiSdkLlmClient {
 		// Preserve the model catalog's own capability metadata; the tutor imposes no
 		// additional output-token ceiling.
 		const model = { ...runtimeModel, headers };
+		const attempt = (cancel?: AbortSignal) => this.completeOnce(ctx, model, runtime, request, deadline, cancel);
+		return request.hedgeAfterMs == null ? attempt() : this.hedged(attempt, request.hedgeAfterMs);
+	}
+
+	private async completeOnce(
+		ctx: ExtensionContext,
+		model: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
+		runtime: ModelRuntime,
+		request: SdkCompletionRequest,
+		deadline: number,
+		cancel?: AbortSignal,
+	): Promise<string> {
 		const settingsManager = SettingsManager.inMemory({
 			compaction: { enabled: false },
 			retry: { enabled: true, maxRetries: 2 },
@@ -232,7 +247,7 @@ export class PiSdkLlmClient {
 			systemPromptOverride: () => request.systemPrompt,
 			appendSystemPromptOverride: () => [],
 		});
-		await this.waitFor(resourceLoader.reload(), deadline);
+		await this.waitFor(resourceLoader.reload(), deadline, cancel);
 
 		const sessionCreation = createAgentSession({
 			cwd: ctx.cwd,
@@ -247,7 +262,7 @@ export class PiSdkLlmClient {
 		});
 		let session: AgentSession;
 		try {
-			({ session } = await this.waitFor(sessionCreation, deadline));
+			({ session } = await this.waitFor(sessionCreation, deadline, cancel));
 		} catch (err) {
 			// A session created after timeout/dispose is an orphan. Keep a rejection
 			// handler attached and dispose it as soon as creation eventually settles.
@@ -257,14 +272,14 @@ export class PiSdkLlmClient {
 			}).catch(() => {});
 			throw err;
 		}
-		if (this.closed) {
+		if (this.closed || cancel?.aborted) {
 			session.dispose();
 			throw clientClosedError();
 		}
 		const terminalErrorCode = normalizeSessionFailures(session);
 		this.activeSessions.add(session);
 		try {
-			await this.waitFor(session.prompt(request.prompt, { expandPromptTemplates: false }), deadline);
+			await this.waitFor(session.prompt(request.prompt, { expandPromptTemplates: false }), deadline, cancel);
 			const error = session.agent.state.errorMessage;
 			if (error) throw sdkFailure(error, terminalErrorCode());
 			let last: { content?: Array<{ type?: string; text?: string }>; stopReason?: string; errorMessage?: string } | undefined;
@@ -304,8 +319,32 @@ export class PiSdkLlmClient {
 		}
 	}
 
-	private waitFor<T>(operation: Promise<T>, deadline: number): Promise<T> {
-		if (this.closed || this.lifecycle.signal.aborted) return Promise.reject(clientClosedError());
+	/** Tail-latency guard for interactive calls: when the first request is still
+	 * running after `delayMs`, race an identical second one. The first success
+	 * wins and cancels the other; a failure waits for the other to finish. */
+	private hedged(attempt: (cancel: AbortSignal) => Promise<string>, delayMs: number): Promise<string> {
+		const cancel = new AbortController();
+		return new Promise<string>((resolve, reject) => {
+			let running = 0;
+			const start = () => {
+				running++;
+				attempt(cancel.signal).then((text) => {
+					clearTimeout(hedge);
+					cancel.abort();
+					resolve(text);
+				}, (error) => {
+					if (--running > 0) return;
+					clearTimeout(hedge);
+					reject(error);
+				});
+			};
+			const hedge = setTimeout(start, delayMs);
+			start();
+		});
+	}
+
+	private waitFor<T>(operation: Promise<T>, deadline: number, cancel?: AbortSignal): Promise<T> {
+		if (this.closed || this.lifecycle.signal.aborted || cancel?.aborted) return Promise.reject(clientClosedError());
 		const remaining = deadline - Date.now();
 		if (remaining <= 0) return Promise.reject(completionTimeoutError());
 		return new Promise<T>((resolve, reject) => {
@@ -314,6 +353,7 @@ export class PiSdkLlmClient {
 			const cleanup = () => {
 				if (timer) clearTimeout(timer);
 				this.lifecycle.signal.removeEventListener("abort", onAbort);
+				cancel?.removeEventListener("abort", onAbort);
 			};
 			const finish = (callback: () => void) => {
 				if (settled) return;
@@ -323,6 +363,7 @@ export class PiSdkLlmClient {
 			};
 			const onAbort = () => finish(() => reject(clientClosedError()));
 			this.lifecycle.signal.addEventListener("abort", onAbort, { once: true });
+			cancel?.addEventListener("abort", onAbort, { once: true });
 			timer = setTimeout(() => finish(() => reject(completionTimeoutError())), remaining);
 			operation.then(
 				(value) => finish(() => resolve(value)),

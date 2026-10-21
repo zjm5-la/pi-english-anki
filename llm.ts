@@ -696,6 +696,9 @@ export async function evaluateAttempt(
 		text = await llm.complete(ctx, resolved, {
 			systemPrompt: "你是英语拼写/词义评价员，只输出 JSON。",
 			prompt,
+			// The learner is waiting: ~13% of gradings outlive 4s, and a fresh
+			// request usually lands before such a stalled one.
+			hedgeAfterMs: 4_000,
 		});
 	} catch {
 		return unavailable();
