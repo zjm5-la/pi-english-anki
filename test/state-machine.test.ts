@@ -274,7 +274,8 @@ test("first-showing word and phrase cards accept active-recall answers", { concu
 		await harness.commands["anki:flip"].handler("", harness.ctx);
 		assert.match(harness.widget().join(" "), /take effect.*生效/);
 		await harness.commands["anki:answer"].handler("take effect", harness.ctx);
-		assert.match(harness.widget().join(" "), /答对了.*翻了答案，按忘记安排/);
+		assert.match(harness.widget().join(" "), /答对了.*记牢了！/);
+		assert.doesNotMatch(harness.widget().join(" "), /翻了答案/, "a reveal no longer downgrades the rating");
 
 		check = openTestDb();
 		const items = check.prepare("SELECT id,reviews FROM items ORDER BY id").all().map((row: any) => ({ ...row }));
@@ -286,7 +287,7 @@ test("first-showing word and phrase cards accept active-recall answers", { concu
 		assert.deepEqual(items, [{ id: 1, reviews: 1 }, { id: 2, reviews: 1 }]);
 		assert.deepEqual(attempts, [
 			{ item_id: 1, answer_text: "condition", assistance_level: "none", status: "evaluated", verdict: "correct", explicit_rating: "good" },
-			{ item_id: 2, answer_text: "take effect", assistance_level: "revealed", status: "evaluated", verdict: "correct", explicit_rating: "again" },
+			{ item_id: 2, answer_text: "take effect", assistance_level: "revealed", status: "evaluated", verdict: "correct", explicit_rating: "good" },
 		]);
 		assert.deepEqual({ ...state }, { active_item_id: null, active_kind: null });
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
@@ -3147,7 +3148,7 @@ test("active recall direction is shared across sessions and survives reattachmen
 	}
 });
 
-test("flip-assisted correct answer schedules Again (a revealed answer is not recall evidence)", { concurrency: false }, async () => {
+test("flip-assisted correct answer keeps Good but is not recall evidence", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		const harness = await createHarness();
@@ -3166,8 +3167,8 @@ test("flip-assisted correct answer schedules Again (a revealed answer is not rec
 		const mastery = check.prepare("SELECT stage, unassisted_good, assisted_good, consecutive_again FROM mastery_state WHERE item_id = 1").get() as any;
 		check.close();
 		assert.equal(item.reviews, 1, "the review still happened");
-		assert.deepEqual({ ...attempt }, { assistance_level: "revealed", explicit_rating: "again" }, "correct-after-reveal schedules Again (P0-2)");
-		assert.deepEqual({ ...mastery }, { stage: "recognition", unassisted_good: 0, assisted_good: 0, consecutive_again: 1 }, "a revealed answer produces no recall evidence");
+		assert.deepEqual({ ...attempt }, { assistance_level: "revealed", explicit_rating: "good" }, "correct-after-reveal is no longer downgraded");
+		assert.deepEqual({ ...mastery }, { stage: "controlled_recall", unassisted_good: 2, assisted_good: 0, consecutive_again: 0 }, "a revealed answer adds no recall evidence");
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
 	} finally {
 		fake.restore();

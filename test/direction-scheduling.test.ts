@@ -196,10 +196,11 @@ test("effectiveRecallRating: unassisted objective correct stays Good", () => {
 	assert.equal(effectiveRecallRating({ rating: Rating.Again, assistance: "none", manual: true }), Rating.Again);
 });
 
-test("effectiveRecallRating: hint caps correct at Hard; revealed/flip collapses to Again", () => {
+test("effectiveRecallRating: hint caps correct at Hard; revealed/flip no longer downgrades", () => {
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "hint", manual: false }), Rating.Hard);
 	assert.equal(effectiveRecallRating({ rating: Rating.Again, assistance: "hint", manual: false }), Rating.Again);
-	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "revealed", manual: false }), Rating.Again);
+	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "revealed", manual: false }), Rating.Good);
+	assert.equal(effectiveRecallRating({ rating: Rating.Easy, assistance: "revealed", manual: false }), Rating.Easy);
 });
 
 test("effectiveRecallRating: clean manual self-report schedules like a correct answer", () => {
@@ -207,5 +208,5 @@ test("effectiveRecallRating: clean manual self-report schedules like a correct a
 	// like a correct typed answer; only assistance levels downgrade.
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "none", manual: true }), Rating.Good);
 	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "hint", manual: true }), Rating.Hard);
-	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "revealed", manual: true }), Rating.Again);
+	assert.equal(effectiveRecallRating({ rating: Rating.Good, assistance: "revealed", manual: true }), Rating.Good);
 });

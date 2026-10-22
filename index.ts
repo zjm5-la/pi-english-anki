@@ -1658,11 +1658,10 @@ export default function piEnglishAnkiExtension(
 			return true;
 		}
 		recordRendered(getRuntimeState(db));
-		// Clean manual self-reports no longer downgrade (owner decision), so the
-		// only downgrade paths are revealed/hint assistance.
+		// Clean manual self-reports and reveals no longer downgrade (owner
+		// decision), so the only downgrade path is hint assistance.
 		const downgradeNote = effective === rating
 			? ""
-			: assistanceLevel === "revealed" ? "（翻了答案，按忘记安排）"
 			: assistanceLevel === "hint" ? "（用了提示，按困难安排）"
 			: "";
 		if (effective === Rating.Easy) {

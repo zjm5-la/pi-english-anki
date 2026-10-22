@@ -11,7 +11,7 @@ const scheduler = new FSRS();
  * Objective evidence ranks above self-report; assistance caps the rating:
  * - unassisted objective correct -> Good (miss stays Again)
  * - hint + correct -> at most Hard
- * - revealed/flipped + correct -> Again
+ * - revealed/flipped + correct -> unchanged (owner decision: no reveal downgrade)
  * - manual /anki:good without an objective answer -> at most Hard
  *   (self-report is recorded separately and never counts as unassisted evidence)
  * - manual /anki:easy (classic Anki Easy) follows the same assistance caps
@@ -24,7 +24,6 @@ export function effectiveRecallRating(args: {
 }): Rating {
 	const { rating, assistance, manual } = args;
 	if (rating !== Rating.Good && rating !== Rating.Easy) return rating;
-	if (assistance === "revealed") return Rating.Again;
 	if (assistance === "hint") return Rating.Hard;
 	// A clean manual "remembered" self-report is treated like a correct typed
 	// answer (owner decision): only assistance downgrades remain.
