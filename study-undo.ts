@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { getStat, setStat } from "./db.ts";
 
-export type UndoKind = "good" | "again" | "skip";
+export type UndoKind = "good" | "easy" | "again" | "skip";
 export interface StudyUndo { actionId: string; itemId: number; kind: UndoKind; available: boolean }
 type Row = Record<string, any>;
 type Snapshot = Record<string, Row[]>;

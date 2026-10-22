@@ -14,6 +14,7 @@ const scheduler = new FSRS();
  * - revealed/flipped + correct -> Again
  * - manual /anki:good without an objective answer -> at most Hard
  *   (self-report is recorded separately and never counts as unassisted evidence)
+ * - manual /anki:easy (classic Anki Easy) follows the same assistance caps
  * Sentence cards do not use this policy; their stricter cycle logic is unchanged.
  */
 export function effectiveRecallRating(args: {
@@ -22,12 +23,12 @@ export function effectiveRecallRating(args: {
 	manual: boolean;
 }): Rating {
 	const { rating, assistance, manual } = args;
-	if (rating !== Rating.Good) return rating;
+	if (rating !== Rating.Good && rating !== Rating.Easy) return rating;
 	if (assistance === "revealed") return Rating.Again;
 	if (assistance === "hint") return Rating.Hard;
 	// A clean manual "remembered" self-report is treated like a correct typed
 	// answer (owner decision): only assistance downgrades remain.
-	return Rating.Good;
+	return rating;
 }
 
 /** Rebuild a Card from its stored JSON state (dates come back as strings).

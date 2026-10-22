@@ -3604,6 +3604,34 @@ test("manual /anki:good is recorded as a conservative self-report, not objective
 	}
 });
 
+test("manual /anki:easy schedules FSRS Easy (classic Anki: new card skips learning steps)", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		const harness = await createHarness();
+		const db = openTestDb();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown) VALUES('word','banana','香蕉',?,?,1)")
+			.run(new Date().toISOString(), new Date(0).toISOString());
+		db.close();
+		await fake.fire();
+		const before = Date.now();
+		await harness.commands["anki:easy"].handler("", harness.ctx);
+		assert.match(harness.widget().join(" "), /太简单！/);
+		const check = openTestDb();
+		const attempt = check.prepare("SELECT kind, status, explicit_rating FROM attempts WHERE item_id = 1").get() as any;
+		const state = check.prepare("SELECT fsrs_state FROM direction_state WHERE item_id = 1 AND direction = 'forward'").get() as any;
+		const undo = JSON.parse((check.prepare("SELECT value FROM stats WHERE key = 'study_undo'").get() as any).value);
+		check.close();
+		assert.deepEqual({ ...attempt }, { kind: "recall_self_report", status: "self_report", explicit_rating: "easy" });
+		const card = JSON.parse(state.fsrs_state);
+		assert.equal(card.state, 2, "Easy graduates a new card straight to Review");
+		assert.ok(new Date(card.due).getTime() - before > 3 * 24 * 3600 * 1000, "Easy lands days out, not a 10-minute learning step");
+		assert.equal(undo.kind, "easy", "undo receipt names the easy action");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test("word/phrase assistance persists across sessions (hint in A, answered in B still caps Hard)", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {

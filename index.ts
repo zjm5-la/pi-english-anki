@@ -1429,7 +1429,7 @@ export default function piEnglishAnkiExtension(
 		}
 
 		// A sentence Good must come from an evaluated written answer; manual Again remains an escape hatch.
-		if (item.type === "sentence" && rating === Rating.Good && !attempt) {
+		if (item.type === "sentence" && (rating === Rating.Good || rating === Rating.Easy) && !attempt) {
 			ctx.ui.notify("句子卡请先用 /anki:answer <英文> 完成输出；也可以用 /anki:again 结束本轮", "info");
 			return true;
 		}
@@ -1527,7 +1527,7 @@ export default function piEnglishAnkiExtension(
 					cur.active_exercise_id === attempt.exerciseId
 				))
 			) {
-				const undo = !attempt ? beginStudyUndo(db, item.id, rating === Rating.Again ? "again" : "good") : undefined;
+				const undo = !attempt ? beginStudyUndo(db, item.id, rating === Rating.Again ? "again" : rating === Rating.Easy ? "easy" : "good") : undefined;
 				if (item.type === "sentence" && rating === Rating.Again) {
 					db.prepare("UPDATE items SET progress = 0 WHERE id = ?").run(item.id);
 				}
@@ -1558,7 +1558,7 @@ export default function piEnglishAnkiExtension(
 					).run(
 						randomUUID(), item.id, randomUUID(), `recall_self_report:${item.id}:${expectedVersion}`,
 						expectedVersion, expectedVersion, expectedDirection, assistanceLevel,
-						effective === Rating.Again ? "again" : effective === Rating.Hard ? "hard" : "good",
+						effective === Rating.Again ? "again" : effective === Rating.Hard ? "hard" : effective === Rating.Easy ? "easy" : "good",
 						now.toISOString(), now.toISOString(), now.toISOString(),
 						recallQuestionText(item, expectedDirection, activeForwardCue(item, expectedDirection)),
 					);
@@ -1599,7 +1599,7 @@ export default function piEnglishAnkiExtension(
 				const newAssistedGood = Number(m?.assisted_good ?? 0) + (objectiveCorrect && assistanceLevel === "hint" ? 1 : 0);
 				const newAgain = effective === Rating.Again
 					? Number(m?.consecutive_again ?? 0) + 1
-					: effective === Rating.Good ? 0 : Number(m?.consecutive_again ?? 0);
+					: effective === Rating.Good || effective === Rating.Easy ? 0 : Number(m?.consecutive_again ?? 0);
 				const stage = effective === Rating.Again
 					? computeMasteryStage(prevStage, newGood, true)
 					: objectiveCorrect && !assisted
@@ -1665,7 +1665,12 @@ export default function piEnglishAnkiExtension(
 			: assistanceLevel === "revealed" ? "（翻了答案，按忘记安排）"
 			: assistanceLevel === "hint" ? "（用了提示，按困难安排）"
 			: "";
-		if (effective === Rating.Good) {
+		if (effective === Rating.Easy) {
+			updateWidget(ctx, FACES.review, [
+				`${FACES.review} 太简单！下次 ${next.due.slice(0, 10)} 再见这个${TYPE_LABELS[item.type] ?? "学习项"}`,
+				statsLine(db),
+			]);
+		} else if (effective === Rating.Good) {
 			updateWidget(ctx, FACES.review, [
 				...(recallNote ? [recallNote] : []),
 				`${FACES.review} 记牢了！下次 ${next.due.slice(0, 10)} 再见这个${TYPE_LABELS[item.type] ?? "学习项"}`,
@@ -2932,6 +2937,15 @@ export default function piEnglishAnkiExtension(
 		description: "Rate a word/phrase as remembered; sentences require /anki:answer",
 		handler: async (_args, ctx) => {
 			if (!ratePending(ctx, Rating.Good)) {
+				ctx.ui.notify("当前没有待评分的复习卡", "info");
+			}
+		},
+	});
+
+	pi.registerCommand("anki:easy", {
+		description: "Rate a word/phrase as too easy (FSRS Easy, longer interval); sentences require /anki:answer",
+		handler: async (_args, ctx) => {
+			if (!ratePending(ctx, Rating.Easy)) {
 				ctx.ui.notify("当前没有待评分的复习卡", "info");
 			}
 		},

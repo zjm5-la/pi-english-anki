@@ -401,7 +401,7 @@ export function renderCard(item: ItemRow, isReview: boolean, face: string, showA
 		if (item.example && showAnswer) {
 			lines.push(`  例：${item.example}${item.example_cn ? `（${item.example_cn}）` : ""}`);
 		}
-		lines.push(`💬 /anki:answer 默写 · /anki:hint 提示 · /anki:flip 翻面 · /anki:good 记得 · /anki:again 忘了`);
+		lines.push(`💬 /anki:answer 默写 · /anki:hint 提示 · /anki:flip 翻面 · /anki:good 记得 · /anki:easy 太简单 · /anki:again 忘了`);
 	} else {
 		lines.push(`${face} ${label}：${item.text}${item.phonetic ? " " + item.phonetic : ""}`);
 		if (showAnswer) {
