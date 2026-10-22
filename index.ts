@@ -36,6 +36,10 @@ export { contentFingerprint };
 // tiny 5s cache instead of trusting `config`.
 let screeningCache: { value: boolean; at: number } | undefined;
 const SCREENING_CARD_STAT = "screening_card";
+/** Cards the learner missed in a sweep: never offered by screening again,
+ * left for normal study to introduce on its own schedule. Items by id,
+ * queued cards by their (stable) custom_card_queue row id. */
+const SCREENING_MISSED_STAT = "screening_missed";
 interface ScreeningCard { itemId: number; wasShown: boolean; queueRow?: CustomQueueRow }
 function screeningActive(): boolean {
 	const now = Date.now();
@@ -866,8 +870,9 @@ export default function piEnglishAnkiExtension(
 				return undefined;
 			}
 			const pool = `status = 'learning' AND shown = 0 AND type IN ('word', 'phrase', 'cloze') AND id NOT IN (SELECT value FROM json_each(?)) ${SCHEDULABLE}`;
-			const sweptItems = JSON.stringify([...screeningSwept]);
-			const sweptQueue = JSON.stringify([...screeningSweptQueue]);
+			const missed = readScreeningMissed();
+			const sweptItems = JSON.stringify([...screeningSwept, ...missed.items]);
+			const sweptQueue = JSON.stringify([...screeningSweptQueue, ...missed.queue]);
 			let card: ScreeningCard | undefined;
 			for (let tries = 0; !card && tries < 20; tries++) {
 				const itemCount = Number((db.prepare(`SELECT COUNT(*) AS n FROM items WHERE ${pool}`).get(sweptItems) as { n: number }).n);
@@ -932,6 +937,24 @@ export default function piEnglishAnkiExtension(
 	}
 	function writeScreeningCard(card?: ScreeningCard) {
 		if (db) setStat(db, SCREENING_CARD_STAT, card ? JSON.stringify(card) : "");
+	}
+
+	function readScreeningMissed(): { items: number[]; queue: number[] } {
+		const raw = db ? getStat(db, SCREENING_MISSED_STAT) : null;
+		try {
+			const parsed = raw ? JSON.parse(raw) as { items?: unknown; queue?: unknown } : {};
+			const ids = (v: unknown) => Array.isArray(v) ? v.filter((n): n is number => Number.isSafeInteger(n)) : [];
+			return { items: ids(parsed.items), queue: ids(parsed.queue) };
+		} catch { return { items: [], queue: [] }; }
+	}
+	/** Inside a transaction, before the presentation is reverted: remember a miss permanently. */
+	function recordScreeningMiss(itemId: number) {
+		if (!db) return;
+		const card = readScreeningCard();
+		const missed = readScreeningMissed();
+		if (card?.itemId === itemId && card.queueRow) missed.queue.push(card.queueRow.id);
+		else missed.items.push(itemId);
+		setStat(db, SCREENING_MISSED_STAT, JSON.stringify(missed));
 	}
 
 	/** Inside a transaction: undo what claimScreeningItem did to `itemId` (queue row back in place, shown flag restored). */
@@ -1766,6 +1789,7 @@ export default function piEnglishAnkiExtension(
 					bumpStat(db, "total_skipped", 1);
 					if (readScreeningCard()?.itemId === item.id) writeScreeningCard();
 				} else {
+					recordScreeningMiss(item.id);
 					revertScreeningPresentation(item.id);
 				}
 				setRuntimeState(db, {
@@ -1792,13 +1816,13 @@ export default function piEnglishAnkiExtension(
 		recordRendered(getRuntimeState(db));
 		const lines = known
 			? [...(recallNote ? [recallNote] : []), `${FACES.party} 已会：${item.text}，一年后再见`]
-			: [...(recallNote ? [recallNote] : []), `${FACES.review} 没关系，${item.text} 保持原来的复习安排`];
+			: [...(recallNote ? [recallNote] : []), `${FACES.review} 没关系，${item.text} 以后不再进筛查，留给正常学习`];
 		lines.push(statsLine(db));
 		updateWidget(ctx, known ? FACES.party : FACES.review, lines);
 		// The app settles an answer on a new attempt or a notify; a miss writes no
 		// attempt, so it must notify or the app waits out its answer timeout.
 		if (known) ctx.ui.notify(`筛查通过：${item.text} 已会，一年后再见`, "info");
-		else ctx.ui.notify(`筛查未通过：${item.text}${recallNote ? `（${recallNote}）` : ""}，保持原来的复习安排`, "info");
+		else ctx.ui.notify(`筛查未通过：${item.text}${recallNote ? `（${recallNote}）` : ""}，以后不再进筛查，留给正常学习`, "info");
 		stopTimer();
 		const nextCard = claimDueItem(new Date());
 		if (nextCard) {

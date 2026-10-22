@@ -5417,7 +5417,7 @@ test("terminal-teach mode: no auto generation, teach resolves as failed, insert 
 	}
 });
 
-test("screening sweep serves every unmastered card at once: pass = known, miss = untouched", { concurrency: false }, async () => {
+test("screening sweep serves every unmastered card at once: pass = known, miss = left for normal study", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
 		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1, adaptiveNewCards: false });
@@ -5482,16 +5482,22 @@ test("screening sweep serves every unmastered card at once: pass = known, miss =
 		check.close();
 		assert.equal(active()?.id ?? null, null, "each card is offered once per round; hotel is never offered");
 
-		// A new round re-offers misses; leaving mid-card reverts the sweep presentation.
+		// Misses never come back to screening, not even in a new round or another session.
 		await harness.commands["anki:screening"].handler("on", harness.ctx);
-		assert.ok(["alpha", "beta", "gamma"].includes(active()?.text));
-		while (active()?.text !== "gamma") await harness.commands["anki:again"].handler("", harness.ctx);
-		// Leaving from another session (e.g. after an app restart) still restores the sweep card.
+		assert.equal(active()?.id ?? null, null, "missed beta and gamma are not re-offered");
+		check = openTestDb();
+		enqueueCustomCard(check, "test", { type: "word", text: "delta", meaning: "德尔塔", phonetic: "/d/", example: "D.", example_cn: "德。" });
+		const deltaQueueId = (check.prepare("SELECT id FROM custom_card_queue WHERE id <> ?").get(queueId) as any).id;
+		check.close();
 		const other = await makeSession();
+		await other.commands["anki:screening"].handler("on", other.ctx);
+		assert.equal(active()?.text, "delta", "only the never-screened card is offered");
+		// Leaving mid-card (here from another session, e.g. after an app restart) is not a miss: the card is restored.
 		await other.commands["anki:screening"].handler("off", other.ctx);
 		check = openTestDb();
-		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM custom_card_queue WHERE id = ?").get(queueId) as any).n, 1);
-		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM items WHERE text = 'gamma'").get() as any).n, 0);
+		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM custom_card_queue WHERE id IN (?, ?)").get(queueId, deltaQueueId) as any).n, 2);
+		assert.equal((check.prepare("SELECT COUNT(*) AS n FROM items WHERE text IN ('gamma', 'delta')").get() as any).n, 0);
+		assert.deepEqual(JSON.parse((check.prepare("SELECT value FROM stats WHERE key = 'screening_missed'").get() as any).value), { items: [second.id], queue: [queueId] });
 		check.close();
 		assert.equal(active()?.text, "hotel", "normal study resumes with its own due review");
 		await other.handlers.session_shutdown({ reason: "quit" }, other.ctx);
