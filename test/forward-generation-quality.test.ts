@@ -86,6 +86,24 @@ test("the unconstrained Chinese prompt still accepts a natural alternative answe
 	assert.match(prompts[0], /任何一个自然且完全符合该中文提示的英文单词\/词组都算对/);
 });
 
+test("forward synonyms are flagged with a retry hint that never names the target", async () => {
+	const item = { type: "word", text: "goal", meaning: "目标" } as ItemRow;
+	for (const [retryHint, expected] of [["更强调个人想达到的结果", "更强调个人想达到的结果"], ["答案是 Goal", ""]]) {
+		const { llm, prompts } = capture({ verdict: "correct", feedback: "target 也可以", synonym: true, retryHint });
+		const result = await evaluateAttempt(llm, ctx, item, "target", resolved, "forward", "默写英文：目标");
+		assert.deepEqual({ synonym: result.synonym, retryHint: result.retryHint }, { synonym: true, retryHint: expected });
+		assert.match(prompts[0], /"synonym":false,"retryHint":""/);
+	}
+	const retried = capture({ verdict: "correct", feedback: "", synonym: true, retryHint: "更具体" });
+	await evaluateAttempt(retried.llm, ctx, item, "aim", resolved, "forward", "默写英文：目标", ["target", "objective"]);
+	assert.match(retried.prompts[0], /之前试过的 target \/ objective 的区别/);
+	const reverse = capture({ verdict: "correct", feedback: "", synonym: true, retryHint: "x" });
+	assert.equal((await evaluateAttempt(reverse.llm, ctx, item, "目的", resolved, "reverse", "写出单词「goal」的中文释义")).synonym, undefined);
+	assert.doesNotMatch(reverse.prompts[0], /retryHint/);
+	const partial = capture({ verdict: "partial", feedback: "", synonym: true });
+	assert.equal((await evaluateAttempt(partial.llm, ctx, item, "gaol", resolved, "forward", "默写英文：目标")).synonym, undefined);
+});
+
 test("both reverse rubrics accept core meanings without repeating disambiguation metadata", async () => {
 	const { llm, prompts } = capture({ verdict: "correct", feedback: "正确" });
 	const item = { type: "word", text: "information", meaning: "信息（不可数名词，泛指事实或资料）", example: "We need more information about the course." } as ItemRow;

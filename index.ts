@@ -30,6 +30,23 @@ import { beginStudyUndo, finishStudyUndo, beginUndoContinuation, finishUndoConti
 
 export { contentFingerprint };
 
+// -- Synonym retry ----------------------------------------------------------
+/** Synonyms already offered for the card on screen, with the latest hint.
+ * Shared through the DB so every session sees the same retry; it only counts
+ * while `active_retry_count` > 0, which every card claim resets. */
+const SYNONYM_TRIES_STAT = "synonym_tries";
+
+function readSynonymTries(db: DatabaseSync, itemId: number, direction: RecallDirection): { answers: string[]; hint: string } | undefined {
+	const row = db.prepare("SELECT value FROM stats WHERE key = ?").get(SYNONYM_TRIES_STAT) as { value: string } | undefined;
+	try {
+		const parsed = JSON.parse(row?.value ?? "") as { itemId?: unknown; direction?: unknown; answers?: unknown; hint?: unknown };
+		if (parsed.itemId !== itemId || parsed.direction !== direction || !Array.isArray(parsed.answers)) return undefined;
+		return { answers: parsed.answers.filter((answer): answer is string => typeof answer === "string"), hint: typeof parsed.hint === "string" ? parsed.hint : "" };
+	} catch {
+		return undefined;
+	}
+}
+
 // -- Screening sweep --------------------------------------------------------
 // The config FILE is the source of truth for screening mode: sessions hold
 // stale in-memory copies, so behaviour gates re-read the flag through this
@@ -1304,10 +1321,16 @@ export default function piEnglishAnkiExtension(
 		let verdict: PendingAttempt["verdict"] = exact ? "correct" : "incorrect";
 		let feedback = "";
 		if (!exact) {
+			const tries = !screeningActive() && state.active_retry_count > 0 ? readSynonymTries(db, item.id, attemptBase.direction) : undefined;
+			// Repeating a synonym already tried costs nothing and needs no grading.
+			if (tries?.answers.includes(norm(text))) {
+				ctx.ui.notify(`同义词，再试一次：${text} 已经试过了，换一个词${tries.hint ? `。提示：${tries.hint}` : ""}`, "info");
+				return true;
+			}
 			startAnswerThinking(ctx, attemptBase.sessionGeneration);
 			let result: AnswerEvaluation;
 			try {
-				result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction, attemptBase.questionText);
+				result = await evaluateAttempt(llm, ctx, item, text, resolveModel(ctx), attemptBase.direction, attemptBase.questionText, tries?.answers);
 			} finally {
 				stopAnswerThinking();
 			}
@@ -1322,6 +1345,37 @@ export default function piEnglishAnkiExtension(
 			}
 			verdict = result.verdict;
 			feedback = result.feedback;
+			// A synonym shows the meaning, not recall of the target: each new one
+			// earns another try without a rating, until the target or a miss.
+			if (result.synonym && !screeningActive()) {
+				const answers = [...(tries?.answers ?? []), norm(text)];
+				const hint = result.retryHint || tries?.hint || "";
+				let retried = false;
+				try {
+					db.exec("BEGIN IMMEDIATE");
+					const changes = db.prepare("UPDATE runtime_state SET active_retry_count = ?, active_version = active_version + 1 WHERE id = 1 AND active_item_id = ? AND active_version = ? AND active_direction = ?")
+						.run(answers.length, item.id, attemptBase.version, attemptBase.direction).changes;
+					retried = Number(changes) > 0;
+					if (retried) {
+						db.prepare("INSERT OR REPLACE INTO stats(key, value) VALUES(?, ?)")
+							.run(SYNONYM_TRIES_STAT, JSON.stringify({ itemId: item.id, direction: attemptBase.direction, answers, hint }));
+					}
+					db.exec("COMMIT");
+				} catch (err) {
+					try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+					console.error(`[pi-english-anki] Synonym retry failed: ${err}`);
+					ctx.ui.notify("暂时无法记录这次重试；没有记录成绩，请再答一次", "warning");
+					return true;
+				}
+				if (!retried) {
+					renderGlobalCard(ctx);
+					return true;
+				}
+				recordRendered(getRuntimeState(db));
+				// Writes no attempt, so it must notify or the app waits out its answer timeout.
+				ctx.ui.notify(`同义词，再试一次：${text} 也说得通，但本题要的是另一个词${hint ? `。提示：${hint}` : ""}`, "info");
+				return true;
+			}
 		}
 		const attempt: PendingAttempt = { ...attemptBase, verdict, feedback, correctedAnswer: target };
 		// Auto-rate: correct -> Good, miss (partial/incorrect) -> Again.

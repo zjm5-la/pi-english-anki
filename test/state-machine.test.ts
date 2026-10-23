@@ -3810,6 +3810,63 @@ test("thin unique forward reviews show masked-example context without spelling h
 	}
 });
 
+for (const [label, finalAnswer, finalResponse, expected] of [
+	["the target word", "efficient", undefined, { verdict: "correct", explicit_rating: "good" }],
+	["a wrong word", "busy", { verdict: "incorrect", feedback: "意思不对" }, { verdict: "incorrect", explicit_rating: "again" }],
+] as const) {
+	test(`forward synonyms earn unrated retries until ${label} settles the card`, { concurrency: false }, async () => {
+		const fake = installFakeTimers();
+		const registration = registerFauxProvider({ provider: `kaomoji-synonym-${finalAnswer}` });
+		try {
+			registration.setResponses([
+				fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "productive 也可代入", synonym: true, retryHint: "目标词更强调又快又不浪费时间和精力" })),
+				fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "effective 也可代入", synonym: true, retryHint: "" })),
+				fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "capable 也可代入", synonym: true, retryHint: "目标词说的是做事省时省力" })),
+				...(finalResponse ? [fauxAssistantMessage(JSON.stringify(finalResponse))] : []),
+			]);
+			const { model, registry } = fauxModelRegistry(registration);
+			writeConfig({ intervalMinutes: 10, dailyNewLimit: 0 });
+			const harness = await makeSession({ model, modelRegistry: registry, sessionId: `synonym-${finalAnswer}` });
+			const db = openTestDb();
+			db.prepare("INSERT INTO items(type,text,meaning,example,learned_at,due_at,shown) VALUES('word','efficient','效率高的',?,?,?,1)")
+				.run("She is an efficient worker.", new Date().toISOString(), new Date(0).toISOString());
+			db.close();
+			await fake.fire();
+			const unrated = (retryCount: number, label: string) => {
+				const check = openTestDb();
+				const attempts = Number((check.prepare("SELECT COUNT(*) AS n FROM attempts").get() as any).n);
+				const state = check.prepare("SELECT active_item_id,active_retry_count FROM runtime_state WHERE id=1").get() as any;
+				const reviews = Number((check.prepare("SELECT reviews FROM items WHERE id=1").get() as any).reviews);
+				check.close();
+				assert.deepEqual({ attempts, reviews, ...state }, { attempts: 0, reviews: 0, active_item_id: 1, active_retry_count: retryCount }, label);
+				const notice = harness.notifications().at(-1)!;
+				assert.match(notice, /^同义词，再试一次：/, `${label}: the retry is announced so the app settles`);
+				assert.doesNotMatch(notice, /efficient/, `${label}: the notice never names the target`);
+				return notice;
+			};
+
+			await harness.commands["anki:answer"].handler("productive", harness.ctx);
+			assert.match(unrated(1, "first synonym"), /productive 也说得通.*提示：目标词更强调又快又不浪费时间和精力/);
+			await harness.commands["anki:answer"].handler(" Productive ", harness.ctx);
+			assert.match(unrated(1, "repeated synonym"), /Productive 已经试过了，换一个词。提示：目标词更强调又快又不浪费时间和精力/);
+			await harness.commands["anki:answer"].handler("effective", harness.ctx);
+			assert.match(unrated(2, "second synonym keeps the last hint"), /effective 也说得通.*提示：目标词更强调又快又不浪费时间和精力/);
+			await harness.commands["anki:answer"].handler("capable", harness.ctx);
+			assert.match(unrated(3, "third synonym"), /capable 也说得通.*提示：目标词说的是做事省时省力/);
+
+			await harness.commands["anki:answer"].handler(finalAnswer, harness.ctx);
+			const check = openTestDb();
+			const attempt = check.prepare("SELECT verdict,explicit_rating FROM attempts WHERE item_id=1").get() as any;
+			check.close();
+			assert.deepEqual({ ...attempt }, expected);
+			await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+		} finally {
+			registration.unregister();
+			fake.restore();
+		}
+	});
+}
+
 // -- /anki:add custom queue release (harness level) ------------------------
 
 function queueWord(text: string, meaning: string) {

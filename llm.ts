@@ -612,6 +612,10 @@ export interface AnswerEvaluation {
 	available: boolean;
 	verdict: "correct" | "partial" | "incorrect";
 	feedback: string;
+	/** Forward only: a correct answer that is a different word from the target. */
+	synonym?: boolean;
+	/** With `synonym`: a nudge toward the target that never names it. */
+	retryHint?: string;
 }
 
 /**
@@ -627,6 +631,7 @@ export async function evaluateAttempt(
 	resolved: { provider: string; model: string } | undefined,
 	direction: "forward" | "reverse" = "forward",
 	questionText?: string,
+	triedSynonyms: string[] = [],
 ): Promise<AnswerEvaluation> {
 	const unavailable = (): AnswerEvaluation => ({ available: false, verdict: "incorrect", feedback: "" });
 	if (!resolved) return unavailable();
@@ -639,6 +644,7 @@ export async function evaluateAttempt(
 	const answerLang = isReverse ? "中文" : "英文";
 	const shownQuestion = !isCloze && (!isReverse || reverseContextual) ? questionText : undefined;
 	const cuePresent = questionHasForwardCue(shownQuestion);
+	const forwardRecall = !isCloze && !isReverse;
 	const rubric = isCloze
 		? [
 			"- correct: 与目标答案完全一致，或仅大小写差异",
@@ -687,9 +693,17 @@ export async function evaluateAttempt(
 		`目标：${target}`,
 		`学生写了：${answer}`,
 		"判断学生的答案，只输出 JSON：",
-		'{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题"}',
+		forwardRecall
+			? '{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题","synonym":false,"retryHint":""}'
+			: '{"verdict":"correct|partial|incorrect","feedback":"简短中文反馈，指出最小问题"}',
 		`- 学生必须用${answerLang}作答；写错语言一律 incorrect`,
 		...rubric,
+		...(forwardRecall
+			? [
+				`- synonym: verdict 为 correct 且学生写的是与「${target}」不同的单词/词组（不是大小写、拼写或词形差异）时填 true，否则 false`,
+				`- retryHint: synonym 为 true 时写一句中文提示，说明目标词与学生答案${triedSynonyms.length ? `及之前试过的 ${triedSynonyms.join(" / ")} ` : ""}的区别，帮学生再想一次；不得出现目标词及其词形、首字母或字母数；否则留空`,
+			]
+			: []),
 	].join("\n");
 	let text: string;
 	try {
@@ -706,9 +720,14 @@ export async function evaluateAttempt(
 	const json = extractJsonObjectText(text);
 	if (!json) return unavailable();
 	try {
-		const parsed = JSON.parse(json) as { verdict?: unknown; feedback?: unknown };
+		const parsed = JSON.parse(json) as { verdict?: unknown; feedback?: unknown; synonym?: unknown; retryHint?: unknown };
 		const verdict = parsed.verdict === "correct" ? "correct" : parsed.verdict === "partial" ? "partial" : "incorrect";
-		return { available: true, verdict, feedback: typeof parsed.feedback === "string" ? parsed.feedback : "" };
+		const feedback = typeof parsed.feedback === "string" ? parsed.feedback : "";
+		if (!forwardRecall || verdict !== "correct" || parsed.synonym !== true) return { available: true, verdict, feedback };
+		// A hint that leaks the target would turn the retry into copying.
+		const hint = typeof parsed.retryHint === "string" ? parsed.retryHint.trim() : "";
+		const retryHint = hint.toLowerCase().includes(target.toLowerCase()) ? "" : hint;
+		return { available: true, verdict, feedback, synonym: true, retryHint };
 	} catch {
 		return unavailable();
 	}
