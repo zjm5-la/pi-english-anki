@@ -50,7 +50,8 @@ function readSynonymTries(db: DatabaseSync, itemId: number, direction: RecallDir
 // -- Screening sweep --------------------------------------------------------
 // The config FILE is the source of truth for screening mode: sessions hold
 // stale in-memory copies, so behaviour gates re-read the flag through this
-// tiny 5s cache instead of trusting `config`.
+// tiny 5s cache instead of trusting `config`. Paths that move a card read it
+// `fresh`: a stale cache would undo or claim cards against another session.
 let screeningCache: { value: boolean; at: number } | undefined;
 const SCREENING_CARD_STAT = "screening_card";
 /** Cards the learner missed in a sweep: never offered by screening again,
@@ -58,9 +59,9 @@ const SCREENING_CARD_STAT = "screening_card";
  * queued cards by their (stable) custom_card_queue row id. */
 const SCREENING_MISSED_STAT = "screening_missed";
 interface ScreeningCard { itemId: number; wasShown: boolean; queueRow?: CustomQueueRow }
-function screeningActive(): boolean {
+function screeningActive(fresh = false): boolean {
 	const now = Date.now();
-	if (!screeningCache || now - screeningCache.at > 5_000) {
+	if (fresh || !screeningCache || now - screeningCache.at > 5_000) {
 		let value = false;
 		try {
 			const raw = readFileSync(join(getAgentDir(), "kaomoji-english-tutor.json"), "utf-8");
@@ -996,7 +997,7 @@ export default function piEnglishAnkiExtension(
 	 * record whose card was already rated elsewhere). Returns true when the
 	 * active card was released. */
 	function releaseStaleScreeningCard(): boolean {
-		if (!db || db.isTransaction || screeningActive()) return false;
+		if (!db || db.isTransaction || screeningActive(true)) return false;
 		const card = readScreeningCard();
 		if (!card) return false;
 		let released = false;
@@ -1029,7 +1030,7 @@ export default function piEnglishAnkiExtension(
 	/** Atomically select, mark, and activate the next due card. */
 	function claimDueItem(now: Date, reviewsOnly = false): ItemRow | undefined {
 		if (!db) return undefined;
-		if (screeningActive()) return claimScreeningItem(now);
+		if (screeningActive(true)) return claimScreeningItem(now);
 		try {
 			db.exec("BEGIN IMMEDIATE");
 			const state = getRuntimeState(db);
@@ -1320,8 +1321,10 @@ export default function piEnglishAnkiExtension(
 		const exact = norm(text) === norm(target);
 		let verdict: PendingAttempt["verdict"] = exact ? "correct" : "incorrect";
 		let feedback = "";
-		if (!exact) {
-			const tries = !screeningActive() && state.active_retry_count > 0 ? readSynonymTries(db, item.id, attemptBase.direction) : undefined;
+		// Screening passes on an exact match only, so a mismatch is a miss
+		// without grading: no LLM call, the sweep settles at once.
+		if (!exact && !screeningActive()) {
+			const tries = state.active_retry_count > 0 ? readSynonymTries(db, item.id, attemptBase.direction) : undefined;
 			// Repeating a synonym already tried costs nothing and needs no grading.
 			if (tries?.answers.includes(norm(text))) {
 				ctx.ui.notify(`同义词，再试一次：${text} 已经试过了，换一个词${tries.hint ? `。提示：${tries.hint}` : ""}`, "info");
@@ -1377,7 +1380,7 @@ export default function piEnglishAnkiExtension(
 				return true;
 			}
 		}
-		const attempt: PendingAttempt = { ...attemptBase, verdict, feedback, correctedAnswer: target };
+		const attempt: PendingAttempt = { ...attemptBase, verdict, feedback, correctedAnswer: target, exact };
 		// Auto-rate: correct -> Good, miss (partial/incorrect) -> Again.
 		const autoRating = verdict === "correct" ? Rating.Good : Rating.Again;
 		const recallNote = verdict === "correct"
@@ -1790,10 +1793,12 @@ export default function piEnglishAnkiExtension(
 	}
 
 	/**
-	 * Screening sweep rating: a clean unassisted pass marks the card known
-	 * (both directions a year out, mastered); anything else changes nothing —
-	 * no attempt, no FSRS step, the card keeps its old schedule. Either way the
-	 * next sweep card shows immediately.
+	 * Screening sweep rating: only a written answer that exactly matches the
+	 * card's target (code-level exact match, not the LLM semantic verdict)
+	 * marks the card known — a paraphrase means the learner knows the concept,
+	 * not the target word itself. A manual Good (no answer) or any mismatch
+	 * changes nothing: no attempt, no FSRS step, the card keeps its old
+	 * schedule. Either way the next sweep card shows immediately.
 	 */
 	function rateScreening(
 		ctx: ExtensionContext,
@@ -1811,7 +1816,7 @@ export default function piEnglishAnkiExtension(
 		const effective = effectiveRecallRating({ rating, assistance: assistanceLevel, manual: !attempt });
 		const minDue = new Date(now.getTime() + 365 * 24 * 3600 * 1000).toISOString();
 		let known: { direction: RecallDirection; state: string; due: string }[] | undefined;
-		if (effective !== Rating.Again && assistanceLevel === "none" && (attempt == null || attempt.verdict === "correct")) {
+		if (effective !== Rating.Again && assistanceLevel === "none" && attempt?.exact === true) {
 			const directions = item.type === "cloze" ? ["forward"] as const : ["forward", "reverse"] as const;
 			known = [];
 			for (const direction of directions) {
@@ -1876,7 +1881,7 @@ export default function piEnglishAnkiExtension(
 		// The app settles an answer on a new attempt or a notify; a miss writes no
 		// attempt, so it must notify or the app waits out its answer timeout.
 		if (known) ctx.ui.notify(`筛查通过：${item.text} 已会，一年后再见`, "info");
-		else ctx.ui.notify(`筛查未通过：${item.text}${recallNote ? `（${recallNote}）` : ""}，以后不再进筛查，留给正常学习`, "info");
+		else ctx.ui.notify(`筛查未通过：${item.text}${recallNote ? `（${recallNote}）` : ""}，答案须与卡面完全一致，以后不再进筛查，留给正常学习`, "info");
 		stopTimer();
 		const nextCard = claimDueItem(new Date());
 		if (nextCard) {
@@ -3159,7 +3164,7 @@ export default function piEnglishAnkiExtension(
 				return;
 			}
 			screeningCache = { value: next, at: Date.now() };
-			ctx.ui.notify(`筛查扫荡模式：${next ? "已开启——自由刷还没学过的卡（排队卡和未出过的新卡），答对即已会（一年后再见），答错不改动" : "已关闭，恢复正常学习"}`, "info");
+			ctx.ui.notify(`筛查扫荡模式：${next ? "已开启——自由刷还没学过的卡（排队卡和未出过的新卡），答出卡面原词即已会（一年后再见），答错不变" : "已关闭，恢复正常学习"}`, "info");
 			screeningSwept.clear();
 			screeningSweptQueue.clear();
 			if (!db) return;

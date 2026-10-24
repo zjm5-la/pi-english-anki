@@ -648,6 +648,7 @@ export async function evaluateAttempt(
 	const rubric = isCloze
 		? [
 			"- correct: 与目标答案完全一致，或仅大小写差异",
+			"- 拼写变体一律判 correct：美式/英式拼写互为合法变体（colour/color、organise/organize、metre/meter、realise/realize、theatre/theater、litre/liter、travelled/traveled、favour/favor 等），不得因变体差异判 partial 或 incorrect",
 			"- partial: 语法形式接近但有错误（如漏助动词、时态/单复数/拼写错），如目标 was committed 写成 was commit",
 			"- incorrect: 不同的词、空白或语言错误；语义相同但语法形式不同的答案不算对",
 		]
@@ -675,11 +676,13 @@ export async function evaluateAttempt(
 			"- 语境存在不代表答案唯一：逐项检查学生答案能否自然替换目标，不得仅因首字母、词长或拼写不同拒绝合理同义答案，也不得使用题面未展示的例句或隐藏信息来排除答案",
 			"- 与题面实际语境或语法矛盾的答案不算 correct；必须说明具体冲突，不能只说不是目标词",
 			`- 同义答案判 correct 时，反馈须点明本题目标是「${target}」；只解释有根据的用法差异，不得编造同义词不能互换的区别`,
+			"- 拼写变体一律判 correct：美式/英式拼写互为合法变体（colour/color、organise/organize、metre/meter、realise/realize、theatre/theater、litre/liter、travelled/traveled、favour/favor 等），不得因变体差异判 partial 或 incorrect",
 			"- partial: 英文有小错（拼写/字形），但明显是想写这个目标词",
 			"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
 		]
 		: [
 			"- correct: 英文与目标一致；如果题面只有中文、没有唯一指定英文词，任何一个自然且完全符合该中文提示的英文单词/词组都算对（如 book 与 reserve 都可表示「预订」）",
+			"- 拼写变体一律判 correct：美式/英式拼写互为合法变体（colour/color、organise/organize、metre/meter、realise/realize、theatre/theater、litre/liter、travelled/traveled、favour/favor 等），不得因变体差异判 partial 或 incorrect",
 			`- 同义答案判 correct 时，反馈须点明本题目标是「${target}」并简要区分常见说法`,
 			"- partial: 英文有小错（拼写/字形），但明显是想写这个目标词",
 			"- incorrect: 完全不同的意思、空白、语言错误或无法识别",
@@ -786,7 +789,7 @@ export async function evaluateSentenceAttempt(
 		`学生答案：${answer}`,
 		'输出：{"verdict":"correct|partial|incorrect","feedback":"一个最小中文修正","errorTags":["grammar|collocation|meaning|missing_target|word_order|spelling|preposition|tense|article|word_choice"],"correctedAnswer":"自然修正版"}',
 		"errorTags 只能从上面列表中选择，拿不准就用 other。",
-		"correct：语义满足中文意图且英文自然；自然变体应接受。",
+		"correct：语义满足中文意图且英文自然；自然变体应接受。美式/英式拼写互为合法变体（colour/color、organise/organize、realise/realize 等），不得因变体判错或计入 spelling 错误标签。",
 		"partial：意图基本正确，仅有一个或少量可修正问题。",
 		"incorrect：核心意思错误、无法理解、写成中文，或填空目标明显错误。",
 		"feedback 只指出当前最关键的一个问题，不要长篇讲解。",

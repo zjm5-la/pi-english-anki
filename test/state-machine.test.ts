@@ -22,6 +22,8 @@ const sdkRuntimeFactory = async (ctx: any) => ({
 	},
 }) as any;
 const { default: extension, contentFingerprint } = await import("../index.ts");
+/** A second module instance = another pi process with its own module-level caches. */
+const { default: otherProcessExtension } = await import("../index.ts?other-process");
 const { enqueueCustomCard } = await import("../db.ts");
 const { undoStudyAction } = await import("../study-undo.ts");
 let sessionSeq = 0;
@@ -99,7 +101,7 @@ function writeConfig(config: Record<string, unknown>) {
 }
 
 /** Attach one extension instance to the shared agentDir (a single Pi session/process). */
-async function makeSession(options: { model?: any; modelRegistry?: any; sessionId?: string; mode?: string; branch?: any[] } = {}) {
+async function makeSession(options: { model?: any; modelRegistry?: any; sessionId?: string; mode?: string; branch?: any[]; extension?: unknown } = {}) {
 	const logicalSessionId = options.sessionId ?? `session-${++sessionSeq}`;
 	const handlers: Record<string, any> = {};
 	const commands: Record<string, any> = {};
@@ -130,7 +132,7 @@ async function makeSession(options: { model?: any; modelRegistry?: any; sessionI
 		},
 		modelRegistry: options.modelRegistry ?? { getAvailable: () => [], find: () => undefined, hasConfiguredAuth: () => false },
 	};
-	await (extension as any)(pi, { runtimeFactory: sdkRuntimeFactory });
+	await ((options.extension ?? extension) as any)(pi, { runtimeFactory: sdkRuntimeFactory });
 	await handlers.session_start({ reason: "startup" }, ctx);
 	return { handlers, commands, shortcuts, ctx, widget: () => widget, notifications: () => notifications };
 }
@@ -5474,6 +5476,118 @@ test("terminal-teach mode: no auto generation, teach resolves as failed, insert 
 	}
 });
 
+test("screening pass requires the exact target answer: paraphrase and manual good keep the card", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	const registration = registerFauxProvider({ provider: "kaomoji-screening-exact" });
+	let llmCalls = 0;
+	try {
+		// The LLM would call the paraphrase semantically correct; screening never asks it.
+		registration.setResponses([async () => {
+			llmCalls++;
+			return fauxAssistantMessage(JSON.stringify({ verdict: "correct", feedback: "意思对" }));
+		}]);
+		const { model, registry } = fauxModelRegistry(registration);
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1, adaptiveNewCards: false });
+		const harness = await makeSession({ model, modelRegistry: registry });
+		const future = "2030-01-01T00:00:00.000Z";
+		const db = openTestDb();
+		for (const [text, meaning] of [["alpha", "阿尔法"], ["beta", "贝塔"], ["delta", "德尔塔"]]) {
+			db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,reviews,fsrs_state) VALUES('word',?,?,?,?,0,0,'')")
+				.run(text, meaning, new Date().toISOString(), future);
+		}
+		db.close();
+		const active = () => {
+			const check = openTestDb();
+			const row = check.prepare("SELECT i.* FROM runtime_state r LEFT JOIN items i ON i.id = r.active_item_id WHERE r.id = 1").get() as any;
+			check.close();
+			return row;
+		};
+		const itemState = (id: number) => {
+			const check = openTestDb();
+			const row = check.prepare("SELECT status, due_at, reviews FROM items WHERE id = ?").get(id) as any;
+			const attempts = (check.prepare("SELECT COUNT(*) AS n FROM attempts WHERE item_id = ?").get(id) as any).n;
+			check.close();
+			return { ...row, attempts };
+		};
+
+		await harness.commands["anki:screening"].handler("on", harness.ctx);
+
+		// A paraphrase is a miss without grading: the sweep wants the target word
+		// itself, so it settles at once with no LLM call.
+		const first = active();
+		assert.ok(first, "screening serves a card");
+		await harness.commands["anki:answer"].handler(`synonym of ${first.text}`, harness.ctx);
+		assert.deepEqual(itemState(first.id), { status: "learning", due_at: future, reviews: 0, attempts: 0 });
+		assert.equal(llmCalls, 0, "screening never sends a mismatch to the LLM grader");
+		assert.ok(harness.notifications().some((m) => m.startsWith(`筛查未通过：${first.text}`) && m.includes(`✗ 答案是：${first.text}`) && m.includes("答案须与卡面完全一致")), "a paraphrase misses with the target shown");
+
+		// A manual Good without an answer cannot prove the target word either.
+		const second = active();
+		assert.ok(second && second.id !== first.id, "the sweep moves on after a paraphrase miss");
+		await harness.commands["anki:good"].handler("", harness.ctx);
+		assert.deepEqual(itemState(second.id), { status: "learning", due_at: future, reviews: 0, attempts: 0 });
+		assert.ok(harness.notifications().some((m) => m.startsWith(`筛查未通过：${second.text}`)), "a manual good notifies the miss too");
+
+		// An exact written answer masters the card for a year.
+		const third = active();
+		assert.ok(third && third.id !== first.id && third.id !== second.id, "the sweep moves on after a manual-good miss");
+		await harness.commands["anki:answer"].handler(third.text, harness.ctx);
+		const mastered = itemState(third.id);
+		assert.equal(mastered.status, "mastered");
+		assert.equal(mastered.attempts, 1, "an exact pass records the attempt");
+		assert.ok(Date.parse(mastered.due_at) - Date.now() >= 364 * 24 * 3600 * 1000, "known card is pushed a year out");
+		assert.ok(harness.notifications().some((m) => m.startsWith(`筛查通过：${third.text}`)), "an exact pass notifies mastery");
+		assert.equal(llmCalls, 0, "an exact pass needs no LLM call either");
+
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		registration.unregister();
+		fake.restore();
+	}
+});
+
+test("another session's stale screening cache neither undoes nor claims sweep cards", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1, adaptiveNewCards: false });
+		// Another pi process: its screening cache starts out "off" and stays so for the next 5s.
+		const stale = await makeSession({ extension: otherProcessExtension });
+		const harness = await makeSession();
+		const db = openTestDb();
+		for (const [text, meaning] of [["alpha", "阿尔法"], ["beta", "贝塔"]]) {
+			db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,reviews,fsrs_state) VALUES('word',?,?,?,?,0,0,'')")
+				.run(text, meaning, new Date().toISOString(), "2030-01-01T00:00:00.000Z");
+		}
+		db.close();
+		const active = () => {
+			const check = openTestDb();
+			const row = check.prepare("SELECT active_item_id AS id FROM runtime_state WHERE id = 1").get() as any;
+			check.close();
+			return row?.id ?? null;
+		};
+
+		await harness.commands["anki:screening"].handler("on", harness.ctx);
+		const card = active();
+		assert.ok(card != null, "entering screening claims a sweep card");
+		for (const timer of fake.active()) await fake.fire(timer);
+		await fake.firePoll();
+		assert.equal(active(), card, "the stale session must not put the sweep card back");
+
+		await harness.commands["anki:screening"].handler("off", harness.ctx);
+		assert.equal(active(), null, "leaving screening releases the unrated card");
+		// The stale session's cache flips to "on" after its next read; exit happened in between.
+		for (const timer of fake.active()) await fake.fire(timer);
+		const check = openTestDb();
+		const shown = (check.prepare("SELECT COUNT(*) AS n FROM items WHERE shown = 1").get() as any).n;
+		check.close();
+		assert.equal(shown, 0, "no session claims a sweep card after screening is off");
+		await stale.handlers.session_shutdown({ reason: "quit" }, stale.ctx);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test("screening sweep serves every unmastered card at once: pass = known, miss = left for normal study", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
@@ -5502,7 +5616,8 @@ test("screening sweep serves every unmastered card at once: pass = known, miss =
 		await harness.commands["anki:screening"].handler("on", harness.ctx);
 		const first = active();
 		assert.ok(first?.text === "alpha" || first?.text === "beta", "a future-dated unseen card is served immediately");
-		await harness.commands["anki:good"].handler("", harness.ctx);
+		// Pass = an exact written answer matching the card target (no LLM call needed).
+		await harness.commands["anki:answer"].handler(first.text, harness.ctx);
 		let check = openTestDb();
 		const passed = check.prepare("SELECT status, due_at FROM items WHERE id = ?").get(first.id) as any;
 		const statOf = (c: any, key: string) => Number((c.prepare("SELECT value FROM stats WHERE key = ?").get(key) as any)?.value ?? 0);

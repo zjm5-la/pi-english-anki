@@ -23,6 +23,9 @@ export interface PendingAttempt {
 	errorTags?: string[];
 	correctedAnswer?: string;
 	questionText?: string;
+	/** 答案与卡面目标归一化后完全一致（代码短路判对，未走 LLM）。筛查
+	 * 扫词以它为过关标准：同义改写即使 LLM 判 correct 也不算认识目标词。 */
+	exact?: boolean;
 }
 
 export interface RuntimeState {
