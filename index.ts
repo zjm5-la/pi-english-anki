@@ -928,6 +928,7 @@ export default function piEnglishAnkiExtension(
 				});
 				removeCustomQueueRows(db, [queueRow.id]);
 				card = { itemId: id, wasShown: false, queueRow };
+				break;
 			}
 			if (!card) {
 				db.exec("ROLLBACK");

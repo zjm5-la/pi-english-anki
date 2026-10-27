@@ -5588,6 +5588,31 @@ test("another session's stale screening cache neither undoes nor claims sweep ca
 	}
 });
 
+test("a screening claim takes exactly one queued card, likeliest-known first", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1, adaptiveNewCards: false });
+		const harness = await makeSession();
+		const db = openTestDb();
+		for (const [text, meaning] of [["interpretation", "解释"], ["house", "房子"], ["departure", "离开"]]) {
+			enqueueCustomCard(db, "test", { type: "word", text, meaning, phonetic: "/x/", example: "X.", example_cn: "叉。" });
+		}
+		db.close();
+		await harness.commands["anki:screening"].handler("on", harness.ctx);
+		const check = openTestDb();
+		const queued = (check.prepare("SELECT payload FROM custom_card_queue ORDER BY id").all() as any[]).map((r) => JSON.parse(r.payload).text);
+		const items = (check.prepare("SELECT text FROM items").all() as any[]).map((r) => r.text);
+		const activeText = (check.prepare("SELECT i.text FROM runtime_state r JOIN items i ON i.id = r.active_item_id").get() as any)?.text;
+		check.close();
+		assert.equal(activeText, "house");
+		assert.deepEqual(items, ["house"], "only the claimed card leaves the queue");
+		assert.deepEqual(queued, ["interpretation", "departure"]);
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test("entering screening puts a study card on screen back untouched and starts the sweep at once", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {
