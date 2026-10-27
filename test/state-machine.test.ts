@@ -5588,6 +5588,44 @@ test("another session's stale screening cache neither undoes nor claims sweep ca
 	}
 });
 
+test("entering screening puts a study card on screen back untouched and starts the sweep at once", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 1, adaptiveNewCards: false });
+		const harness = await makeSession();
+		const db = openTestDb();
+		const overdue = new Date(0).toISOString();
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,reviews,fsrs_state) VALUES('word','hotel','酒店',?,?,1,13,'')")
+			.run(new Date().toISOString(), overdue);
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,reviews,fsrs_state) VALUES('word','alpha','阿尔法',?,?,0,0,'')")
+			.run(new Date().toISOString(), "2030-01-01T00:00:00.000Z");
+		db.close();
+		const active = () => {
+			const check = openTestDb();
+			const row = check.prepare("SELECT i.* FROM runtime_state r LEFT JOIN items i ON i.id = r.active_item_id WHERE r.id = 1").get() as any;
+			check.close();
+			return row;
+		};
+		await harness.commands["anki:screening"].handler("off", harness.ctx);
+		assert.equal(active()?.text, "hotel", "normal study shows the due review");
+
+		await harness.commands["anki:screening"].handler("on", harness.ctx);
+		assert.equal(active()?.text, "alpha", "the sweep card replaces the study card immediately");
+		await harness.commands["anki:answer"].handler("alpha", harness.ctx);
+		const check = openTestDb();
+		const hotel = check.prepare("SELECT status, due_at, reviews, shown FROM items WHERE text = 'hotel'").get() as any;
+		assert.deepEqual({ ...hotel }, { status: "learning", due_at: overdue, reviews: 13, shown: 1 }, "the study card keeps its schedule");
+		assert.equal((check.prepare("SELECT status FROM items WHERE text = 'alpha'").get() as any).status, "mastered");
+		check.close();
+
+		await harness.commands["anki:screening"].handler("off", harness.ctx);
+		assert.equal(active()?.text, "hotel", "the released study card comes back in normal study");
+		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
 test("screening sweep serves every unmastered card at once: pass = known, miss = left for normal study", { concurrency: false }, async () => {
 	const fake = installFakeTimers();
 	try {

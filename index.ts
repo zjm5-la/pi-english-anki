@@ -1033,6 +1033,34 @@ export default function piEnglishAnkiExtension(
 		return released;
 	}
 
+	/** Entering screening: put a normal study card on screen back untouched (it
+	 * stays due) so the sweep starts at once instead of after that card. */
+	function releaseStudyCardForScreening(): boolean {
+		if (!db || db.isTransaction) return false;
+		let released = false;
+		try {
+			db.exec("BEGIN IMMEDIATE");
+			const cur = getRuntimeState(db);
+			if (cur.active_item_id != null && readScreeningCard()?.itemId !== cur.active_item_id) {
+				setRuntimeState(db, {
+					active_item_id: null,
+					active_kind: null,
+					active_direction: "forward",
+					active_version: cur.active_version + 1,
+					...EMPTY_SENTENCE_CYCLE,
+					next_check_at: new Date().toISOString(),
+				});
+				released = true;
+			}
+			db.exec("COMMIT");
+		} catch (err) {
+			try { db.exec("ROLLBACK"); } catch { /* no transaction */ }
+			console.error(`[pi-english-anki] Study card release failed: ${err}`);
+		}
+		if (released) clearPendingLocals();
+		return released;
+	}
+
 	/** Atomically select, mark, and activate the next due card. */
 	function claimDueItem(now: Date, reviewsOnly = false): ItemRow | undefined {
 		if (!db) return undefined;
@@ -1510,7 +1538,9 @@ export default function piEnglishAnkiExtension(
 			return true;
 		}
 
-		if (screeningActive() && item.type !== "sentence") {
+		// Only the card the sweep itself claimed is graded as screening; a study
+		// card left on screen (e.g. by a session with a stale mode cache) keeps normal scheduling.
+		if (screeningActive() && item.type !== "sentence" && readScreeningCard()?.itemId === item.id) {
 			return rateScreening(ctx, item, rating, assistanceLevel, expectedVersion, expectedDirection, recallNote, attempt);
 		}
 
@@ -3176,6 +3206,7 @@ export default function piEnglishAnkiExtension(
 			if (!db) return;
 			// A sweep card on screen was never rated: put it back untouched.
 			if (!next) releaseStaleScreeningCard();
+			else releaseStudyCardForScreening();
 			if (activeItem(db)) {
 				renderGlobalCard(ctx);
 				return;
