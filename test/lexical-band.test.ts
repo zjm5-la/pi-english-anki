@@ -32,6 +32,7 @@ const {
 	estimateFromBands,
 	lookupBands,
 	loadWordlists,
+	screeningEase,
 	vocabularyReport,
 } = await import("../lexical-band.ts");
 const { openDb } = await import("../db.ts");
@@ -53,6 +54,14 @@ test("lookup labels words, phrases, and simple inflections", () => {
 	const phrase = lookupBands("run out of");
 	assert.equal(phrase.cefr, undefined, "unlisted phrases stay untagged");
 	assert.equal(phrase.band, undefined);
+});
+
+test("screening ease ranks common, low-level, short words first", () => {
+	const order = ["interpretation", "run out of", "house", "surge", "specifying", "departure"]
+		.sort((a, b) => screeningEase(b) - screeningEase(a));
+	assert.deepEqual(order, ["house", "surge", "departure", "specifying", "run out of", "interpretation"]);
+	assert.equal(screeningEase("Houses "), screeningEase("houses"), "case and padding normalize");
+	assert.ok(screeningEase("specifying") > screeningEase("specifyingx"), "an inflection inherits its lemma's rank");
 });
 
 test("missing word-list directory degrades to empty labels", () => {

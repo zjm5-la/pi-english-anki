@@ -5615,7 +5615,7 @@ test("screening sweep serves every unmastered card at once: pass = known, miss =
 		// Entering screening shows a not-yet-due card right away: no pacing, no due gate.
 		await harness.commands["anki:screening"].handler("on", harness.ctx);
 		const first = active();
-		assert.ok(first?.text === "alpha" || first?.text === "beta", "a future-dated unseen card is served immediately");
+		assert.equal(first?.text, "beta", "a future-dated unseen card is served immediately, likeliest-known first (beta: shorter than alpha)");
 		// Pass = an exact written answer matching the card target (no LLM call needed).
 		await harness.commands["anki:answer"].handler(first.text, harness.ctx);
 		let check = openTestDb();

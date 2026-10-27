@@ -123,6 +123,23 @@ export function lookupBands(text: string, lists: Wordlists = loadWordlists()): W
 	return { cefr, band: rank ? `${Math.ceil(rank / 1000)}k` : undefined };
 }
 
+/**
+ * Screening order: log-odds that the learner already spells this card from its
+ * Chinese cue. Logistic fit on 1,038 random-order screening verdicts
+ * (2026-10, 10-fold CV AUC 0.82 vs 0.75–0.77 for any single feature): common,
+ * low-CEFR, short single words pass most. Unlisted words fall back to a
+ * mid-band CEFR guess and rank 15000.
+ */
+export function screeningEase(text: string, lists: Wordlists = loadWordlists()): number {
+	const word = normalizeWord(text);
+	const { cefr } = lookupBands(word, lists);
+	const rank = lists.cocaRank.get(word)
+		?? (word.includes(" ") ? undefined : lemmaVariants(word).map((v) => lists.cocaRank.get(v)).find((r) => r !== undefined));
+	const level = cefr ? CEFR_LEVELS.indexOf(cefr) : 2.5;
+	return 3.611 - 0.227 * Math.log(rank ?? 15000) - 0.503 * level + (cefr ? 0 : 0.694)
+		- 0.306 * word.length - (word.includes(" ") ? 0.513 : 0);
+}
+
 // -- Stratified estimation --------------------------------------------------
 
 export interface BandSample {

@@ -13,7 +13,7 @@ import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, lo
 import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, getStat, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type CustomQueueRow, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
-import { formatVocabReport, vocabularyReport } from "./lexical-band.ts";
+import { formatVocabReport, screeningEase, vocabularyReport } from "./lexical-band.ts";
 import { backfillCardImages } from "./card-image.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
@@ -891,17 +891,23 @@ export default function piEnglishAnkiExtension(
 			const missed = readScreeningMissed();
 			const sweptItems = JSON.stringify([...screeningSwept, ...missed.items]);
 			const sweptQueue = JSON.stringify([...screeningSweptQueue, ...missed.queue]);
+			// Likely-known cards first (screeningEase), so early rounds clear the most cards; ties stay random.
+			const textOf = (payload: string) => {
+				try { return String(JSON.parse(payload).text ?? ""); } catch { return ""; }
+			};
+			const candidates = [
+				...(db.prepare(`SELECT id, text FROM items WHERE ${pool}`).all(sweptItems) as { id: number; text: string }[])
+					.map((row) => ({ ease: screeningEase(row.text), itemId: row.id as number | undefined, raw: undefined as Record<string, unknown> | undefined })),
+				...(db.prepare("SELECT * FROM custom_card_queue WHERE id NOT IN (SELECT value FROM json_each(?))").all(sweptQueue) as Record<string, unknown>[])
+					.map((raw) => ({ ease: screeningEase(textOf(String(raw.payload))), itemId: undefined as number | undefined, raw })),
+			].map((c) => ({ ...c, tie: Math.random() })).sort((a, b) => b.ease - a.ease || a.tie - b.tie);
 			let card: ScreeningCard | undefined;
-			for (let tries = 0; !card && tries < 20; tries++) {
-				const itemCount = Number((db.prepare(`SELECT COUNT(*) AS n FROM items WHERE ${pool}`).get(sweptItems) as { n: number }).n);
-				const queueCount = Number((db.prepare("SELECT COUNT(*) AS n FROM custom_card_queue WHERE id NOT IN (SELECT value FROM json_each(?))").get(sweptQueue) as { n: number }).n);
-				if (itemCount + queueCount === 0) break;
-				if (Math.random() * (itemCount + queueCount) < itemCount) {
-					const row = db.prepare(`SELECT id FROM items WHERE ${pool} ORDER BY RANDOM() LIMIT 1`).get(sweptItems) as { id: number };
-					card = { itemId: row.id, wasShown: false };
+			for (const candidate of candidates) {
+				if (candidate.itemId !== undefined) {
+					card = { itemId: candidate.itemId, wasShown: false };
 					break;
 				}
-				const raw = db.prepare("SELECT * FROM custom_card_queue WHERE id NOT IN (SELECT value FROM json_each(?)) ORDER BY RANDOM() LIMIT 1").get(sweptQueue) as Record<string, unknown>;
+				const raw = candidate.raw!;
 				const queueRow: CustomQueueRow = {
 					id: Number(raw.id), created_at: String(raw.created_at), prompt: String(raw.prompt),
 					fingerprint: String(raw.fingerprint), payload: String(raw.payload),
