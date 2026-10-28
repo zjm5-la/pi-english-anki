@@ -10,10 +10,10 @@ import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { PiSdkLlmClient, type PiSdkRuntimeFactory } from "./pi-sdk-llm.ts";
 import { dailyLoadPlan, formatDailyLoadPlan, hasNewCardCapacity, nextAdaptiveLessonBatch, remainingNewCardSlots } from "./adaptive-load.ts";
 import { AUTO_DETECT_MODELS, DEFAULTS, LESSON_CLOZE_ITEMS, LESSON_WORD_ITEMS, loadConfig, MAX_CUSTOM_PER_ADD, type PetConfig, type ThinkingLevel } from "./config.ts";
-import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, getStat, insertItem, knownList, listCustomQueue, markShown, openDb, peekCustomQueue, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type CustomQueueRow, type ItemRow } from "./db.ts";
+import { advanceReview, advanceReviewDirectional, appendGenLog, bumpStat, computeMasteryStage, consumeReplacement, contentFingerprint, countTodayNew, customQueueCount, dueDirection, directionFsrsState, earliestUpcomingReviewDue, enqueueCustomCard, enqueueReplacement, getDueItem, getGenLog, getStat, insertItem, knownList, listCustomQueue, markShown, openDb, pendingReplacementTypes, recognitionDueFloorAfterProduction, removeCustomQueueRows, replacementKnownList, SCHEDULABLE, setStat, touchClient, touchStreak, type CustomQueueRow, type ItemRow } from "./db.ts";
 import { EMPTY_SENTENCE_CYCLE, activeItem, getRuntimeState, latestMasteredItem, myCoordinatorId, pacingReady, resetPacing, setRuntimeState, type AssistanceLevel, type PendingAttempt, type RecallDirection, type RuntimeState } from "./runtime-state.ts";
 import { effectiveRecallRating, quarantineCorruptFsrs, scheduleNext } from "./fsrs.ts";
-import { formatVocabReport, screeningEase, vocabularyReport } from "./lexical-band.ts";
+import { formatVocabReport, screeningEase, studyOrder, vocabularyReport } from "./lexical-band.ts";
 import { backfillCardImages } from "./card-image.ts";
 import { buildConversation } from "./conversation.ts";
 import { MAX_LESSON_REVISIONS, MAX_DUPLICATE_RETRIES, critiqueLesson, evaluateAttempt, evaluateSentenceAttempt, generateLesson, generateReplacement, parseGeneratedItem, type AnswerEvaluation, type CritiqueIssue, type GeneratedItem, type LessonBatch, type LessonDecision, type ReplacementDecision, type SentenceEvaluation } from "./llm.ts";
@@ -1096,6 +1096,18 @@ export default function piEnglishAnkiExtension(
 					: "introduction_kind = 'replacement'";
 				due = db.prepare(`SELECT * FROM items WHERE due_at <= ? AND shown = 0 AND ${kinds} ${SCHEDULABLE} ORDER BY due_at ASC, id ASC LIMIT 1`)
 					.get(now.toISOString()) as ItemRow | undefined;
+				// When planned/custom inventory leads, its word/phrase cards go easiest
+				// level first (studyOrder: CEFR, then frequency) instead of insertion order.
+				if (due && due.introduction_kind !== "replacement" && (due.type === "word" || due.type === "phrase")) {
+					const pool = db.prepare(`SELECT id, text FROM items WHERE due_at <= ? AND shown = 0 AND type IN ('word', 'phrase') AND (introduction_kind IN ('planned', 'custom') OR introduction_kind IS NULL) ${SCHEDULABLE}`)
+						.all(now.toISOString()) as { id: number; text: string }[];
+					let best = { id: due.id, order: studyOrder(due.text) };
+					for (const row of pool) {
+						const order = studyOrder(row.text);
+						if (order < best.order || (order === best.order && row.id < best.id)) best = { id: row.id, order };
+					}
+					due = db.prepare("SELECT * FROM items WHERE id = ?").get(best.id) as unknown as ItemRow;
+				}
 				isReview = false;
 			}
 			if (!due) {
@@ -2299,7 +2311,19 @@ export default function piEnglishAnkiExtension(
 				return false;
 			}
 			const remaining = remainingNewCardSlots(plan, introduced, customQueueCount(db));
-			const rows = peekCustomQueue(db, remaining);
+			// Word/phrase rows go easiest level first (studyOrder); cloze/sentence rows keep the
+			// front in FIFO order; unparsable rows sort last.
+			const orderOf = (row: CustomQueueRow) => {
+				try {
+					const payload = JSON.parse(row.payload);
+					return payload.type === "word" || payload.type === "phrase" ? studyOrder(String(payload.text ?? "")) : -1;
+				} catch { return Infinity; }
+			};
+			const rows = listCustomQueue(db)
+				.map((row) => ({ row, order: orderOf(row) }))
+				.sort((a, b) => a.order - b.order || a.row.id - b.row.id)
+				.slice(0, remaining)
+				.map(({ row }) => row);
 			if (rows.length === 0) {
 				db.exec("ROLLBACK");
 				return false;

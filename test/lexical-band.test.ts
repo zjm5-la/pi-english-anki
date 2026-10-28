@@ -16,6 +16,7 @@ writeFileSync(join(fixtureDir, "oxford-cefr.tsv"), [
 	"specify\t\t\tv.\tB1",
 	"interpretation\t\t\tn.\tB2",
 	"feasible\t\t\tadj.\tC1",
+	"water\t\t\tn., v. A1, B1\tA1, B1", // multi-level row: only studyOrder reads it
 ].join("\n"));
 writeFileSync(join(fixtureDir, "oxford5000-cefr.tsv"), [
 	"Word\tAnnotation\tSense\tPart of Speech\tLevel",
@@ -33,6 +34,7 @@ const {
 	lookupBands,
 	loadWordlists,
 	screeningEase,
+	studyOrder,
 	vocabularyReport,
 } = await import("../lexical-band.ts");
 const { openDb } = await import("../db.ts");
@@ -62,6 +64,17 @@ test("screening ease ranks common, low-level, short words first", () => {
 	assert.deepEqual(order, ["house", "surge", "departure", "specifying", "run out of", "interpretation"]);
 	assert.equal(screeningEase("Houses "), screeningEase("houses"), "case and padding normalize");
 	assert.ok(screeningEase("specifying") > screeningEase("specifyingx"), "an inflection inherits its lemma's rank");
+});
+
+test("study order goes CEFR level first, then frequency; unlisted levels come from frequency", () => {
+	const order = ["feasible", "zzz", "surge", "the", "water", "interpretation", "specify", "departure", "house"]
+		.sort((a, b) => studyOrder(a) - studyOrder(b));
+	// house takes its lowest level (A1, though another file lists A2); listed A1 words precede the
+	// unlisted "the" (rank 1, inferred A1); a multi-level "A1, B1" row counts as A1; within B2,
+	// surge (ranked) precedes interpretation (unranked); an unknown word goes last.
+	assert.deepEqual(order, ["house", "water", "the", "departure", "specify", "surge", "interpretation", "feasible", "zzz"]);
+	assert.equal(studyOrder("house surge"), studyOrder("house surge"), "deterministic");
+	assert.equal(studyOrder("the zzz"), studyOrder("zzz"), "an unlisted phrase takes its hardest word's position");
 });
 
 test("missing word-list directory degrades to empty labels", () => {

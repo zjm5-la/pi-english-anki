@@ -32,6 +32,9 @@ const COCA_FILE = "coca20000.txt";
 export interface Wordlists {
 	/** normalized word → CEFR level (highest level wins across files). */
 	cefr: Map<string, CefrLevel>;
+	/** normalized word → its lowest CEFR level across files, multi-level rows ("A1, B2") and
+	 * "a, an" headwords included: when the word's first sense is taught. */
+	cefrLowest: Map<string, CefrLevel>;
 	/** normalized word → COCA rank (1-based, first occurrence wins). */
 	cocaRank: Map<string, number>;
 }
@@ -52,12 +55,20 @@ export function normalizeWord(text: string): string {
 export function loadWordlists(dir = wordlistDir()): Wordlists {
 	if (cache?.dir === dir) return cache.lists;
 	const cefr = new Map<string, CefrLevel>();
+	const cefrLowest = new Map<string, CefrLevel>();
 	for (const file of OXFORD_FILES) {
 		const path = join(dir, file);
 		if (!existsSync(path)) continue;
 		const lines = readFileSync(path, "utf-8").split(/\r?\n/);
 		for (const line of lines.slice(1)) {
 			const cells = line.split("\t");
+			const levels = ((cells[4] ?? "").match(/\b[ABC][12]\b/g) ?? []) as CefrLevel[];
+			const lowest = levels.sort((a, b) => CEFR_LEVELS.indexOf(a) - CEFR_LEVELS.indexOf(b))[0];
+			for (const headword of (cells[0] ?? "").split(",")) {
+				const key = normalizeWord(headword);
+				const previous = cefrLowest.get(key);
+				if (key && lowest && (!previous || CEFR_LEVELS.indexOf(lowest) < CEFR_LEVELS.indexOf(previous))) cefrLowest.set(key, lowest);
+			}
 			const word = normalizeWord(cells[0] ?? "");
 			const level = (cells[4] ?? "").trim() as CefrLevel;
 			if (!word || !CEFR_LEVELS.includes(level)) continue;
@@ -76,7 +87,7 @@ export function loadWordlists(dir = wordlistDir()): Wordlists {
 			if (!cocaRank.has(word)) cocaRank.set(word, rank);
 		}
 	}
-	cache = { dir, lists: { cefr, cocaRank } };
+	cache = { dir, lists: { cefr, cefrLowest, cocaRank } };
 	return cache.lists;
 }
 
@@ -133,11 +144,39 @@ export function lookupBands(text: string, lists: Wordlists = loadWordlists()): W
 export function screeningEase(text: string, lists: Wordlists = loadWordlists()): number {
 	const word = normalizeWord(text);
 	const { cefr } = lookupBands(word, lists);
-	const rank = lists.cocaRank.get(word)
-		?? (word.includes(" ") ? undefined : lemmaVariants(word).map((v) => lists.cocaRank.get(v)).find((r) => r !== undefined));
+	const rank = cocaRankOf(word, lists);
 	const level = cefr ? CEFR_LEVELS.indexOf(cefr) : 2.5;
 	return 3.611 - 0.227 * Math.log(rank ?? 15000) - 0.503 * level + (cefr ? 0 : 0.694)
 		- 0.306 * word.length - (word.includes(" ") ? 0.513 : 0);
+}
+
+function cocaRankOf(word: string, lists: Wordlists): number | undefined {
+	return lists.cocaRank.get(word)
+		?? (word.includes(" ") ? undefined : lemmaVariants(word).map((v) => lists.cocaRank.get(v)).find((r) => r !== undefined));
+}
+
+/** COCA rank ceilings that stand in for a CEFR level when a word is unlisted (A1…B2; beyond = C1). */
+const RANK_LEVEL_CEILINGS = [1000, 2000, 3500, 6000];
+const UNRANKED = 49_999;
+
+/**
+ * New-card study order, ascending: CEFR level first (A1 → C1), then COCA
+ * frequency within the level; Oxford-listed words precede unlisted words
+ * whose level is inferred from frequency. An unlisted phrase takes its
+ * hardest word's position.
+ */
+export function studyOrder(text: string, lists: Wordlists = loadWordlists()): number {
+	const word = normalizeWord(text);
+	const cefr = lists.cefrLowest.get(word)
+		?? (word.includes(" ") ? undefined : lemmaVariants(word).map((v) => lists.cefrLowest.get(v)).find((l) => l !== undefined));
+	const rank = cocaRankOf(word, lists);
+	if (!cefr && rank === undefined && word.includes(" ")) {
+		return Math.max(...word.split(" ").map((part) => studyOrder(part, lists)));
+	}
+	const level = cefr
+		? CEFR_LEVELS.indexOf(cefr)
+		: rank === undefined ? RANK_LEVEL_CEILINGS.length : RANK_LEVEL_CEILINGS.filter((ceiling) => rank >= ceiling).length;
+	return level * 100_000 + (cefr ? 0 : 50_000) + Math.min(rank ?? UNRANKED, UNRANKED);
 }
 
 // -- Stratified estimation --------------------------------------------------

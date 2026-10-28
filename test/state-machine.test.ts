@@ -252,7 +252,8 @@ test("first-showing word and phrase cards accept active-recall answers", { concu
 		const db = openTestDb();
 		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('word','condition','（判断）条件',?,?)")
 			.run(new Date().toISOString(), new Date(0).toISOString());
-		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('phrase','take effect','生效',?,?)")
+		// B1-level phrase: new cards go easiest level first, so the A2 word still surfaces first.
+		db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at) VALUES('phrase','come into force','生效',?,?)")
 			.run(new Date().toISOString(), new Date(0).toISOString());
 		db.close();
 
@@ -271,11 +272,11 @@ test("first-showing word and phrase cards accept active-recall answers", { concu
 		check.close();
 		const phraseFace = harness.widget().join(" ");
 		assert.match(phraseFace, /复习时间到.*默写词组.*生效/);
-		assert.doesNotMatch(phraseFace, /take effect/, "first-showing question must not leak the target phrase");
+		assert.doesNotMatch(phraseFace, /come into force/, "first-showing question must not leak the target phrase");
 
 		await harness.commands["anki:flip"].handler("", harness.ctx);
-		assert.match(harness.widget().join(" "), /take effect.*生效/);
-		await harness.commands["anki:answer"].handler("take effect", harness.ctx);
+		assert.match(harness.widget().join(" "), /come into force.*生效/);
+		await harness.commands["anki:answer"].handler("come into force", harness.ctx);
 		assert.match(harness.widget().join(" "), /答对了.*记牢了！/);
 		assert.doesNotMatch(harness.widget().join(" "), /翻了答案/, "a reveal no longer downgrades the rating");
 
@@ -289,7 +290,7 @@ test("first-showing word and phrase cards accept active-recall answers", { concu
 		assert.deepEqual(items, [{ id: 1, reviews: 1 }, { id: 2, reviews: 1 }]);
 		assert.deepEqual(attempts, [
 			{ item_id: 1, answer_text: "condition", assistance_level: "none", status: "evaluated", verdict: "correct", explicit_rating: "good" },
-			{ item_id: 2, answer_text: "take effect", assistance_level: "revealed", status: "evaluated", verdict: "correct", explicit_rating: "good" },
+			{ item_id: 2, answer_text: "come into force", assistance_level: "revealed", status: "evaluated", verdict: "correct", explicit_rating: "good" },
 		]);
 		assert.deepEqual({ ...state }, { active_item_id: null, active_kind: null });
 		await harness.handlers.session_shutdown({ reason: "quit" }, harness.ctx);
@@ -2749,6 +2750,47 @@ test("new cards surface in due-time order regardless of kind", { concurrency: fa
 		const active = ck.prepare("SELECT active_item_id FROM runtime_state WHERE id=1").get() as any;
 		ck.close();
 		assert.equal(active.active_item_id, 1, "the earlier-due replacement surfaces first");
+		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
+	} finally {
+		fake.restore();
+	}
+});
+
+test("planned and queued new cards surface easiest CEFR level first", { concurrency: false }, async () => {
+	const fake = installFakeTimers();
+	try {
+		writeConfig({ intervalMinutes: 10, dailyNewLimit: 0, adaptiveNewCards: false });
+		const s = await makeSession({ sessionId: "level-order" });
+		const today = new Date().toISOString();
+		const due = new Date(0).toISOString();
+		const db = openTestDb();
+		// Insertion order is hardest-first; studyOrder must override it (C1 → B1 → A1 by the real lists).
+		for (const [text, meaning] of [["accountability", "问责"], ["generous", "慷慨的"], ["house", "房子"]]) {
+			db.prepare("INSERT INTO items(type,text,meaning,learned_at,due_at,shown,introduction_kind) VALUES('word',?,?,?,?,0,'custom')").run(text, meaning, today, due);
+		}
+		db.close();
+		const seen: string[] = [];
+		const activeText = () => {
+			const ck = openTestDb();
+			const row = ck.prepare("SELECT i.text FROM runtime_state r JOIN items i ON i.id = r.active_item_id WHERE r.id = 1").get() as any;
+			ck.close();
+			return row?.text;
+		};
+		await fake.fire();
+		for (let i = 0; i < 3; i++) {
+			seen.push(activeText());
+			if (i === 2) {
+				// The custom queue releases in the same order, not FIFO, once stored inventory runs out.
+				const q = openTestDb();
+				for (const [text, meaning] of [["simultaneously", "同时"], ["water", "水"]]) {
+					enqueueCustomCard(q, "test", { type: "word", text, meaning, phonetic: "/x/", example: "X.", example_cn: "叉。" });
+				}
+				q.close();
+			}
+			await s.commands["anki:good"].handler("", s.ctx);
+		}
+		assert.deepEqual(seen, ["house", "generous", "accountability"]);
+		assert.equal(activeText(), "water", "the easier queued card is released first");
 		await s.handlers.session_shutdown({ reason: "quit" }, s.ctx);
 	} finally {
 		fake.restore();
